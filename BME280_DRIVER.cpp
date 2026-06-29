@@ -44,6 +44,10 @@ static float ground_hpa = 1013.25f;
 // (本スレッドが yield しない限り)。read_latest 側も yield せずコピーするだけ。
 static bme280_sample_t latest = {0, 0.f, 0.f, 0.f, false};
 
+// 新サンプルの push 先 (sink)。set_sample_sink で (obj<<16)|method を登録。0xFFFF=無効。
+static uint32_t sample_sink_obj = 0xFFFF;
+static uint32_t sample_sink_method = 0;
+
 // ===========================================================================
 //  BME280 低レベル
 // ===========================================================================
@@ -171,6 +175,12 @@ static void method_read_latest(uint32_t _caller_obj_id,
   memcpy((void *)(uintptr_t)out_ptr, (const void *)&latest, sizeof(latest));
 }
 
+// arg0 = (obj<<16)|method。新サンプル push 先を登録。
+static void method_set_sample_sink(uint32_t, uint32_t, uint32_t packed, uint32_t) {
+  sample_sink_obj = (packed >> 16) & 0xFFFF;
+  sample_sink_method = packed & 0xFFFF;
+}
+
 static void method_rezero(uint32_t _a, uint32_t _b, uint32_t _c, uint32_t _d) {
   (void)_a;
   (void)_b;
@@ -188,6 +198,7 @@ void BME280_DRIVER::init() {
   printf("[BME280] init\n");
   export_method<method_read_latest>(BME280_DRIVER::METHOD_IDs::read_latest);
   export_method<method_rezero>(BME280_DRIVER::METHOD_IDs::rezero);
+  export_method<method_set_sample_sink>(BME280_DRIVER::METHOD_IDs::set_sample_sink);
 
   i2c_bus::init();
   if (!bme_init_sensor()) {
@@ -215,6 +226,10 @@ void BME280_DRIVER::init() {
       s.alt_m = pressure_to_altitude(p, t, ground_hpa);
       s.valid = true;
       latest = s; // 構造体ごと差し替え (yield しないので原子的)
+      // 新サンプルを sink へ push (event-driven。登録時のみ)。
+      if (sample_sink_obj != 0xFFFF)
+        obj_api::svc(obj_api::svc_num::CALL_METHOD, sample_sink_obj,
+                     sample_sink_method, (uint32_t)(uintptr_t)&latest);
     } else {
       latest.valid = false;
     }

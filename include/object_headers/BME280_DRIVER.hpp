@@ -30,6 +30,8 @@ public:
     read_latest = 0,
     // arg0 = 無視。地上気圧を現在値で取り直す (高度ゼロ点の再較正)。
     rezero = 1,
+    // arg0 = (obj_id<<16)|method_id。新サンプル push 先(sink)を登録。0xFFFF... で無効。
+    set_sample_sink = 2,
   };
 };
 } // namespace shizu

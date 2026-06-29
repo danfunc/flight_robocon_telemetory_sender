@@ -96,6 +96,22 @@ __always_inline static void yield_us(uint64_t us) {
   }
 }
 
+// 絶対締切 deadline_us まで待つ。余裕があるうちは yield で他スレッドに譲り、最後の
+// spin_us[µs] だけは yield せずビジースピンで締切に張り付く。yield 1 回で他スレッドが
+// 走る時間ぶんオーバーシュートする yield_us と違い、締切±数µs に収まる。
+// 注意: 協調スケジューラなので spin 中は他オブジェクトが完全に止まる。precision と
+// starvation のトレードオフなので spin_us は「最長 1 スレッドの実行時間」程度に留める。
+// 既に締切を過ぎていれば即 return。
+__always_inline static void yield_until_us(uint64_t deadline_us,
+                                           uint64_t spin_us = 300) {
+  while ((int64_t)(deadline_us - time_us_64()) > (int64_t)spin_us) {
+    shizu::obj_api::yield();
+  }
+  while ((int64_t)(deadline_us - time_us_64()) > 0) {
+    tight_loop_contents();
+  }
+}
+
 } // namespace obj_api
 } // namespace shizu
 #endif // SHIZU_OBJ_API_HPP

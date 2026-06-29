@@ -45,13 +45,15 @@ NUS / Shizuku 側定数 (BLE_UART_DRIVER.cpp / ble_uart.gatt と一致):
 
 import asyncio
 import collections
+import csv
+import os
 import queue
 import re
 import struct
 import threading
 import time
 import tkinter as tk
-from tkinter import scrolledtext, ttk
+from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 from bleak import BleakClient, BleakScanner
 
@@ -360,6 +362,21 @@ class App:
         self._last_telem_seq = None
         self._telem_lost = 0
 
+        # CSV 記録 (全サンプルを host 受信時刻つきで保存し、後でオフライン解析する)
+        self._rec_file = None
+        self._rec_writer = None
+        self._rec_count = 0
+        self._rec_path = None
+
+        # BNO055 読みモード / 較正
+        self._read_split = False           # False=BLK, True=2B 個別読み
+        self._ffff_reject = True            # 0xFFFF 破損破棄 (既定 ON)
+        self._calib_win = None             # 較正 Toplevel
+        self._calib_labels = {}            # S/G/A/M ラベル
+        self._calib_status_var = None
+        self._calib_save_to_file = False   # CDUMP 受信時にファイル保存するか
+        self._last_calib_hex = None        # 直近に保存したオフセット(44 hex)
+
         root.title("Shizuku 飛行テレメトリ クライアント")
         root.geometry("860x900")
         root.minsize(720, 700)
@@ -465,6 +482,18 @@ class App:
                                     values=["BIN", "CSV"])
         self.fmt_box.pack(side=tk.LEFT)
         self.fmt_box.bind("<<ComboboxSelected>>", lambda _e: self._on_set_format())
+        self.rec_btn = ttk.Button(bottom, text="記録開始", command=self._toggle_record)
+        self.rec_btn.pack(side=tk.LEFT, padx=4)
+        # BNO055 読みモード切替 (X0=ブロック / X1=2B 個別読み)。
+        self.readmode_btn = ttk.Button(bottom, text="読み:BLK",
+                                       command=self._toggle_read_mode)
+        self.readmode_btn.pack(side=tk.LEFT, padx=4)
+        # 0xFFFF 破損バーストの破棄 ON/OFF (Y1/Y0)。既定 ON。
+        self.ffff_btn = ttk.Button(bottom, text="0xFF除外:ON",
+                                   command=self._toggle_ffff_reject)
+        self.ffff_btn.pack(side=tk.LEFT, padx=4)
+        self.calib_btn = ttk.Button(bottom, text="較正", command=self._open_calib_window)
+        self.calib_btn.pack(side=tk.LEFT, padx=4)
         ttk.Button(bottom, text="クリア", command=self._clear).pack(side=tk.LEFT, padx=4)
 
         self._set_connected(False)
@@ -662,6 +691,17 @@ class App:
             self._append("log", f"{line}\n")
             return
 
+        # 較正オフセットのダンプ / 復元 ack
+        if line.startswith("CDUMP"):
+            self._on_calib_dump(line)
+            return
+        if line.startswith("CLOAD"):
+            ok = "ok=1" in line
+            if self._calib_status_var is not None:
+                self._calib_status_var.set("復元 " + ("成功" if ok else "失敗"))
+            self._append("log", line + "\n")
+            return
+
         # それ以外はログへ
         self._append("rx", line + "\n")
 
@@ -686,8 +726,16 @@ class App:
         """物理量に直したテレメトリ (CSV/バイナリ共通) でパネル・グラフ・統計を更新。
 
         バッチ受信では複数サンプルが一度に来るので、数値パネルは最後の 1 件だけ
-        (update_panel=True)、グラフと統計は全サンプルを反映する。
+        (update_panel=True)、グラフと統計は全サンプルを反映する。記録中なら全サンプルを
+        CSV へ書き出す。
         """
+        # CSV 記録 (全サンプル。パネル更新の有無に関わらず)
+        self._record_sample(vals)
+
+        # 較正ウィンドウが開いていれば S/G/A/M ライブ更新
+        if self._calib_win is not None:
+            self._calib_update_status(vals.get("calib", 0))
+
         # 表示更新 (パネル)
         if update_panel:
             for (key, _label, _scale, unit) in TELEMETRY_FIELDS:
@@ -727,6 +775,188 @@ class App:
             self._telem_count = 0
             self._telem_t0 = now
             self._set_metrics()
+
+    # -- CSV 記録 -----------------------------------------------------------
+    # 受信した全テレメトリサンプルを host 受信時刻つきで CSV に追記する。バッチで
+    # 複数サンプルが来ても 1 行ずつ残るので、0.06° ディザのような微小な時系列を
+    # オフラインで解析できる。GUI スレッドからのみ呼ばれるのでロック不要。
+    def _toggle_record(self):
+        if self._rec_file is None:
+            self._start_record()
+        else:
+            self._stop_record()
+
+    def _start_record(self):
+        path = os.path.join(os.getcwd(), time.strftime("telemetry_%Y%m%d_%H%M%S.csv"))
+        try:
+            f = open(path, "w", newline="")
+        except OSError as e:  # noqa: BLE001
+            self._append("log", f"記録ファイルを開けません: {e}\n")
+            return
+        self._rec_file = f
+        self._rec_writer = csv.writer(f)
+        self._rec_count = 0
+        self._rec_path = path
+        cols = ["host_unix", "host_time"] + [k for k, _l, _s, _u in TELEMETRY_FIELDS]
+        self._rec_writer.writerow(cols)
+        f.flush()
+        self.rec_btn.config(text="記録停止")
+        self._append("log", f"記録開始: {path}\n")
+
+    def _stop_record(self):
+        if self._rec_file is not None:
+            try:
+                self._rec_file.flush()
+                self._rec_file.close()
+            except OSError:
+                pass
+            self._append("log",
+                         f"記録停止: {self._rec_count} サンプル → {self._rec_path}\n")
+        self._rec_file = None
+        self._rec_writer = None
+        if hasattr(self, "rec_btn"):
+            self.rec_btn.config(text="記録開始")
+
+    def _record_sample(self, vals: dict):
+        if self._rec_writer is None:
+            return
+        now = time.time()
+        ms = int((now % 1) * 1000)
+        row = [f"{now:.6f}", time.strftime("%H:%M:%S", time.localtime(now)) + f".{ms:03d}"]
+        row += [vals.get(k) for k, _l, _s, _u in TELEMETRY_FIELDS]
+        try:
+            self._rec_writer.writerow(row)
+            self._rec_count += 1
+            if self._rec_count % 50 == 0:  # 定期 flush でクラッシュ時の取りこぼしを抑える
+                self._rec_file.flush()
+        except (OSError, ValueError) as e:  # noqa: BLE001
+            self._append("log", f"記録書き込み失敗: {e}\n")
+            self._stop_record()
+
+    # -- BNO055 読みモード / 較正 -------------------------------------------
+    def _toggle_read_mode(self):
+        self._read_split = not self._read_split
+        cmd = b"X1\n" if self._read_split else b"X0\n"
+        self.worker.submit(self.worker.send(cmd))
+        self.readmode_btn.config(text="読み:2B" if self._read_split else "読み:BLK")
+        self._append("log",
+                     f"BNO読みモード -> {'2B個別' if self._read_split else 'ブロック'}\n")
+
+    def _toggle_ffff_reject(self):
+        self._ffff_reject = not self._ffff_reject
+        self.worker.submit(self.worker.send(b"Y1\n" if self._ffff_reject else b"Y0\n"))
+        self.ffff_btn.config(text="0xFF除外:ON" if self._ffff_reject else "0xFF除外:OFF")
+        self._append("log",
+                     f"0xFFFF破損破棄 -> {'ON' if self._ffff_reject else 'OFF(素通し)'}\n")
+
+    def _open_calib_window(self):
+        if self._calib_win is not None and self._calib_win.winfo_exists():
+            self._calib_win.lift()
+            return
+        win = tk.Toplevel(self.root)
+        win.title("BNO055 較正")
+        win.geometry("440x380")
+        self._calib_win = win
+        self._calib_labels = {}
+
+        ttk.Label(win, text="較正ステータス (各 0→3、3 で完了)",
+                  font=("Menlo", 11, "bold")).pack(pady=(10, 4))
+        row = ttk.Frame(win)
+        row.pack(pady=4)
+        for key, name in [("S", "SYS"), ("G", "GYR"), ("A", "ACC"), ("M", "MAG")]:
+            cell = ttk.Frame(row)
+            cell.pack(side=tk.LEFT, padx=12)
+            ttk.Label(cell, text=name, foreground="#666").pack()
+            lbl = ttk.Label(cell, text="-", font=("Menlo", 22, "bold"))
+            lbl.pack()
+            self._calib_labels[key] = lbl
+
+        guide = ("手順 (動かしながら上の数字が 3 になるのを待つ):\n"
+                 "  GYR : 数秒間そのまま静止して置く\n"
+                 "  ACC : ゆっくり 6 面 (各軸 ±) で数秒ずつ静止\n"
+                 "  MAG : 空中で 8 の字を描く\n\n"
+                 "全部 3 になったら『保存』で書き出し。\n"
+                 "次回起動後は『復元』でそのプロファイルを即適用。")
+        ttk.Label(win, text=guide, justify=tk.LEFT,
+                  font=("Menlo", 9)).pack(pady=8, padx=14, anchor="w")
+
+        btns = ttk.Frame(win)
+        btns.pack(pady=6)
+        ttk.Button(btns, text="オフセット保存(ファイル)",
+                   command=self._on_calib_save).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="オフセット復元(ファイル)",
+                   command=self._on_calib_restore).pack(side=tk.LEFT, padx=4)
+
+        self._calib_status_var = tk.StringVar(value="")
+        ttk.Label(win, textvariable=self._calib_status_var,
+                  foreground="#06c", wraplength=400).pack(pady=4)
+
+    def _calib_update_status(self, calib_byte: int):
+        if self._calib_win is None or not self._calib_win.winfo_exists():
+            return
+        b = int(calib_byte)
+        vals = {"S": (b >> 6) & 3, "G": (b >> 4) & 3, "A": (b >> 2) & 3, "M": b & 3}
+        for k, val in vals.items():
+            lbl = self._calib_labels.get(k)
+            if lbl is not None:
+                lbl.config(text=str(val), foreground="#0a0" if val == 3 else "#c30")
+
+    def _on_calib_save(self):
+        if not self.connected:
+            self._append("log", "未接続のため較正保存できません\n")
+            return
+        self._calib_save_to_file = True
+        self.worker.submit(self.worker.send(b"CS\n"))
+        if self._calib_status_var is not None:
+            self._calib_status_var.set("保存要求を送信… (CDUMP 待ち)")
+        self._append("log", "較正オフセット保存要求 CS 送信\n")
+
+    def _on_calib_restore(self):
+        if not self.connected:
+            self._append("log", "未接続のため較正復元できません\n")
+            return
+        path = filedialog.askopenfilename(
+            filetypes=[("calib hex", "*.hex"), ("all", "*.*")])
+        if not path:
+            return
+        try:
+            with open(path) as f:
+                hexstr = "".join(f.read().split())
+        except OSError as e:  # noqa: BLE001
+            self._append("log", f"較正ファイル読込失敗: {e}\n")
+            return
+        if len(hexstr) != 44 or any(c not in "0123456789abcdefABCDEF" for c in hexstr):
+            messagebox.showerror("較正復元", "ファイル形式が不正です (44 hex 文字が必要)")
+            return
+        self.worker.submit(self.worker.send(f"CL{hexstr}\n".encode("ascii")))
+        if self._calib_status_var is not None:
+            self._calib_status_var.set("復元要求を送信… (CLOAD 待ち)")
+        self._append("log", f"較正オフセット復元 CL 送信 ({path})\n")
+
+    def _on_calib_dump(self, line: str):
+        """CDUMP <44hex> ok=1 を受けてファイル保存。"""
+        parts = line.split()
+        hexstr = parts[1] if len(parts) >= 2 else ""
+        ok = "ok=1" in line
+        self._last_calib_hex = hexstr if ok else None
+        msg = f"CDUMP ok={int(ok)} len={len(hexstr)}"
+        if ok and self._calib_save_to_file and len(hexstr) == 44:
+            path = filedialog.asksaveasfilename(
+                defaultextension=".hex", initialfile="bno055_calib.hex",
+                filetypes=[("calib hex", "*.hex"), ("all", "*.*")])
+            if path:
+                try:
+                    with open(path, "w") as f:
+                        f.write(hexstr + "\n")
+                    msg += f" -> {path}"
+                    if self._calib_status_var is not None:
+                        self._calib_status_var.set(f"保存しました: {path}")
+                except OSError as e:  # noqa: BLE001
+                    msg += f" 保存失敗:{e}"
+        elif not ok and self._calib_status_var is not None:
+            self._calib_status_var.set("保存失敗 (ok=0)")
+        self._calib_save_to_file = False
+        self._append("log", msg + "\n")
 
     # -- メトリクス表示 -----------------------------------------------------
     def _set_metrics(self):
@@ -834,6 +1064,7 @@ class App:
         self.text.config(state=tk.DISABLED)
 
     def _on_close(self):
+        self._stop_record()
         self.worker.stop()
         self.root.destroy()
 

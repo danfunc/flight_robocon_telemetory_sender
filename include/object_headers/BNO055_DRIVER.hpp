@@ -15,6 +15,15 @@ struct bno055_sample_t {
   bool valid;                 // 直近の I2C 読み出しが成功したか
 };
 
+// 較正オフセットプロファイル (BNO055 レジスタ 0x55..0x6A の 22 バイト)。calib_get で
+// ドライバ→呼び出し元へ、現在の保存状態とダンプを渡す。calib_load は data[22] のみ使う。
+static constexpr int BNO055_CALIB_PROFILE_LEN = 22;
+struct bno055_calib_xfer_t {
+  uint8_t done; // 1=直近の save/load が完了
+  uint8_t ok;   // 1=成功 (I2C 成功)
+  uint8_t data[BNO055_CALIB_PROFILE_LEN]; // オフセットプロファイル
+};
+
 // BNO055 (9 軸 IMU、NDOF フュージョン) を Shizuku オブジェクト化したドライバ。
 // 専用スレッドが I2C で姿勢/加速度を周期サンプリングし内部にキャッシュする。
 class BNO055_DRIVER {
@@ -26,6 +35,20 @@ public:
   enum METHOD_IDs : uint32_t {
     // arg0 = bno055_sample_t* (呼び出し元のバッファ)。最新値をコピーする。
     read_latest = 0,
+    // arg0 = 0:26B ブロック読み(既定) / 1:16bit 値ごとの 2B 個別読み。
+    set_read_mode = 1,
+    // arg0 無視。現オフセットプロファイルを内部バッファへ吸い出す(非同期、calib_get で取得)。
+    calib_save = 2,
+    // arg0 = uint8_t[22] への ptr。そのオフセットプロファイルを書き戻す(非同期)。
+    calib_load = 3,
+    // arg0 = bno055_calib_xfer_t* 。done/ok とダンプをコピーする(save/load の結果取得)。
+    calib_get = 4,
+    // arg0 = 0:0xFFFF 破損バーストをそのまま公開 / 1:検出して破棄(既定)。
+    set_ffff_reject = 5,
+    // arg0 = (obj_id<<16)|method_id。新サンプル push 先(sink)を登録。0xFFFF.. で無効。
+    set_sample_sink = 6,
+    // arg0 = (obj_id<<16)|method_id。較正 save/load 完了の push 先を登録。
+    set_calib_sink = 7,
   };
 };
 } // namespace shizu

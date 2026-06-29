@@ -17,22 +17,25 @@
 //  call_stack
 //                (メソッド呼び出しのネストを積むスタック) を持つ。
 //
-//  【2 層の SVC 番号】
-//   (1) kernel_object_svc_num … カーネルオブジェクト (id=0)
-//   のスレッドが発行した
-//        ときだけ svc_cpp_handler が直接処理する低位プリミティブ。
-//        METHOD_CALL(200) / METHOD_EXIT(201) / SET_SVC_HANDLER(202) /
-//        SWITCH_THREAD(203) / GET_CURRENT_THREAD_ID(0) など。
-//   (2) obj_api::svc_num … 一般オブジェクトが使う高位 API (CREATE_OBJECT,
-//        EXPORT_METHOD, CALL_METHOD, YIELD, SET/GET_OBJ_MEMORY ...)。これらは
-//        すべて `svc 0x00` で発行され、カーネルは「登録済み SVC ハンドラ
-//        (= カーネルオブジェクトの
-//        kernel_obj_svc_handler)」へトランポリンする。
+//  【ディスパッチは "svc 番号" ではなく "発行元オブジェクトの種別" で決まる】
+//   カーネルは svc 命令の番号で経路を分けてはいない。svc を発行したスレッドが
+//   属するオブジェクトが「カーネルオブジェクト」か「一般オブジェクト」かだけで
+//   経路が決まる (svc_cpp_handler 冒頭の object_table[...].state 判定)。svc 番号は
+//   経路を決めた後、そのオブジェクトが呼びたいプリミティブ/API の選択に使うだけ。
 //
-//  【ディスパッチの肝 (svc_cpp_handler 末尾)】
-//   ・発行元がカーネルオブジェクト        → プリミティブを switch で即実行。
-//   ・発行元が一般オブジェクト (svc 0)     → 現フレームを call_stack に積み、pc
-//   を
+//   API は用途別に 2 系統ある:
+//   (1) kernel_object_svc_num … カーネルオブジェクト (id=0) が使う低位プリミティブ。
+//        METHOD_CALL(200) / METHOD_EXIT(201) / SET_SVC_HANDLER(202) /
+//        SWITCH_THREAD(203) / GET_CURRENT_THREAD_ID(0) など。発行元がカーネル
+//        オブジェクトのときだけ svc_cpp_handler が switch で直接処理する。
+//   (2) obj_api::svc_num … 一般オブジェクトが使う高位 API (CREATE_OBJECT,
+//        EXPORT_METHOD, CALL_METHOD, YIELD, SET/GET_OBJ_MEMORY ...)。発行元が
+//        一般オブジェクトなら、カーネルは内容を解釈せず「登録済み SVC ハンドラ
+//        (= カーネルオブジェクトの kernel_obj_svc_handler)」へトランポリンする。
+//
+//  【ディスパッチの肝 (svc_cpp_handler)】
+//   ・発行元がカーネルオブジェクト  → プリミティブを switch で即実行。
+//   ・発行元が一般オブジェクト      → 現フレームを call_stack に積み、pc を
 //      登録済みハンドラへ張り替え、svc 番号/呼び出し元 obj/thread を r4/r5/r6
 //      に載せて 同じスレッド上でカーネルオブジェクトとして走らせる (権限委譲)。
 //
@@ -44,10 +47,13 @@
 //   つだけ載る。大きなデータはアドレスを arg に渡して
 //     呼び出し先がコピーする (単一アドレス空間なのでポインタが共有できる)。
 //
-//  【スケジューリング】
-//   プリエンプションは無い。各スレッドは明示的に yield (READY
-//   な次スレッドを探して SWITCH_THREAD) する。I2C/SVC 等の処理は yield
-//   しない限り原子的に走る。
+//  【スケジューリング — 方針はカーネルではなくカーネルオブジェクトが持つ】
+//   プリエンプションは無い。カーネルが提供するのは SWITCH_THREAD という機構
+//   だけ (「指定スレッドが READY なら、そこへ切り替える」というプリミティブ)。
+//   「次にどのスレッドを走らせるか」というスケジューリング方針はカーネル側には
+//   無く、カーネルオブジェクトの YIELD ハンドラが GET_THREAD_STATE で READY な
+//   次スレッドを探し、SWITCH_THREAD を発行することで実現する。各スレッドが
+//   明示的に yield しない限り、I2C/SVC 等の処理は原子的に走る。
 //
 //  svc_asm_handler.S が例外入口で {r4-r11, PSP} を context_t に退避し、ここで
 //  svc_cpp_handler が論理を処理して context を更新、復帰時に書き戻す。
@@ -322,7 +328,7 @@ void svc_cpp_handler(shizu::context_t *context) {
       break;
     }
   } else {
-    // 発行元が一般オブジェクト (svc 0x00) の場合: 直接は処理せず、登録済みの
+    // 発行元が一般オブジェクトの場合: 直接は処理せず、登録済みの
     // SVC ハンドラ (= カーネルオブジェクトの kernel_obj_svc_handler) へ
     // トランポリンする。現フレームを積み、pc をハンドラ入口へ、戻り先 lr を
     // exit_method へ張り替え、current object をハンドラの所有者 (カーネルオブジェクト)

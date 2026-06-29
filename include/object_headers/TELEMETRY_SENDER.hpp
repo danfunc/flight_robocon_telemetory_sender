@@ -23,6 +23,12 @@ public:
   enum METHOD_IDs : uint32_t {
     // BLE_UART の rx_sink から 1 バイトずつ呼ばれる (コマンド行の組み立て)。
     rx_byte = 0,
+    // arg0 = bno055_sample_t* 。BNO055 が新サンプルを push してくる(融合を駆動)。
+    on_bno_sample = 1,
+    // arg0 = bme280_sample_t* 。BME280 が新サンプルを push してくる(気圧補正)。
+    on_bme_sample = 2,
+    // arg0 = bno055_calib_xfer_t* 。BNO055 が較正 save/load 完了を push してくる。
+    on_calib_result = 3,
   };
 };
 } // namespace shizu

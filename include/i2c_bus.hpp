@@ -19,8 +19,11 @@ namespace i2c_bus {
 
 static constexpr uint SDA_PIN = 4;
 static constexpr uint SCL_PIN = 5;
-static constexpr uint FREQ_HZ = 100000;   // 100kHz (BME280/BNO055 とも対応)
-static constexpr uint TIMEOUT_US = 10000; // 1 トランザクションの上限
+static constexpr uint FREQ_HZ = 100000; // 100kHz Standard-mode (BNO055 は 400kHz
+                                        // でバースト末尾が化けるため低速で運用)
+// 1 トランザクションの上限。100kHz では 26B 読みが ~2.4ms かかるので、2ms 等にすると
+// calib(BME 0x88×26B)/motion(BNO 0x1A×26B) がタイムアウトして失敗する。4x 余裕。
+static constexpr uint TIMEOUT_US = 10000;
 
 // i2c0 はマクロ (ポインタ) なので関数で包んで使う。
 static inline i2c_inst_t *port() { return i2c0; }

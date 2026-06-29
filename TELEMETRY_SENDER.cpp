@@ -86,8 +86,14 @@ static volatile uint64_t blast_end_us = 0;
 static volatile uint32_t blast_seq = 0, blast_bytes = 0;
 static constexpr int BLAST_LINE_LEN = 480;
 
+// ---- 較正オフセット保存/復元のダウンリンク待ち -----------------------------
+// CS/CL コマンドは BNO スレッドに非同期で処理されるので、完了を main ループで
+// ポーリングして結果(CDUMP/CLOAD)をダウンリンクする。
+static bool calib_pending = false;     // 結果待ち中
+static bool calib_pending_save = false; // true=save(ダンプ返信), false=load(ack)
+
 // ---- RX 行アセンブリ -------------------------------------------------------
-static char rxline[64];
+static char rxline[80];
 static uint32_t rxlen = 0;
 
 // ===========================================================================
@@ -219,6 +225,61 @@ static void handle_line() {
   case 'F': { // 送信フォーマット: F1=バイナリ(既定), F0=CSV テキスト
     telemetry_binary = !(rxlen >= 2 && rxline[1] == '0');
     printf("[TELEMETRY] format -> %s\n", telemetry_binary ? "binary" : "CSV");
+    break;
+  }
+  case 'X': { // BNO055 読みモード: X1=2B 個別読み, X0=26B ブロック読み(既定)
+    uint32_t mode = (rxlen >= 2 && rxline[1] == '1') ? 1 : 0;
+    call_method(object_ids::BNO055_DRIVER,
+                BNO055_DRIVER::METHOD_IDs::set_read_mode, mode);
+    printf("[TELEMETRY] BNO read mode -> %s\n", mode ? "split2B" : "block");
+    break;
+  }
+  case 'Y': { // 0xFFFF 破損破棄: Y1=有効(既定), Y0=素通し
+    uint32_t on = (rxlen >= 2 && rxline[1] == '0') ? 0 : 1;
+    call_method(object_ids::BNO055_DRIVER,
+                BNO055_DRIVER::METHOD_IDs::set_ffff_reject, on);
+    printf("[TELEMETRY] 0xFFFF reject -> %s\n", on ? "on" : "off");
+    break;
+  }
+  case 'C': { // 較正オフセット: "CS"=保存(吸出), "CL<44hex>"=復元(書込)
+    if (rxlen >= 2 && rxline[1] == 'S') {
+      call_method(object_ids::BNO055_DRIVER,
+                  BNO055_DRIVER::METHOD_IDs::calib_save, 0);
+      calib_pending = true;
+      calib_pending_save = true;
+      printf("[TELEMETRY] calib save requested\n");
+    } else if (rxlen >= 2 && rxline[1] == 'L') {
+      // "CL" + 44 hex (= 22 バイト) を期待。
+      static uint8_t prof[BNO055_CALIB_PROFILE_LEN];
+      bool ok = (rxlen >= 2 + 2 * BNO055_CALIB_PROFILE_LEN);
+      for (int i = 0; ok && i < BNO055_CALIB_PROFILE_LEN; ++i) {
+        auto hexval = [](char c) -> int {
+          if (c >= '0' && c <= '9')
+            return c - '0';
+          if (c >= 'a' && c <= 'f')
+            return c - 'a' + 10;
+          if (c >= 'A' && c <= 'F')
+            return c - 'A' + 10;
+          return -1;
+        };
+        int hi = hexval(rxline[2 + 2 * i]);
+        int lo = hexval(rxline[2 + 2 * i + 1]);
+        if (hi < 0 || lo < 0)
+          ok = false;
+        else
+          prof[i] = (uint8_t)((hi << 4) | lo);
+      }
+      if (ok) {
+        call_method(object_ids::BNO055_DRIVER,
+                    BNO055_DRIVER::METHOD_IDs::calib_load,
+                    (uint32_t)(uintptr_t)prof);
+        calib_pending = true;
+        calib_pending_save = false;
+        printf("[TELEMETRY] calib load requested\n");
+      } else {
+        ble_send("CLOAD err=parse\r\n", 16);
+      }
+    }
     break;
   }
   default:
@@ -456,6 +517,7 @@ void TELEMETRY_SENDER::main() {
   uint32_t seq = 0;
   uint64_t prev_us = time_us_64();
   uint64_t last_flush_us = prev_us;
+  uint64_t next_us = prev_us; // 送信周期の絶対グリッド (処理時間を吸収して真の周期)
   char line[BLAST_LINE_LEN + 16];
 
   while (true) {
@@ -464,7 +526,30 @@ void TELEMETRY_SENDER::main() {
       flush_batch(); // 溜まっていれば吐き出してからブラストへ
       blast_step(line, (int)sizeof(line));
       obj_api::yield_us(30000);
+      next_us = time_us_64(); // ブラスト後はグリッドを取り直す
       continue;
+    }
+
+    // 較正 save/load の完了をポーリングして結果をダウンリンク。
+    if (calib_pending) {
+      bno055_calib_xfer_t cx = {};
+      call_method(object_ids::BNO055_DRIVER,
+                  BNO055_DRIVER::METHOD_IDs::calib_get,
+                  (uint32_t)(uintptr_t)&cx);
+      if (cx.done) {
+        char cl[80];
+        int n;
+        if (calib_pending_save) {
+          n = snprintf(cl, sizeof(cl), "CDUMP ");
+          for (int i = 0; i < BNO055_CALIB_PROFILE_LEN; ++i)
+            n += snprintf(cl + n, sizeof(cl) - n, "%02X", cx.data[i]);
+          n += snprintf(cl + n, sizeof(cl) - n, " ok=%d\r\n", cx.ok);
+        } else {
+          n = snprintf(cl, sizeof(cl), "CLOAD ok=%d\r\n", cx.ok);
+        }
+        ble_send(cl, n);
+        calib_pending = false;
+      }
     }
 
     uint64_t now_us = time_us_64();
@@ -548,7 +633,12 @@ void TELEMETRY_SENDER::main() {
     }
 
     seq++;
-    obj_api::yield_us(telemetry_period_us);
+    next_us += telemetry_period_us; // 絶対グリッドを1周期進める
+    uint64_t end_us = time_us_64();
+    if ((int64_t)(next_us - end_us) < 0)
+      next_us = end_us; // 処理が周期を超えた → 取りこぼし再同期
+    else
+      obj_api::yield_us(next_us - end_us); // 残り時間だけ待って真の周期を保つ
   }
 }
 
