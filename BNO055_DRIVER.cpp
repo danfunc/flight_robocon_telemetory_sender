@@ -58,6 +58,9 @@ static uint8_t g_calib_buf[CALIB_PROFILE_LEN];
 static uint32_t sample_sink_obj = 0xFFFF, sample_sink_method = 0;
 static uint32_t calib_sink_obj = 0xFFFF, calib_sink_method = 0;
 
+// サンプリング一時停止 (スループット試験中に I2C/融合を止めて帯域に振る)。
+static volatile bool g_paused = false;
+
 // ===========================================================================
 //  BNO055 低レベル
 // ===========================================================================
@@ -266,6 +269,11 @@ static void method_set_calib_sink(uint32_t, uint32_t, uint32_t packed, uint32_t)
   calib_sink_method = packed & 0xFFFF;
 }
 
+// arg0: 非0=サンプリング一時停止 / 0=再開。
+static void method_set_paused(uint32_t, uint32_t, uint32_t on, uint32_t) {
+  g_paused = (on != 0);
+}
+
 // 較正オフセットの吸い出し要求(実処理は BNO ループ内 handle_calib_cmd)。
 static void method_calib_save(uint32_t, uint32_t, uint32_t, uint32_t) {
   g_calib_done = false;
@@ -304,6 +312,7 @@ void BNO055_DRIVER::init() {
   export_method<method_set_ffff_reject>(BNO055_DRIVER::METHOD_IDs::set_ffff_reject);
   export_method<method_set_sample_sink>(BNO055_DRIVER::METHOD_IDs::set_sample_sink);
   export_method<method_set_calib_sink>(BNO055_DRIVER::METHOD_IDs::set_calib_sink);
+  export_method<method_set_paused>(BNO055_DRIVER::METHOD_IDs::set_paused);
   export_method<method_calib_save>(BNO055_DRIVER::METHOD_IDs::calib_save);
   export_method<method_calib_load>(BNO055_DRIVER::METHOD_IDs::calib_load);
   export_method<method_calib_get>(BNO055_DRIVER::METHOD_IDs::calib_get);
@@ -322,6 +331,12 @@ void BNO055_DRIVER::init() {
   // (これより速く読んでも同じ値しか出ない)。
   uint64_t next = time_us_64();
   while (true) {
+    // スループット試験中は I2C/融合を止めて帯域を空ける(yield で BLE は回り続ける)。
+    if (g_paused) {
+      obj_api::yield_us(20000);
+      next = time_us_64(); // 再開時にグリッドを取り直す
+      continue;
+    }
     // 較正の保存/復元要求があれば先に処理(モード切替で数十ms掛かるのでグリッド再同期)。
     if (g_calib_cmd != 0) {
       handle_calib_cmd();

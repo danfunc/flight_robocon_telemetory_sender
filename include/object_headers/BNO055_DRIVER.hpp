@@ -49,6 +49,8 @@ public:
     set_sample_sink = 6,
     // arg0 = (obj_id<<16)|method_id。較正 save/load 完了の push 先を登録。
     set_calib_sink = 7,
+    // arg0 = 0:サンプリング再開 / 非0:一時停止(スループット試験中に I2C を空ける)。
+    set_paused = 8,
   };
 };
 } // namespace shizu

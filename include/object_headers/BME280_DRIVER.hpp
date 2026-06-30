@@ -32,6 +32,8 @@ public:
     rezero = 1,
     // arg0 = (obj_id<<16)|method_id。新サンプル push 先(sink)を登録。0xFFFF... で無効。
     set_sample_sink = 2,
+    // arg0 = 0:サンプリング再開 / 非0:一時停止(スループット試験中に I2C を空ける)。
+    set_paused = 3,
   };
 };
 } // namespace shizu

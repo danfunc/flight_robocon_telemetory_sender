@@ -447,22 +447,15 @@ static void sm_packet_handler(uint8_t packet_type, uint16_t channel,
 // ===========================================================================
 //  エクスポートするメソッド
 // ===========================================================================
-static void method_send_byte(uint32_t _caller_obj_id,
-                             uint32_t _caller_thread_id, uint32_t byte,
-                             uint32_t _arg1) {
-  (void)_caller_obj_id;
-  (void)_caller_thread_id;
-  (void)_arg1;
-  uint8_t b = (uint8_t)(byte & 0xFF);
-
-  // 行をステージングへ溜める。協調スケジューリングでは 1 行分の send_byte
-  // 列の途中でスレッドが切り替わらないので、line_buf は実質その行専有になる。
+// 1 バイトを行ステージングへ積む。'\n' で 1 行確定 → リングへコミット。
+// send_byte / send_buf 共通の本体。協調スケジューリングでは 1 行分の連続呼び出しの
+// 途中でスレッドが切り替わらないので、line_buf は実質その行専有になる。
+static void tx_stage_byte(uint8_t b) {
   if (line_len < TX_LINE_MAX)
     line_buf[line_len++] = b;
   else
     line_overflow = true; // 長すぎる行はコミット時に丸ごと破棄する
 
-  // '\n' で 1 行確定 → ロック下でリングへ原子的にコミット。
   if (b == (uint8_t)'\n') {
     tx_commit_line();
     // 通知が有効で送信要求がまだなら、次の送信機会を確保。
@@ -472,6 +465,30 @@ static void method_send_byte(uint32_t _caller_obj_id,
       att_server_request_can_send_now_event(con_handle);
     }
   }
+}
+
+static void method_send_byte(uint32_t _caller_obj_id,
+                             uint32_t _caller_thread_id, uint32_t byte,
+                             uint32_t _arg1) {
+  (void)_caller_obj_id;
+  (void)_caller_thread_id;
+  (void)_arg1;
+  tx_stage_byte((uint8_t)(byte & 0xFF));
+}
+
+// arg0 = ble_tx_buf_t* 。バッファをまとめて積む(1 バイトずつ call_method しない)。
+static void method_send_buf(uint32_t _caller_obj_id, uint32_t _caller_thread_id,
+                            uint32_t ptr, uint32_t _arg1) {
+  (void)_caller_obj_id;
+  (void)_caller_thread_id;
+  (void)_arg1;
+  if (ptr == 0)
+    return;
+  const ble_tx_buf_t *b = (const ble_tx_buf_t *)(uintptr_t)ptr;
+  if (b->data == nullptr)
+    return;
+  for (uint32_t i = 0; i < b->len; ++i)
+    tx_stage_byte(b->data[i]);
 }
 
 static void method_set_rx_sink(uint32_t _caller_obj_id,
@@ -494,6 +511,7 @@ void BLE_UART_DRIVER::init() {
 
   // 1) メソッドを先にエクスポート (BT が立ち上がる前でも積める)
   export_method<method_send_byte>(BLE_UART_DRIVER::METHOD_IDs::send_byte);
+  export_method<method_send_buf>(BLE_UART_DRIVER::METHOD_IDs::send_buf);
   export_method<method_set_rx_sink>(BLE_UART_DRIVER::METHOD_IDs::set_rx_sink);
 
   // 2) CYW43 / BTstack 初期化

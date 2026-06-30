@@ -60,11 +60,21 @@ enum Elev { EL_NEUTRAL = 0, EL_UP = 1, EL_DOWN = 2 };
 //  BLE 送信ヘルパー
 // ===========================================================================
 static void ble_send(const char *s, int len) {
-  for (int i = 0; i < len; ++i) {
-    call_method(object_ids::BLE_UART_DRIVER,
-                BLE_UART_DRIVER::METHOD_IDs::send_byte,
-                (uint32_t)(uint8_t)s[i]);
-  }
+  if (len <= 0)
+    return;
+  // バッファのアドレス+長さを 1 個のポインタで渡して一括送信(1 バイトずつ
+  // call_method する代わり)。記述子 b はこの同期呼び出しの間だけ有効ならよい。
+  ble_tx_buf_t b = {(const uint8_t *)s, (uint32_t)len};
+  call_method(object_ids::BLE_UART_DRIVER, BLE_UART_DRIVER::METHOD_IDs::send_buf,
+              (uint32_t)(uintptr_t)&b);
+}
+
+// スループット試験中はセンサのサンプリングを止め、I2C/融合に食われる時間を帯域へ
+// 回す(協調スケジューラなので他スレッドの停止はできないが、無駄な仕事は消せる)。
+static void set_sensors_paused(bool paused) {
+  uint32_t v = paused ? 1u : 0u;
+  call_method(object_ids::BNO055_DRIVER, BNO055_DRIVER::METHOD_IDs::set_paused, v);
+  call_method(object_ids::BME280_DRIVER, BME280_DRIVER::METHOD_IDs::set_paused, v);
 }
 
 // float を四捨五入して整数スケールに落とす (%f を使わず送るため)。
@@ -86,11 +96,13 @@ static volatile uint64_t blast_end_us = 0;
 static volatile uint32_t blast_seq = 0, blast_bytes = 0;
 static constexpr int BLAST_LINE_LEN = 480;
 
-// ---- 較正オフセット保存/復元のダウンリンク待ち -----------------------------
-// CS/CL コマンドは BNO スレッドに非同期で処理されるので、完了を main ループで
-// ポーリングして結果(CDUMP/CLOAD)をダウンリンクする。
-static bool calib_pending = false;     // 結果待ち中
-static bool calib_pending_save = false; // true=save(ダンプ返信), false=load(ack)
+// ---- 較正オフセット保存/復元 (push 受信) ------------------------------------
+// CS/CL を BNO へ要求し、完了は on_calib_result で push 受信する(ポーリングしない)。
+// ダウンリンク自体は BLE バイト生成を単一スレッドに保つため送信ループ側で行う。
+static bool calib_pending_save = false;      // true=save(CDUMP), false=load(CLOAD)
+static volatile bool calib_dl_ready = false; // 結果を受領しダウンリンク待ち
+static volatile uint8_t calib_dl_ok = 0;
+static uint8_t calib_dl_data[BNO055_CALIB_PROFILE_LEN];
 
 // ---- RX 行アセンブリ -------------------------------------------------------
 static char rxline[80];
@@ -212,6 +224,7 @@ static void handle_line() {
     blast_bytes = 0;
     blast_end_us = time_us_64() + (uint64_t)secs * 1000000ull;
     blast_active = true;
+    set_sensors_paused(true); // 試験中はセンサを止めて帯域に振る
     printf("[TELEMETRY] blast start %lu s\n", (unsigned long)secs);
     break;
   }
@@ -245,8 +258,7 @@ static void handle_line() {
     if (rxlen >= 2 && rxline[1] == 'S') {
       call_method(object_ids::BNO055_DRIVER,
                   BNO055_DRIVER::METHOD_IDs::calib_save, 0);
-      calib_pending = true;
-      calib_pending_save = true;
+      calib_pending_save = true; // 結果は on_calib_result に push される
       printf("[TELEMETRY] calib save requested\n");
     } else if (rxlen >= 2 && rxline[1] == 'L') {
       // "CL" + 44 hex (= 22 バイト) を期待。
@@ -273,8 +285,7 @@ static void handle_line() {
         call_method(object_ids::BNO055_DRIVER,
                     BNO055_DRIVER::METHOD_IDs::calib_load,
                     (uint32_t)(uintptr_t)prof);
-        calib_pending = true;
-        calib_pending_save = false;
+        calib_pending_save = false; // 結果は on_calib_result に push される
         printf("[TELEMETRY] calib load requested\n");
       } else {
         ble_send("CLOAD err=parse\r\n", 16);
@@ -310,6 +321,7 @@ static void blast_step(char *line, int cap) {
                      (unsigned long)blast_seq, (unsigned long)blast_bytes);
     ble_send(line, n);
     blast_active = false;
+    set_sensors_paused(false); // 試験終了 → センサ再開
     return;
   }
   int n = snprintf(line, cap, "D%lu ", (unsigned long)blast_seq);
@@ -494,6 +506,72 @@ static void batch_push(uint32_t seq, uint32_t up_ms, const bme280_sample_t &bme,
 }
 
 // ===========================================================================
+//  融合状態 (push ハンドラが更新、送信ループが読む)
+// ---------------------------------------------------------------------------
+//  協調スケジューラ単一コアなので、push ハンドラは yield せず原子的に走る。送信
+//  ループも状態の読み出し〜パケット化の間 yield しないため、torn read は起きない。
+// ===========================================================================
+static float g_h_est = 0.f, g_v_est = 0.f, g_h_baro_prev = 0.f;
+static float g_last_a_z = 0.f;
+static uint64_t g_last_bno_us = 0, g_last_baro_us = 0;
+static uint32_t g_last_bme_seq = 0;
+static bno055_sample_t g_bno = {}; // 直近の BNO サンプル(送信スナップ用)
+static bme280_sample_t g_bme = {}; // 直近の BME サンプル
+
+// BNO055 から新サンプルが push される。慣性鉛直加速度を 100Hz フルレートで積分。
+static void handle_bno_push(uint32_t, uint32_t, uint32_t ptr, uint32_t) {
+  if (ptr == 0)
+    return;
+  memcpy(&g_bno, (const void *)(uintptr_t)ptr, sizeof(g_bno));
+  if (!g_bno.valid)
+    return;
+  uint64_t now = time_us_64();
+  float dt = (float)(now - g_last_bno_us) / 1e6f;
+  g_last_bno_us = now;
+  if (dt <= 0.f || dt > 0.5f)
+    dt = 0.01f; // 異常 dt のガード(初回含む)
+  float a_z = world_z_accel(g_bno);
+  if (a_z > A_Z_CLIP)
+    a_z = A_Z_CLIP;
+  if (a_z < -A_Z_CLIP)
+    a_z = -A_Z_CLIP;
+  g_h_est += g_v_est * dt + 0.5f * a_z * dt * dt;
+  g_v_est += a_z * dt;
+  g_last_a_z = a_z;
+}
+
+// BME280 から新サンプルが push される。気圧高度で相補補正(BME の実レート ~21Hz)。
+static void handle_bme_push(uint32_t, uint32_t, uint32_t ptr, uint32_t) {
+  if (ptr == 0)
+    return;
+  memcpy(&g_bme, (const void *)(uintptr_t)ptr, sizeof(g_bme));
+  if (!g_bme.valid || g_bme.seq == g_last_bme_seq)
+    return;
+  uint64_t now = time_us_64();
+  float baro_dt = (float)(now - g_last_baro_us) / 1e6f;
+  if (baro_dt <= 0.f)
+    baro_dt = 0.02f;
+  g_last_baro_us = now;
+  g_last_bme_seq = g_bme.seq;
+  g_h_est = ALPHA_H * g_h_est + (1.0f - ALPHA_H) * g_bme.alt_m;
+  float v_baro = (g_bme.alt_m - g_h_baro_prev) / baro_dt;
+  g_v_est = ALPHA_V * g_v_est + (1.0f - ALPHA_V) * v_baro;
+  g_h_baro_prev = g_bme.alt_m;
+}
+
+// BNO055 から較正 save/load 完了が push される。データを受け取りフラグを立てる
+// (ダウンリンクは送信ループが行う)。
+static void handle_calib_push(uint32_t, uint32_t, uint32_t ptr, uint32_t) {
+  if (ptr == 0)
+    return;
+  bno055_calib_xfer_t x;
+  memcpy(&x, (const void *)(uintptr_t)ptr, sizeof(x));
+  calib_dl_ok = x.ok;
+  memcpy(calib_dl_data, x.data, BNO055_CALIB_PROFILE_LEN);
+  calib_dl_ready = true;
+}
+
+// ===========================================================================
 //  オブジェクトエントリ
 // ===========================================================================
 void TELEMETRY_SENDER::main() {
@@ -506,11 +584,22 @@ void TELEMETRY_SENDER::main() {
   call_method(object_ids::BLE_UART_DRIVER,
               BLE_UART_DRIVER::METHOD_IDs::set_rx_sink, sink);
 
-  // 融合状態
-  float h_est = 0.f, v_est = 0.f;
-  float h_baro_prev = 0.f;
-  uint32_t last_bme_seq = 0;
-  uint64_t last_baro_us = time_us_64();
+  // センサ/較正の push を受け取るハンドラを公開し、各ドライバへ sink を登録する
+  // (以後 read_latest のポーリングは行わず、push されたサンプルで融合する)。
+  export_method<handle_bno_push>(TELEMETRY_SENDER::METHOD_IDs::on_bno_sample);
+  export_method<handle_bme_push>(TELEMETRY_SENDER::METHOD_IDs::on_bme_sample);
+  export_method<handle_calib_push>(TELEMETRY_SENDER::METHOD_IDs::on_calib_result);
+  auto pack = [](TELEMETRY_SENDER::METHOD_IDs m) {
+    return ((uint32_t)object_ids::TELEMETRY_SENDER << 16) | (uint32_t)m;
+  };
+  call_method(object_ids::BNO055_DRIVER, BNO055_DRIVER::METHOD_IDs::set_sample_sink,
+              pack(TELEMETRY_SENDER::METHOD_IDs::on_bno_sample));
+  call_method(object_ids::BNO055_DRIVER, BNO055_DRIVER::METHOD_IDs::set_calib_sink,
+              pack(TELEMETRY_SENDER::METHOD_IDs::on_calib_result));
+  call_method(object_ids::BME280_DRIVER, BME280_DRIVER::METHOD_IDs::set_sample_sink,
+              pack(TELEMETRY_SENDER::METHOD_IDs::on_bme_sample));
+
+  // 出力側の状態 (送信ループ内でのみ使用。融合状態は g_* で push ハンドラが更新)。
   VState vstate = ST_LEVEL;
   PID pid;
 
@@ -530,66 +619,31 @@ void TELEMETRY_SENDER::main() {
       continue;
     }
 
-    // 較正 save/load の完了をポーリングして結果をダウンリンク。
-    if (calib_pending) {
-      bno055_calib_xfer_t cx = {};
-      call_method(object_ids::BNO055_DRIVER,
-                  BNO055_DRIVER::METHOD_IDs::calib_get,
-                  (uint32_t)(uintptr_t)&cx);
-      if (cx.done) {
-        char cl[80];
-        int n;
-        if (calib_pending_save) {
-          n = snprintf(cl, sizeof(cl), "CDUMP ");
-          for (int i = 0; i < BNO055_CALIB_PROFILE_LEN; ++i)
-            n += snprintf(cl + n, sizeof(cl) - n, "%02X", cx.data[i]);
-          n += snprintf(cl + n, sizeof(cl) - n, " ok=%d\r\n", cx.ok);
-        } else {
-          n = snprintf(cl, sizeof(cl), "CLOAD ok=%d\r\n", cx.ok);
-        }
-        ble_send(cl, n);
-        calib_pending = false;
+    // 較正 save/load 完了が push されていればダウンリンク(BLE 生成は本スレッドのみ)。
+    if (calib_dl_ready) {
+      calib_dl_ready = false;
+      char cl[80];
+      int n;
+      if (calib_pending_save) {
+        n = snprintf(cl, sizeof(cl), "CDUMP ");
+        for (int i = 0; i < BNO055_CALIB_PROFILE_LEN; ++i)
+          n += snprintf(cl + n, sizeof(cl) - n, "%02X", calib_dl_data[i]);
+        n += snprintf(cl + n, sizeof(cl) - n, " ok=%d\r\n", calib_dl_ok);
+      } else {
+        n = snprintf(cl, sizeof(cl), "CLOAD ok=%d\r\n", calib_dl_ok);
       }
+      ble_send(cl, n);
     }
 
     uint64_t now_us = time_us_64();
     float dt = (float)(now_us - prev_us) / 1e6f;
     prev_us = now_us;
     if (dt <= 0.f || dt > 0.5f)
-      dt = 0.02f; // 異常 dt のガード
+      dt = 0.04f; // PID 用 dt (送信周期相当)。異常値ガード。
 
-    // --- センサ購読 (ポインタ渡しでスナップショットを受け取る) ---
-    bme280_sample_t bme = {};
-    bno055_sample_t bno = {};
-    call_method(object_ids::BME280_DRIVER,
-                BME280_DRIVER::METHOD_IDs::read_latest,
-                (uint32_t)(uintptr_t)&bme);
-    call_method(object_ids::BNO055_DRIVER,
-                BNO055_DRIVER::METHOD_IDs::read_latest,
-                (uint32_t)(uintptr_t)&bno);
-
-    // --- 慣性による高度/速度の予測 (傾き補正済み鉛直加速度を積分) ---
-    float a_z = bno.valid ? world_z_accel(bno) : 0.f;
-    if (a_z > A_Z_CLIP)
-      a_z = A_Z_CLIP;
-    if (a_z < -A_Z_CLIP)
-      a_z = -A_Z_CLIP;
-    h_est += v_est * dt + 0.5f * a_z * dt * dt;
-    v_est += a_z * dt;
-
-    // --- 気圧高度で相補補正 (BME のサンプルが更新されたときだけ) ---
-    if (bme.valid && bme.seq != last_bme_seq) {
-      float baro_dt = (float)(now_us - last_baro_us) / 1e6f;
-      if (baro_dt <= 0.f)
-        baro_dt = 0.02f;
-      last_baro_us = now_us;
-      last_bme_seq = bme.seq;
-      h_est = ALPHA_H * h_est + (1.0f - ALPHA_H) * bme.alt_m;
-      float v_baro = (bme.alt_m - h_baro_prev) / baro_dt;
-      v_est = ALPHA_V * v_est + (1.0f - ALPHA_V) * v_baro;
-      h_baro_prev = bme.alt_m;
-    }
-
+    // 融合状態は push ハンドラ(on_bno_sample / on_bme_sample)が随時更新済み。ここ
+    // ではスナップショットして送信パケットを作るだけ(プルもポーリングもしない)。
+    float h_est = g_h_est, v_est = g_v_est, a_z = g_last_a_z;
     vstate = next_state(vstate, v_est);
 
     // --- 高度保持 PID (監視用に算出。サーボ駆動は本オブジェクトの範囲外) ---
@@ -605,7 +659,7 @@ void TELEMETRY_SENDER::main() {
     if (telemetry_binary) {
       // バッチに積む。満杯なら batch_push 内で flush、そうでなくても一定間隔で
       // flush して低レート時の遅延を抑える。
-      batch_push(seq, up_ms, bme, bno, h_est, v_est, a_z, (int)vstate,
+      batch_push(seq, up_ms, g_bme, g_bno, h_est, v_est, a_z, (int)vstate,
                  (int)elev, servo);
       // batch_push が満杯で flush 済み (batch_count==0) か、一定間隔超過なら
       // flush。
@@ -619,11 +673,11 @@ void TELEMETRY_SENDER::main() {
           line, sizeof(line),
           "PICO,%lu,%lu,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%u,%d,%d,%ld\r\n",
           (unsigned long)seq, (unsigned long)up_ms,
-          (long)scaled(bme.temp_c, 100.f), (long)scaled(bme.press_hpa, 100.f),
-          (long)scaled(bme.alt_m, 1000.f), (long)scaled(h_est, 1000.f),
+          (long)scaled(g_bme.temp_c, 100.f), (long)scaled(g_bme.press_hpa, 100.f),
+          (long)scaled(g_bme.alt_m, 1000.f), (long)scaled(h_est, 1000.f),
           (long)scaled(v_est, 1000.f), (long)scaled(a_z, 1000.f),
-          (long)scaled(bno.heading, 100.f), (long)scaled(bno.roll, 100.f),
-          (long)scaled(bno.pitch, 100.f), (unsigned)bno.calib, (int)vstate,
+          (long)scaled(g_bno.heading, 100.f), (long)scaled(g_bno.roll, 100.f),
+          (long)scaled(g_bno.pitch, 100.f), (unsigned)g_bno.calib, (int)vstate,
           (int)elev, (long)scaled(servo, 100.f));
       if (len < 0)
         len = 0;

@@ -3,6 +3,15 @@
 #include <cstdint>
 
 namespace shizu {
+
+// send_buf に渡す送信バッファ記述子。呼び出し元のバッファへのポインタと長さを
+// 1 個のポインタで渡す(センサの read_latest 等と同じアドレス渡し)。data は
+// メソッド呼び出しが返るまで有効であればよい(同期コピーされる)。
+struct ble_tx_buf_t {
+  const uint8_t *data;
+  uint32_t len;
+};
+
 // Nordic UART Service (NUS) ペリフェラルを Shizuku オブジェクト化したもの。
 //   RX char (6E400002, Write/WriteWithoutResponse) : Central -> Peripheral
 //   TX char (6E400003, Notify)                     : Peripheral -> Central
@@ -21,6 +30,9 @@ public:
     // 受信 1 バイトごとに call_method(sink_obj_id, sink_method_id, byte) を呼ぶ。
     // sink_obj_id == 0xFFFF で無効化。
     set_rx_sink = 1,
+    // arg0 = ble_tx_buf_t* 。バッファをまとめて TX リングへ積む(1 バイトずつ
+    // call_method する代わりの一括送信)。send_byte と同じ行フレーミング(\n で確定)。
+    send_buf = 2,
   };
 };
 } // namespace shizu

@@ -48,6 +48,9 @@ static bme280_sample_t latest = {0, 0.f, 0.f, 0.f, false};
 static uint32_t sample_sink_obj = 0xFFFF;
 static uint32_t sample_sink_method = 0;
 
+// サンプリング一時停止 (スループット試験中に I2C を止めて帯域に振る)。
+static volatile bool g_paused = false;
+
 // ===========================================================================
 //  BME280 低レベル
 // ===========================================================================
@@ -181,6 +184,11 @@ static void method_set_sample_sink(uint32_t, uint32_t, uint32_t packed, uint32_t
   sample_sink_method = packed & 0xFFFF;
 }
 
+// arg0: 非0=サンプリング一時停止 / 0=再開。
+static void method_set_paused(uint32_t, uint32_t, uint32_t on, uint32_t) {
+  g_paused = (on != 0);
+}
+
 static void method_rezero(uint32_t _a, uint32_t _b, uint32_t _c, uint32_t _d) {
   (void)_a;
   (void)_b;
@@ -199,6 +207,7 @@ void BME280_DRIVER::init() {
   export_method<method_read_latest>(BME280_DRIVER::METHOD_IDs::read_latest);
   export_method<method_rezero>(BME280_DRIVER::METHOD_IDs::rezero);
   export_method<method_set_sample_sink>(BME280_DRIVER::METHOD_IDs::set_sample_sink);
+  export_method<method_set_paused>(BME280_DRIVER::METHOD_IDs::set_paused);
 
   i2c_bus::init();
   if (!bme_init_sensor()) {
@@ -217,6 +226,11 @@ void BME280_DRIVER::init() {
   // ので、新しいデータが出る実レートの上限は ~21Hz。これより速くポーリングしても
   // 変換完了前の同じ値を二度読みするだけなので、その限界に合わせて回す。
   while (true) {
+    // スループット試験中は I2C を止めて帯域を空ける(yield で BLE は回り続ける)。
+    if (g_paused) {
+      obj_api::yield_us(50000);
+      continue;
+    }
     float t, p;
     if (read_raw(&t, &p)) {
       bme280_sample_t s;
