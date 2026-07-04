@@ -350,10 +350,21 @@ class BleWorker:
             self.log(f"同期失敗: {e} (ペアリングが必要かもしれません)")
 
     async def read_rssi(self):
+        # bleak の公開 API に接続中リンクの RSSI は無く、CoreBluetooth (macOS)
+        # backend だけが get_rssi() を持つ。WinRT (Windows) / BlueZ (Linux) は
+        # OS 側に相当 API が存在しないため取得不能。その場合は unsupported=True
+        # を付けて通知し、GUI 側で表示を「非対応」にしてポーリングを止めてもらう
+        # (Pico 側 RSSI は "RSSI=" 行の notify で届くので引き続き使える)。
         if not (self.client and self.client.is_connected):
             return
+        getter = getattr(self.client._backend, "get_rssi", None)
+        if getter is None:
+            self.post(
+                "rssi_host", value=None, unsupported=True,
+                error=f"{sys.platform} の bleak backend に接続中 RSSI 取得 API 無し")
+            return
         try:
-            rssi = await self.client._backend.get_rssi()
+            rssi = await getter()
             self.post("rssi_host", value=int(rssi))
         except Exception as e:  # noqa: BLE001
             self.post("rssi_host", value=None, error=str(e))

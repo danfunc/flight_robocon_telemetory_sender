@@ -30,6 +30,7 @@ import asyncio
 import collections
 import queue
 import re
+import sys
 import threading
 import time
 import tkinter as tk
@@ -171,12 +172,19 @@ class BleWorker:
         """母艦 (ホスト) 側の無線が測る接続 RSSI を取得して GUI へ送る。
 
         bleak の公開 API には接続中 RSSI が無いため backend の get_rssi() を使う
-        (macOS/CoreBluetooth では CBPeripheral.readRSSI 経由で実装済み)。backend
-        が未対応のプラットフォームでは error を載せて返し、GUI 側で一度だけ警告。"""
+        (macOS/CoreBluetooth では CBPeripheral.readRSSI 経由で実装済み)。WinRT
+        (Windows) / BlueZ (Linux) には OS 側に相当 API が無いので unsupported=True
+        を付けて返し、GUI 側で表示を「非対応」にしてポーリングを止めてもらう。"""
         if not (self.client and self.client.is_connected):
             return
+        getter = getattr(self.client._backend, "get_rssi", None)
+        if getter is None:
+            self.post(
+                "rssi_host", value=None, unsupported=True,
+                error=f"{sys.platform} の bleak backend に接続中 RSSI 取得 API 無し")
+            return
         try:
-            rssi = await self.client._backend.get_rssi()
+            rssi = await getter()
             self.post("rssi_host", value=int(rssi))
         except Exception as e:  # noqa: BLE001
             self.post("rssi_host", value=None, error=str(e))
@@ -296,6 +304,9 @@ class App:
         self._host_rssi = None
         self._pico_rssi = None
         self._rssi_warned = False  # 母艦側 RSSI 取得不可の警告は一度だけ
+        # OS の bleak backend が接続中 RSSI 取得に非対応 (Windows/Linux)。
+        # 一度検出したら以後ポーリングしない (プラットフォームは変わらないため)。
+        self._host_rssi_unsupported = False
 
         root.title("Shizuku BLE UART クライアント")
         root.geometry("700x760")
@@ -430,13 +441,18 @@ class App:
         )
 
     def _set_rssi(self):
-        h = f"{self._host_rssi} dBm" if self._host_rssi is not None else "-"
+        if self._host_rssi is not None:
+            h = f"{self._host_rssi} dBm"
+        elif self._host_rssi_unsupported:
+            h = "非対応(このOS)"
+        else:
+            h = "-"
         p = f"{self._pico_rssi} dBm" if self._pico_rssi is not None else "-"
         self.rssi_var.set(f"RSSI  母艦(host): {h}    Pico(device): {p}")
 
     def _poll_rssi(self):
         # 接続中は母艦側 RSSI を周期取得 (Pico 側は notify で勝手に届く)。
-        if self.connected:
+        if self.connected and not self._host_rssi_unsupported:
             self.worker.submit(self.worker.read_rssi())
         self.root.after(1000, self._poll_rssi)
 
@@ -560,6 +576,16 @@ class App:
                 self._host_rssi = val
                 self.rssi_graph.add("host", val)
                 self._set_rssi()
+            elif payload.get("unsupported"):
+                if not self._host_rssi_unsupported:
+                    self._host_rssi_unsupported = True
+                    self._set_rssi()
+                    self._append(
+                        "log",
+                        f"母艦側 RSSI はこの OS では取得できません "
+                        f"(Pico 側 RSSI で電波状況を確認してください): "
+                        f"{payload.get('error', '')}\n",
+                    )
             elif not self._rssi_warned:
                 self._rssi_warned = True
                 self._append(

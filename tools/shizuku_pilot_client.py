@@ -15,6 +15,7 @@ Airbus の PFD (Primary Flight Display) を模し、中央に人工水平儀
 
 import math
 import queue
+import re
 import time
 import tkinter as tk
 from tkinter import ttk
@@ -373,6 +374,10 @@ class PilotApp:
         self.connected = False
         self.state = {}                 # 最新テレメトリ vals
         self.host_rssi = None
+        self.pico_rssi = None               # 機体側測定 ("RSSI=" 行の notify)
+        # OS の bleak backend が接続中 RSSI 取得に非対応 (Windows/Linux)。
+        # 検出後はポーリングをやめ、LINK 表示は Pico 側 RSSI で代用する。
+        self._host_rssi_unsupported = False
         self._rate_n = 0
         self._rate_t = None
         self._rate = 0.0
@@ -482,9 +487,13 @@ class PilotApp:
 
     def _handle(self, kind, payload):
         if kind == "rx":
-            samples, _texts = self.rx.feed(payload["data"])
+            samples, texts = self.rx.feed(payload["data"])
             for v in samples:
                 self._ingest(v)
+            for line in texts:
+                m = re.match(r"RSSI=(-?\d+)", line)
+                if m:
+                    self.pico_rssi = int(m.group(1))
         elif kind == "scan_done":
             self._label_to_addr = {lbl: addr for lbl, addr in payload["items"]}
             labels = list(self._label_to_addr.keys())
@@ -496,6 +505,8 @@ class PilotApp:
             v = payload.get("value")
             if v is not None:
                 self.host_rssi = v
+            elif payload.get("unsupported"):
+                self._host_rssi_unsupported = True
         elif kind == "connected":
             self.connected = True
             self.connect_btn.config(state=tk.NORMAL, text="切断")
@@ -509,6 +520,7 @@ class PilotApp:
             err = payload.get("error")
             self.status_var.set(f"● 接続失敗: {err}" if err else "● 未接続")
             self.host_rssi = None
+            self.pico_rssi = None
             self._last_seq = None
 
     def _ingest(self, v):
@@ -543,12 +555,19 @@ class PilotApp:
         b = int(s.get("calib", 0))
         sgam = f"{(b>>6)&3} {(b>>4)&3} {(b>>2)&3} {b&3}"
         self.r_calib.set(sgam, warn=((b >> 2) & 3) < 3)  # ACC 未較正を警告色
-        rssi = f"{self.host_rssi}dBm" if self.host_rssi is not None else "--"
+        # 母艦側 RSSI が取れない OS (Windows/Linux) では機体側測定で代用し、
+        # 区別のため (P) を付ける。リンクはほぼ対称なので目安としては十分。
+        if self.host_rssi is not None:
+            rssi = f"{self.host_rssi}dBm"
+        elif self.pico_rssi is not None:
+            rssi = f"{self.pico_rssi}dBm(P)"
+        else:
+            rssi = "--"
         self.r_link.set(f"{rssi} / {self._rate:.0f}Hz L{self._lost}",
                         warn=(not self.connected))
 
     def _poll_rssi(self):
-        if self.connected:
+        if self.connected and not self._host_rssi_unsupported:
             self.worker.submit(self.worker.read_rssi())
         self.root.after(1000, self._poll_rssi)
 
