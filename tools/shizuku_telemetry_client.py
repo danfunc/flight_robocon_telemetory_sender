@@ -156,6 +156,9 @@ class App:
         self._host_rssi = None
         self._pico_rssi = None
         self._rssi_warned = False
+        # OS の bleak backend が接続中 RSSI 取得に非対応 (Windows/Linux)。
+        # 一度検出したら以後ポーリングしない (プラットフォームは変わらないため)。
+        self._host_rssi_unsupported = False
         self._telem_count = 0
         self._telem_t0 = None
         self._last_telem_seq = None
@@ -770,12 +773,17 @@ class App:
             f"RTT: {self._rtt_str}   スループット: {self._tput_str}   テレメトリ: {telem}")
 
     def _set_rssi(self):
-        h = f"{self._host_rssi} dBm" if self._host_rssi is not None else "-"
+        if self._host_rssi is not None:
+            h = f"{self._host_rssi} dBm"
+        elif self._host_rssi_unsupported:
+            h = "非対応(このOS)"
+        else:
+            h = "-"
         p = f"{self._pico_rssi} dBm" if self._pico_rssi is not None else "-"
         self.rssi_var.set(f"RSSI  母艦(host): {h}   Pico(device): {p}")
 
     def _poll_rssi(self):
-        if self.connected:
+        if self.connected and not self._host_rssi_unsupported:
             self.worker.submit(self.worker.read_rssi())
         self.root.after(1000, self._poll_rssi)
 
@@ -815,6 +823,14 @@ class App:
                 self._host_rssi = val
                 self.rssi_chart.add("host", val)
                 self._set_rssi()
+            elif payload.get("unsupported"):
+                if not self._host_rssi_unsupported:
+                    self._host_rssi_unsupported = True
+                    self._set_rssi()
+                    self._append("log",
+                                 f"母艦側 RSSI はこの OS では取得できません "
+                                 f"(Pico 側 RSSI で電波状況を確認してください): "
+                                 f"{payload.get('error', '')}\n")
             elif not self._rssi_warned:
                 self._rssi_warned = True
                 self._append("log",
