@@ -23,7 +23,7 @@
 #include <object_headers/TELEMETRY_SENDER.hpp>
 #include <object_id.hpp>
 #include <pico/time.h>
-#include <soft_math.hpp> // FPU を踏まない sqrtf/fabsf (kernel が FP 例外フレーム非対応)
+#include <cmath> // 標準 libm (kernel が FP コンテキスト退避に対応したため soft_math は退役)
 
 namespace shizu {
 
@@ -127,7 +127,7 @@ static uint32_t rxlen = 0;
 
 // 傾き補正済みの世界鉛直加速度 (重力ベクトルへの線形加速度の射影)。
 static float world_z_accel(const bno055_sample_t &b) {
-  float gn = soft_math::sqrtf(b.gx * b.gx + b.gy * b.gy + b.gz * b.gz);
+  float gn = sqrtf(b.gx * b.gx + b.gy * b.gy + b.gz * b.gz);
   if (gn < 1.0f)
     return 0.0f;
   return (b.lax * b.gx + b.lay * b.gy + b.laz * b.gz) / gn;
@@ -140,9 +140,9 @@ static float world_z_accel(const bno055_sample_t &b) {
 static void world_horiz_accel(const bno055_sample_t &b, float &a_n, float &a_e) {
   const float d2r = 0.017453292519943f;
   float ps = b.heading * d2r, th = b.pitch * d2r, ph = b.roll * d2r;
-  float sp = soft_math::sinf(ps), cp = soft_math::cosf(ps);
-  float st = soft_math::sinf(th), ct = soft_math::cosf(th);
-  float sr = soft_math::sinf(ph), cr = soft_math::cosf(ph);
+  float sp = sinf(ps), cp = cosf(ps);
+  float st = sinf(th), ct = cosf(th);
+  float sr = sinf(ph), cr = cosf(ph);
   float ax = b.lax, ay = b.lay, az = b.laz;
   a_n = ax * (ct * cp) + ay * (sr * st * cp - cr * sp) + az * (cr * st * cp + sr * sp);
   a_e = ax * (ct * sp) + ay * (sr * st * sp + cr * cp) + az * (cr * st * sp - sr * cp);
@@ -712,7 +712,7 @@ void TELEMETRY_SENDER::main() {
     // ではスナップショットするだけ(プルもポーリングもしない)。
     float h_est = g_h_est, v_est = g_v_est, a_z = g_last_a_z;
     float vx = g_vx_est, vy = g_vy_est;
-    float speed = soft_math::sqrtf(vx * vx + vy * vy + v_est * v_est);
+    float speed = sqrtf(vx * vx + vy * vy + v_est * v_est);
 
     // --- 飛行制御は FLIGHT_CONTROLLER に分離。融合状態を push し、最新指令を読む。
     // call_method は yield せず同期実行されるので、スタック上の fst/ctrl は有効。---

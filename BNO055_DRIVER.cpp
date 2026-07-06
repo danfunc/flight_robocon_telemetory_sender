@@ -1,55 +1,34 @@
 // ===========================================================================
-//  BNO055_DRIVER — 9 軸 IMU を Shizuku オブジェクト化したドライバ
+//  BNO055_DRIVER — 9 軸 IMU の Shizuku オブジェクト (core0 側: リング排出係)
 // ===========================================================================
-//  元実装 test_firmware/altitude_fusion_wifi.c の BNO055 部分を移植。NDOF モード
-//  でセンサ内蔵フュージョンを使い、重力ベクトル・線形加速度・オイラー角・較正状態を
-//  周期サンプリングしてキャッシュ、read_latest で他オブジェクトへ渡す。
+//  step2 (docs/sensor_stream_protocol.md §7) で I2C アクセスは core1
+//  (core1_io.cpp) へ移った。本オブジェクトは I2C を一切触らず、
+//    1) コア間データリングの唯一の consumer として 100Hz でレコードを排出し、
+//       EUL/LIA/GRV の 3 レコード (同一 t_us) を bno055_sample_t へ再構成
+//       (float 換算 /16, /100 はここで行う)
+//    2) BARO/GROUND レコードを BME280 モジュールへ配る (bme280_on_baro/_ground)
+//    3) コマンド (pause/read_mode/ffff_reject) をコマンドリングへ、較正
+//       プロファイル save/load をサイドバンドへ転送する
+//  外部インタフェース (メソッド ID / セマンティクス) は従来と完全互換。
+//  TELEMETRY_SENDER / FLIGHT_CONTROLLER は無変更で動く。
 // ===========================================================================
+#include <core_ring.hpp>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <export_method.hpp>
-#include <i2c_bus.hpp>
 #include <obj_api.hpp>
 #include <object_headers/BNO055_DRIVER.hpp>
 #include <pico/time.h>
 
 namespace shizu {
 
-// ---- レジスタ定義 ----------------------------------------------------------
-static constexpr uint8_t BNO055_ADDR = 0x28;
-static constexpr uint8_t REG_CHIP_ID = 0x00;
-static constexpr uint8_t REG_GRV_DATA_X_LSB = 0x2E; // gravity vector
-static constexpr uint8_t REG_LIA_DATA_X_LSB = 0x28; // linear accel
-static constexpr uint8_t REG_EUL_HEAD_LSB = 0x1A;   // euler heading/roll/pitch
-static constexpr uint8_t REG_CALIB_STAT = 0x35;
-static constexpr uint8_t REG_OPR_MODE = 0x3D;
-static constexpr uint8_t REG_SYS_TRIGGER = 0x3F;
-static constexpr uint8_t REG_UNIT_SEL = 0x3B;
-
-static constexpr uint8_t OPMODE_CONFIG = 0x00;
-static constexpr uint8_t OPMODE_NDOF = 0x0C;
-static constexpr uint8_t USE_MODE = OPMODE_NDOF;
-
-// 較正オフセットプロファイル領域 (ACC/MAG/GYR offset + radius)。CONFIG モードでのみ
-// 読み書きできる。0x55..0x6A の 22 バイト。
-static constexpr uint8_t REG_CALIB_OFFSET_START = 0x55;
 static constexpr int CALIB_PROFILE_LEN = BNO055_CALIB_PROFILE_LEN; // 22
 
 // ---- 最新サンプル ----------------------------------------------------------
 static bno055_sample_t latest = {};
 
-// ---- 実行時状態 (他オブジェクトのメソッド呼び出しで変更される) --------------
-// 読みモード: false=26B ブロック読み(既定) / true=16bit 値ごとの 2B 個別読み。
-// バースト破損(heading 以外が 0xFFFF 化)の切り分け/回避用。協調スケジューラ単一
-// コアなので volatile な単純フラグで十分(トランザクション中は yield しない)。
-static volatile bool g_split_read = false;
-// 0xFFFF 破損バースト(roll&pitch 同時 0xFFFF)を検出してサンプル破棄するか。既定 on。
-// off にすると生の破損値もそのまま公開する(破損率の実測・比較用)。
-static volatile bool g_reject_ffff = true;
-// 較正オフセットの保存/復元ハンドシェイク。モード切替(yield 伴う)はサンプリング
-// と競合するため、コマンドはフラグで受けて BNO スレッドのループ内で実行する。
-static volatile uint8_t g_calib_cmd = 0; // 0=none, 1=save(読出), 2=load(書込)
+// ---- 較正 save/load の core0 側ミラー (calib_get が返す) ---------------------
 static volatile bool g_calib_done = false;
 static volatile bool g_calib_ok = false;
 static uint8_t g_calib_buf[CALIB_PROFILE_LEN];
@@ -58,199 +37,28 @@ static uint8_t g_calib_buf[CALIB_PROFILE_LEN];
 static uint32_t sample_sink_obj = 0xFFFF, sample_sink_method = 0;
 static uint32_t calib_sink_obj = 0xFFFF, calib_sink_method = 0;
 
-// サンプリング一時停止 (スループット試験中に I2C/融合を止めて帯域に振る)。
-static volatile bool g_paused = false;
+// ---- リング排出の状態 --------------------------------------------------------
+// EUL/LIA/GRV は core1 が同一 t_us で 3 連続 push する。t_us で組にして 9 値
+// 揃ったらサンプル確定 (途中で t が変わったら不完全組は捨てて数える)。
+static int16_t pend[9];
+static uint32_t pend_t = 0;
+static uint8_t pend_mask = 0; // bit0=EUL bit1=LIA bit2=GRV
+static uint32_t g_drop_count = 0;       // リング上書きで失われたレコード数
+static uint32_t g_incomplete_count = 0; // 3 点組が揃わなかった回数
+static uint8_t g_last_calib = 0;        // STATUS レコード由来
+static uint8_t g_health = 0;            // STATUS: HEALTH_* ビット
+static uint64_t g_last_motion_us = 0;   // 鮮度監視 (500ms 無音で valid=false)
 
-// ===========================================================================
-//  BNO055 低レベル
-// ===========================================================================
-static void set_mode(uint8_t mode) {
-  i2c_bus::write_reg(BNO055_ADDR, REG_OPR_MODE, OPMODE_CONFIG);
-  obj_api::yield_us(30000);
-  if (mode != OPMODE_CONFIG) {
-    i2c_bus::write_reg(BNO055_ADDR, REG_OPR_MODE, mode);
-    obj_api::yield_us(30000);
-  }
-}
-
-static bool bno_init_sensor() {
-  uint8_t id;
-  if (i2c_bus::read_regs(BNO055_ADDR, REG_CHIP_ID, &id, 1) < 0) {
-    printf("[BNO055] I2C read failed at ID\n");
-    return false;
-  }
-  if (id != 0xA0) {
-    printf("[BNO055] wrong ID 0x%02X (expected 0xA0)\n", id);
-    return false;
-  }
-
-  // POR リセット → 起動待ち (~650ms)。yield で他スレッドを止めない。
-  i2c_bus::write_reg(BNO055_ADDR, REG_SYS_TRIGGER, 0x20);
-  obj_api::yield_us(700000);
-  i2c_bus::write_reg(BNO055_ADDR, REG_UNIT_SEL, 0x00); // m/s^2, deg
-  obj_api::yield_us(10000);
-  set_mode(USE_MODE);
-  return true;
-}
-
-// euler(0x1A)〜gravity(0x33) は連続領域なので euler / linaccel / gravity を 3 つに
-// 分けず 1 ブロック読みでまとめて取る(I2C 占有=協調スケジューラの凍結を削減)。
-// 途中の quaternion(0x20) は捨てる。
-// calib(0x35) はこのバーストに含めず別の 1B トランザクションで読む: 400kHz Fast-mode
-// では BNO055 の長いバースト末尾バイトが化け(calib が 0xFF に張り付く症状を実測)、
-// calib はちょうど末尾に当たるため。短い独立読みなら末尾露出を避けられる。
-static constexpr uint8_t REG_BLOCK_START = REG_EUL_HEAD_LSB; // 0x1A
-static constexpr int MOTION_BLOCK_LEN =
-    (REG_GRV_DATA_X_LSB + 6) - REG_EUL_HEAD_LSB; // 0x1A..0x33 = 26
-
-// 静止時でも NDOF フュージョンの euler 出力は ±1 LSB(1/16°=0.0625°)で量子化
-// ディザし続け、これがそのまま 0.06° の揺れとしてテレメトリに乗る。前回採用した
-// 生値(1/16°単位の int16)から ±1 LSB 以内の変化はノイズとみなして据え置く
-// デッドバンド。|Δ|≥2 LSB の実運動だけ通すので遅延ゼロ。整数比較のみ=soft-float
-// 安全。レートを下げても振幅(±1 LSB)は変わらないので、ここで潰すのが本筋。
-static int16_t held_eul[3] = {0, 0, 0};
-static bool eul_primed = false;
-static int16_t euler_deadband(int16_t raw, int16_t &held) {
-  int d = (int)raw - held;
-  if (!eul_primed || d > 1 || d < -1)
-    held = raw;
-  return held;
-}
-
-// 16bit レジスタ 1 個を 2B 読む。失敗 <0。
-static int read_u16(uint8_t reg, int16_t *out) {
-  uint8_t b[2];
-  int r = i2c_bus::read_regs(BNO055_ADDR, reg, b, 2);
-  if (r < 0)
-    return r;
-  *out = (int16_t)((b[1] << 8) | b[0]);
-  return 0;
-}
-
-// euler(h/r/p) + linaccel(x/y/z) + gravity(x/y/z) の生 int16 を 9 個取得する。
-// g_split_read に応じて、1 回の 26B ブロック読み か、9 回の 2B 個別読みを使う。
-// 個別読みは「どのバーストも先頭 2B(=heading)だけは生存する」破損パターンの回避策。
-static bool read_raw9(int16_t r[9]) {
-  if (g_split_read) {
-    static const uint8_t regs[9] = {
-        REG_EUL_HEAD_LSB,       REG_EUL_HEAD_LSB + 2,   REG_EUL_HEAD_LSB + 4,
-        REG_LIA_DATA_X_LSB,     REG_LIA_DATA_X_LSB + 2, REG_LIA_DATA_X_LSB + 4,
-        REG_GRV_DATA_X_LSB,     REG_GRV_DATA_X_LSB + 2, REG_GRV_DATA_X_LSB + 4};
-    for (int i = 0; i < 9; ++i)
-      if (read_u16(regs[i], &r[i]) < 0)
-        return false;
-    return true;
-  }
-  uint8_t buf[MOTION_BLOCK_LEN];
-  if (i2c_bus::read_regs(BNO055_ADDR, REG_BLOCK_START, buf, MOTION_BLOCK_LEN) < 0)
-    return false;
-  const uint8_t *eul = &buf[REG_EUL_HEAD_LSB - REG_BLOCK_START];   // 0
-  const uint8_t *lia = &buf[REG_LIA_DATA_X_LSB - REG_BLOCK_START]; // 14
-  const uint8_t *grv = &buf[REG_GRV_DATA_X_LSB - REG_BLOCK_START]; // 20
-  r[0] = (int16_t)((eul[1] << 8) | eul[0]);
-  r[1] = (int16_t)((eul[3] << 8) | eul[2]);
-  r[2] = (int16_t)((eul[5] << 8) | eul[4]);
-  r[3] = (int16_t)((lia[1] << 8) | lia[0]);
-  r[4] = (int16_t)((lia[3] << 8) | lia[2]);
-  r[5] = (int16_t)((lia[5] << 8) | lia[4]);
-  r[6] = (int16_t)((grv[1] << 8) | grv[0]);
-  r[7] = (int16_t)((grv[3] << 8) | grv[2]);
-  r[8] = (int16_t)((grv[5] << 8) | grv[4]);
-  return true;
-}
-
-// 破損値(0xFFFF)を chごとに据え置くための直近正常生値。
-static int16_t held_raw[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
-
-// 重力/線形加速度/オイラー角/較正状態を 1 サンプル読む。失敗時 false。
-static bool read_motion(bno055_sample_t *s) {
-  // バースト破損: NDOF を ~100Hz でポーリングすると、フュージョン更新に読みが
-  // 重なったとき heading(先頭2B)以外のバースト全体(roll/pitch/linaccel/gravity)が
-  // 丸ごと 0xFFFF に化ける現象がある(実測 ~19%)。生値 9ch のうち 0xFFFF(=-1) の
-  // ch だけを直近の正常値で据え置き、正常な ch は活かす(サンプルは捨てない)。
-  // 破損があれば 1 回だけ読み直して新鮮な値の回収を試みる。g_reject_ffff が off の
-  // ときは検出せず素通し。
-  int16_t r[9];
-  for (int attempt = 0; attempt < 2; ++attempt) {
-    if (!read_raw9(r))
-      return false;
-    if (!g_reject_ffff)
-      break;
-    bool any_ffff = false;
-    for (int k = 0; k < 9; ++k)
-      if (r[k] == -1) {
-        any_ffff = true;
-        break;
-      }
-    if (!any_ffff)
-      break; // 全 ch 正常なら読み直し不要
-  }
-  // 残った 0xFFFF ch のみ直近正常値で置換。正常 ch は held を更新する。
-  if (g_reject_ffff)
-    for (int k = 0; k < 9; ++k) {
-      if (r[k] == -1)
-        r[k] = held_raw[k];
-      else
-        held_raw[k] = r[k];
-    }
-
-  s->heading = euler_deadband(r[0], held_eul[0]) / 16.0f;
-  s->roll = euler_deadband(r[1], held_eul[1]) / 16.0f;
-  s->pitch = euler_deadband(r[2], held_eul[2]) / 16.0f;
-  eul_primed = true; // 3 ch 揃って初期化済みに
-
-  s->lax = r[3] / 100.0f;
-  s->lay = r[4] / 100.0f;
-  s->laz = r[5] / 100.0f;
-  s->gx = r[6] / 100.0f;
-  s->gy = r[7] / 100.0f;
-  s->gz = r[8] / 100.0f;
-
-  // calib は別 1B トランザクション(バースト末尾破損回避。冒頭コメント参照)。
-  // 失敗時は前回値を維持して motion サンプル自体は捨てない。
-  uint8_t calib;
-  if (i2c_bus::read_regs(BNO055_ADDR, REG_CALIB_STAT, &calib, 1) < 0)
-    s->calib = latest.calib;
-  else
-    s->calib = calib;
-  return true;
-}
-
-// 較正オフセット保存/復元を BNO スレッド内で実行する(モード切替の yield が
-// サンプリングと競合しないよう、ループから直列に呼ぶ)。CONFIG モードでオフセット
-// 領域(0x55..0x6A)を読み書きし、NDOF に戻す。
-static void handle_calib_cmd() {
-  uint8_t cmd = g_calib_cmd;
-  if (cmd == 0)
-    return;
-  set_mode(OPMODE_CONFIG);
-  if (cmd == 1) { // save: 現オフセットを吸い出す
-    g_calib_ok = (i2c_bus::read_regs(BNO055_ADDR, REG_CALIB_OFFSET_START,
-                                     g_calib_buf, CALIB_PROFILE_LEN) >= 0);
-  } else { // load: オフセットを書き戻す
-    bool ok = true;
-    for (int i = 0; i < CALIB_PROFILE_LEN; ++i)
-      if (i2c_bus::write_reg(BNO055_ADDR, REG_CALIB_OFFSET_START + i,
-                             g_calib_buf[i]) < 0)
-        ok = false;
-    g_calib_ok = ok;
-  }
-  set_mode(USE_MODE);
-  g_calib_done = true;
-  g_calib_cmd = 0;
-  // 結果を sink へ push (event-driven。登録時のみ)。受け手が同期コピーする。
-  if (calib_sink_obj != 0xFFFF) {
-    bno055_calib_xfer_t x;
-    x.done = 1;
-    x.ok = g_calib_ok ? 1 : 0;
-    memcpy(x.data, g_calib_buf, CALIB_PROFILE_LEN);
-    obj_api::svc(obj_api::svc_num::CALL_METHOD, calib_sink_obj, calib_sink_method,
-                 (uint32_t)(uintptr_t)&x);
-  }
+// core0 → core1 コマンド送信 (協調スケジューラなので push は実質直列)。
+static void send_cmd(uint8_t op, uint8_t arg) {
+  core_ring::cmd_rec_t c = {};
+  c.op = op;
+  c.arg = arg;
+  core_ring::g_cmd_ring.push(c);
 }
 
 // ===========================================================================
-//  公開メソッド
+//  公開メソッド (ID/セマンティクスは従来どおり)
 // ===========================================================================
 static void method_read_latest(uint32_t _caller_obj_id,
                                uint32_t _caller_thread_id, uint32_t out_ptr,
@@ -263,53 +71,60 @@ static void method_read_latest(uint32_t _caller_obj_id,
   memcpy((void *)(uintptr_t)out_ptr, (const void *)&latest, sizeof(latest));
 }
 
-// arg0: 0=ブロック読み / 非0=2B 個別読み。
+// arg0: 0=ブロック読み / 非0=2B 個別読み (core1 へ転送)。
 static void method_set_read_mode(uint32_t, uint32_t, uint32_t mode, uint32_t) {
-  g_split_read = (mode != 0);
+  send_cmd(core_ring::CMD_SET_READ_MODE, mode != 0);
 }
 
-// arg0: 0=0xFFFF 破損を素通し / 非0=検出して破棄(既定)。
+// arg0: 0=0xFFFF 破損を素通し / 非0=検出して据え置き (既定。core1 へ転送)。
 static void method_set_ffff_reject(uint32_t, uint32_t, uint32_t on, uint32_t) {
-  g_reject_ffff = (on != 0);
+  send_cmd(core_ring::CMD_SET_FFFF_REJECT, on != 0);
 }
 
 // arg0 = (obj<<16)|method。新サンプル push 先を登録。
-static void method_set_sample_sink(uint32_t, uint32_t, uint32_t packed, uint32_t) {
+static void method_set_sample_sink(uint32_t, uint32_t, uint32_t packed,
+                                   uint32_t) {
   printf("[BNO055]set_sample_sink called\n");
   sample_sink_obj = (packed >> 16) & 0xFFFF;
   sample_sink_method = packed & 0xFFFF;
 }
 
 // arg0 = (obj<<16)|method。較正 save/load 完了の push 先を登録。
-static void method_set_calib_sink(uint32_t, uint32_t, uint32_t packed, uint32_t) {
+static void method_set_calib_sink(uint32_t, uint32_t, uint32_t packed,
+                                  uint32_t) {
   printf("[BNO055]set_calib_sink called\n");
   calib_sink_obj = (packed >> 16) & 0xFFFF;
   calib_sink_method = packed & 0xFFFF;
 }
 
-// arg0: 非0=サンプリング一時停止 / 0=再開。
+// arg0: 非0=サンプリング一時停止 / 0=再開 (core1 へ転送)。
 static void method_set_paused(uint32_t, uint32_t, uint32_t on, uint32_t) {
-  g_paused = (on != 0);
+  send_cmd(core_ring::CMD_SET_PAUSED_BNO, on != 0);
 }
 
-// 較正オフセットの吸い出し要求(実処理は BNO ループ内 handle_calib_cmd)。
+// 較正オフセットの吸い出し要求 (実処理は core1。完了はサイドバンド ack で届く)。
 static void method_calib_save(uint32_t, uint32_t, uint32_t, uint32_t) {
   g_calib_done = false;
   g_calib_ok = false;
-  g_calib_cmd = 1;
+  core_ring::g_calib_xfer.op = 1;
+  __dmb(); // op を書いてから req 発行
+  core_ring::g_calib_xfer.req_seq = core_ring::g_calib_xfer.req_seq + 1;
 }
 
-// arg0: uint8_t[22] への ptr。オフセットを取り込み書き戻し要求する。
+// arg0: uint8_t[22] への ptr。オフセットを取り込み core1 へ書き戻し要求。
 static void method_calib_load(uint32_t, uint32_t, uint32_t in_ptr, uint32_t) {
   if (in_ptr == 0)
     return;
   memcpy(g_calib_buf, (const void *)(uintptr_t)in_ptr, CALIB_PROFILE_LEN);
+  memcpy(core_ring::g_calib_xfer.data, g_calib_buf, CALIB_PROFILE_LEN);
   g_calib_done = false;
   g_calib_ok = false;
-  g_calib_cmd = 2;
+  core_ring::g_calib_xfer.op = 2;
+  __dmb(); // data/op を書いてから req 発行
+  core_ring::g_calib_xfer.req_seq = core_ring::g_calib_xfer.req_seq + 1;
 }
 
-// arg0: bno055_calib_xfer_t* 。直近 save/load の done/ok とダンプを返す。
+// arg0: bno055_calib_xfer_t*。直近 save/load の done/ok とダンプを返す。
 static void method_calib_get(uint32_t, uint32_t, uint32_t out_ptr, uint32_t) {
   if (out_ptr == 0)
     return;
@@ -321,80 +136,145 @@ static void method_calib_get(uint32_t, uint32_t, uint32_t out_ptr, uint32_t) {
 }
 
 // ===========================================================================
-//  オブジェクトエントリ
+//  レコードディスパッチ
+// ===========================================================================
+// EUL/LIA/GRV の 3 点組が揃ったのでサンプル確定 (float 換算はここでだけ行う)。
+static void commit_motion_sample() {
+  bno055_sample_t s;
+  s.seq = latest.seq + 1;
+  s.heading = pend[0] / 16.0f; // 1/16 deg (デッドバンドは core1 で適用済み)
+  s.roll = pend[1] / 16.0f;
+  s.pitch = pend[2] / 16.0f;
+  s.lax = pend[3] / 100.0f; // 1/100 m/s^2
+  s.lay = pend[4] / 100.0f;
+  s.laz = pend[5] / 100.0f;
+  s.gx = pend[6] / 100.0f;
+  s.gy = pend[7] / 100.0f;
+  s.gz = pend[8] / 100.0f;
+  s.calib = g_last_calib;
+  s.valid = true;
+  latest = s;
+  g_last_motion_us = time_us_64();
+  if (sample_sink_obj != 0xFFFF)
+    obj_api::svc(obj_api::svc_num::CALL_METHOD, sample_sink_obj,
+                 sample_sink_method, (uint32_t)(uintptr_t)&latest);
+}
+
+// モーション 3 点組の部分レコードを取り込む。idx: 0=EUL 1=LIA 2=GRV。
+static void accept_motion_part(int idx, const core_ring::record_t &rec) {
+  if (pend_mask != 0 && rec.t_us != pend_t) {
+    ++g_incomplete_count; // 組の途中で新しい t が来た → 前の組は不成立
+    pend_mask = 0;
+  }
+  pend_t = rec.t_us;
+  memcpy(&pend[idx * 3], rec.payload, 6);
+  pend_mask |= (uint8_t)(1u << idx);
+  if (pend_mask == 0x7) {
+    pend_mask = 0;
+    commit_motion_sample();
+  }
+}
+
+static void dispatch_record(const core_ring::record_t &rec) {
+  switch (rec.ch_id) {
+  case core_ring::CH_EUL:
+    accept_motion_part(0, rec);
+    break;
+  case core_ring::CH_LIA:
+    accept_motion_part(1, rec);
+    break;
+  case core_ring::CH_GRV:
+    accept_motion_part(2, rec);
+    break;
+  case core_ring::CH_BARO: {
+    uint32_t pa;
+    int16_t cc;
+    memcpy(&pa, &rec.payload[0], 4);
+    memcpy(&cc, &rec.payload[4], 2);
+    bme280_on_baro(pa, cc, rec.t_us);
+    break;
+  }
+  case core_ring::CH_GROUND: {
+    uint32_t pa;
+    int16_t cc;
+    memcpy(&pa, &rec.payload[0], 4);
+    memcpy(&cc, &rec.payload[4], 2);
+    bme280_on_ground(pa, cc);
+    break;
+  }
+  case core_ring::CH_STATUS:
+    g_last_calib = rec.payload[0];
+    g_health = rec.payload[1];
+    (void)g_health; // (現状は保持のみ。将来 STATUS のダウンリンクに使う)
+    break;
+  default:
+    break;
+  }
+}
+
+// ===========================================================================
+//  オブジェクトエントリ (データリングの唯一の consumer スレッド)
 // ===========================================================================
 void BNO055_DRIVER::init() {
-  printf("[BNO055] init\n");
+  printf("[BNO055] init (core1 stream consumer)\n");
   export_method<method_read_latest>(BNO055_DRIVER::METHOD_IDs::read_latest);
   export_method<method_set_read_mode>(BNO055_DRIVER::METHOD_IDs::set_read_mode);
-  export_method<method_set_ffff_reject>(BNO055_DRIVER::METHOD_IDs::set_ffff_reject);
-  export_method<method_set_sample_sink>(BNO055_DRIVER::METHOD_IDs::set_sample_sink);
-  export_method<method_set_calib_sink>(BNO055_DRIVER::METHOD_IDs::set_calib_sink);
+  export_method<method_set_ffff_reject>(
+      BNO055_DRIVER::METHOD_IDs::set_ffff_reject);
+  export_method<method_set_sample_sink>(
+      BNO055_DRIVER::METHOD_IDs::set_sample_sink);
+  export_method<method_set_calib_sink>(
+      BNO055_DRIVER::METHOD_IDs::set_calib_sink);
   export_method<method_set_paused>(BNO055_DRIVER::METHOD_IDs::set_paused);
   export_method<method_calib_save>(BNO055_DRIVER::METHOD_IDs::calib_save);
   export_method<method_calib_load>(BNO055_DRIVER::METHOD_IDs::calib_load);
   export_method<method_calib_get>(BNO055_DRIVER::METHOD_IDs::calib_get);
 
-  i2c_bus::init();
-  if (!bno_init_sensor()) {
-    printf("[BNO055] init failed — driver idles (valid=false)\n");
-    while (true) {
-      latest.valid = false;
-      obj_api::yield_us(500000);
-    }
-  }
-  printf("[BNO055] sensor OK (mode=0x%02X)\n", USE_MODE);
+  uint32_t last_ack = core_ring::g_calib_xfer.ack_seq;
+  uint32_t last_drop_report = 0;
 
-  // NDOF フュージョン出力はハード的に 100Hz 固定なので、その限界で読み続ける
-  // (これより速く読んでも同じ値しか出ない)。
+  // 排出周期は最高レートのチャンネル (NDOF 100Hz) に合わせた絶対グリッド。
+  // 1 tick あたり定常 ~4 レコード (EUL/LIA/GRV + BARO/STATUS が時々)。
   uint64_t next = time_us_64();
-  int fail_streak = 0; // 連続 I2C 失敗回数 (バス救出/再初期化のエスカレーション用)
   while (true) {
-    // スループット試験中は I2C/融合を止めて帯域を空ける(yield で BLE は回り続ける)。
-    if (g_paused) {
-      obj_api::yield_us(20000);
-      next = time_us_64(); // 再開時にグリッドを取り直す
-      continue;
-    }
-    // 較正の保存/復元要求があれば先に処理(モード切替で数十ms掛かるのでグリッド再同期)。
-    if (g_calib_cmd != 0) {
-      handle_calib_cmd();
-      next = time_us_64();
-    }
     next += 10000; // 100Hz の絶対グリッド
-    bno055_sample_t s = {};
-    if (read_motion(&s)) {
-      fail_streak = 0;
-      s.seq = latest.seq + 1;
-      s.valid = true;
-      latest = s;
-      // 新サンプルを sink へ push (event-driven。登録時のみ)。
-      if (sample_sink_obj != 0xFFFF)
-        obj_api::svc(obj_api::svc_num::CALL_METHOD, sample_sink_obj,
-                     sample_sink_method, (uint32_t)(uintptr_t)&latest);
-    } else {
-      latest.valid = false;
-      // I2C 失敗が続く間の扱いが重要: 1 回の失敗はタイムアウト待ちだけで
-      // 10〜30ms を消費して常に周期超過になるため、旧実装 (再同期パスで
-      // yield しない) では本スレッドが CPU を独占し、BLE を含む全スレッドが
-      // 数十秒単位で凍結していた (→ macOS 側は無応答と見て切断、HCI イベント
-      // も溢れて切断イベントを取りこぼす)。失敗中は 20Hz へ落として譲る。
-      ++fail_streak;
-      if (fail_streak >= 20) {
-        // バス救出でも戻らない → センサごと再初期化 (POR ~700ms、yield あり)。
-        printf("[BNO055] I2C still failing — sensor reinit\n");
-        bno_init_sensor();
-        fail_streak = 0;
-      } else if (fail_streak % 5 == 0) {
-        // 5 連続失敗ごとにバス救出 (BNO055 のクロックストレッチ起因ロック
-        // アップでスレーブが SDA を掴んだままの状態を解く)。
-        printf("[BNO055] I2C fail x%d — bus recover\n", fail_streak);
-        i2c_bus::recover();
-      }
-      next = time_us_64() + 50000; // 失敗中は 20Hz でリトライ (必ず下で yield)
+
+    // ---- データリング排出 (1 tick の上限 64 件: 遅延回復中も yield を守る) ----
+    core_ring::record_t rec;
+    for (int budget = 64;
+         budget > 0 && core_ring::g_data_ring.pop(&rec, &g_drop_count);
+         --budget)
+      dispatch_record(rec);
+    if (g_drop_count != last_drop_report) {
+      printf("[BNO055] ring overrun: %lu records dropped (total)\n",
+             (unsigned long)g_drop_count);
+      last_drop_report = g_drop_count;
     }
 
+    // ---- 較正サイドバンドの完了 (ack) 監視 ----
+    uint32_t ack = core_ring::g_calib_xfer.ack_seq;
+    if (ack != last_ack) {
+      last_ack = ack;
+      __dmb(); // ack 観測 → data/ok 読みの順序を保証
+      g_calib_ok = (core_ring::g_calib_xfer.ok != 0);
+      memcpy(g_calib_buf, core_ring::g_calib_xfer.data, CALIB_PROFILE_LEN);
+      g_calib_done = true;
+      // 結果を sink へ push (従来 handle_calib_cmd がやっていたのと同じ)。
+      if (calib_sink_obj != 0xFFFF) {
+        bno055_calib_xfer_t x;
+        x.done = 1;
+        x.ok = g_calib_ok ? 1 : 0;
+        memcpy(x.data, g_calib_buf, CALIB_PROFILE_LEN);
+        obj_api::svc(obj_api::svc_num::CALL_METHOD, calib_sink_obj,
+                     calib_sink_method, (uint32_t)(uintptr_t)&x);
+      }
+    }
+
+    // ---- 鮮度監視: 500ms モーションが来なければ valid=false (I2C 断相当) ----
     uint64_t now = time_us_64();
+    if (latest.valid && now - g_last_motion_us > 500000)
+      latest.valid = false;
+
     if ((int64_t)(next - now) < 0) {
       next = now;
       obj_api::yield(); // 周期超過でも必ず 1 回は譲る (無 yield 凍結の防止)

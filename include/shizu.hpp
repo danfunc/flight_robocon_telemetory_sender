@@ -12,6 +12,8 @@ namespace shizu {
   object_table[0].state = object_t::state_t::KERNEL_OBJECT;
   thread_table[0].context = new context_t();
   thread_table[0].context->sp = (shizu::exception_frame_t *)entry_PSP;
+  // スレッド 0 も基本フレーム/PSP へ復帰する前提で EXC_RETURN を種付けする。
+  thread_table[0].context->exc_return = 0xFFFFFFFD;
   thread_table[0].state = thread_t::state_t::RUNNING;
   uintptr_t CONTROL_MASK = 1 << 1;
   asm volatile("MSR PSP,%[entry_psp];"

@@ -69,6 +69,11 @@
 
 static_assert(offsetof(shizu::context_t, sp) == 32,
               "context_t layout mismatch: psp offset");
+// svc_asm_handler.S の .equ CTX_EXC_RETURN / CTX_FP と一致していること。
+static_assert(offsetof(shizu::context_t, exc_return) == 36,
+              "context_t layout mismatch: exc_return offset (asm CTX_EXC_RETURN)");
+static_assert(offsetof(shizu::context_t, fp) == 40,
+              "context_t layout mismatch: fp offset (asm CTX_FP)");
 extern "C" {
 void svc_asm_handler();
 shizu::context_t *get_current_context();
@@ -143,6 +148,9 @@ void create_thread(uint32_t obj_num, uint32_t thread_num, method_t entry) {
     thread_table[thread_num].context->sp->r3 = 0;
     thread_table[thread_num].context->sp->r12 = 0;
     thread_table[thread_num].context->sp->xPSR = (1 << 24);
+    // 新規スレッドは基本フレーム (FP 無効) の Thread/PSP へ復帰する。
+    // 0 のままだと初回復帰で bx 0 → 即 HardFault。必ず明示的に種を入れる。
+    thread_table[thread_num].context->exc_return = 0xFFFFFFFD;
     object_table[obj_num].thread_table.insert(thread_num);
   } else {
     panic("this thread is already initialized\ncalling this system call for "
@@ -254,6 +262,11 @@ void svc_cpp_handler(shizu::context_t *context) {
               (unsigned long)current_thread.object_id, (unsigned long)arg0,
               (unsigned long)arg1);
       }
+      // NOTE(FPU): stack_frame は 8 語の basic exception_frame_t を*その場で*
+      // コピーする。拡張(FP)フレームでもこの構造体はハードウェアスタック上の
+      // 元の位置に居続けなければならない (フレームを別アドレスへ再配置しない)。
+      // FP 拡張分 (S0-S15/FPSCR) は PSP 上に残り、call_stack.context.sp が
+      // 指す位置は不変なので、ここは basic 部のみのコピーで正しい。
       current_thread.call_stack.push(
           {.stack_frame = *stack_frame,
            .context = *context,
@@ -287,6 +300,9 @@ void svc_cpp_handler(shizu::context_t *context) {
           call_stack_top = current_thread.call_stack.top();
           current_thread.call_stack.pop();
         }
+        // NOTE(FPU): basic フレームを元のスタック位置へ書き戻すだけ。フレームは
+        // 決して別アドレスへ再配置しないこと (拡張 FP フレームの S0-S15 が同じ
+        // PSP 位置に残っており、sp を張り替えると FP 分と乖離する)。
         *get_current_context() = call_stack_top.context;
         stack_frame = call_stack_top.context.sp;
         *stack_frame = call_stack_top.stack_frame;

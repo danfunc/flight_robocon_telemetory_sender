@@ -169,6 +169,10 @@ static void build_adv_data() {
 
 static btstack_packet_callback_registration_t hci_event_callback_registration;
 static btstack_packet_callback_registration_t sm_event_callback_registration;
+// CONNECTION_PARAMETER_UPDATE_RESPONSE は l2cap のイベントハンドラにのみ
+// 配送される (l2cap_emit_event は l2cap_event_handlers を回すだけ) ため、
+// hci とは別に l2cap にも packet_handler を登録する。
+static btstack_packet_callback_registration_t l2cap_event_callback_registration;
 
 // ---- 受信処理 --------------------------------------------------------------
 static void process_rx(const uint8_t *data, uint16_t len) {
@@ -195,12 +199,19 @@ static void process_rx(const uint8_t *data, uint16_t len) {
   printf("\n");
 }
 
-// ---- TX flush --------------------------------------------------------------
-static void flush_tx() {
+// ---- TX 統計 (A/B 計測用: 1 CAN_SEND_NOW あたり何発詰めたか) ----------------
+static uint32_t tx_stat_pkts = 0;  // 直近窓の notify 送信数
+static uint32_t tx_stat_csn = 0;   // 直近窓の CAN_SEND_NOW イベント数
+static uint32_t tx_stat_bytes = 0; // 直近窓の送信バイト数
 
-    /*printf("[BLE_UART] notify handle=0x%04x mtu=%u\n",
-       ATT_CHARACTERISTIC_6E400003_B5A3_F393_E0A9_E50E24DCCA9E_01_VALUE_HANDLE,
-       att_server_get_mtu(con_handle));*/
+// ---- TX flush --------------------------------------------------------------
+// 1 回の CAN_SEND_NOW で notification を 1 発だけ送ると、CI (15ms) あたり
+// 1 パケットに律速され ~130kbps が理論上限になる。コントローラの ACL バッファ
+// クレジットがある限り att_server_notify は連続で成功する
+// (att_server_can_send_packet → hci の free ACL slots 判定。尽きると
+// BTSTACK_ACL_BUFFERS_FULL が返る) ので、「失敗するか送るものが無くなるまで」
+// 詰めて 1 CI に複数 LL PDU を載せる。
+static void flush_tx() {
   if (con_handle == HCI_CON_HANDLE_INVALID || !tx_notify_enabled)
     return;
   if (!cmd_authorized)
@@ -211,41 +222,47 @@ static void flush_tx() {
   uint16_t mtu = att_server_get_mtu(con_handle);
   uint16_t max_payload = (mtu > 3) ? (mtu - 3) : 20; // ATT_NOTIFY = MTU-3
 
-  // MTU をなるべく使い切る (現構成は HCI_ACL_PAYLOAD_SIZE=259 → ATT MTU ~247、
-  // notify ペイロード ~244B。CYW43 はこれ以上=LL 251B 超の ACL 分割で固まる
-  // 既知バグがあるため、btstack_config.h 側で意図的に制限している)。chunk の
-  // 512B は上限保険で、実際の 1 notify は max_payload (=MTU-3) で切られる。
+  // MTU をなるべく使い切る (現構成は HCI_ACL_PAYLOAD_SIZE=251 → ATT MTU 247、
+  // notify ペイロード 244B = ちょうど 1 LL PDU。これ以上 = LL 251B 超の ACL
+  // 分割で CYW43 が固まる既知バグがあるため、btstack_config.h 側で意図的に
+  // 制限している。★この 1 notify ≤244B / 1 ACL = 1 LL PDU は厳守★)。
   uint8_t chunk[512];
   if (max_payload > sizeof(chunk))
     max_payload = sizeof(chunk);
 
-  // ロック下で「覗くだけ」(tail は進めない)。成功してから消費する方式にし、
-  // エラー時の tail 巻き戻し (producer と競合しうる) を排除する。
-  uint16_t n = 0;
-  {
-    uint32_t s = save_and_disable_interrupts();
-    uint32_t t = tx_tail;
-    while (n < max_payload && t != tx_head) {
-      chunk[n++] = tx_ring[t];
-      t = (t + 1) & TX_RING_MASK;
+  // クレジットが尽きる (att_server_notify が BUFFERS_FULL) か、リングが空に
+  // なるまで notification を連射する。
+  while (!tx_empty()) {
+    // ロック下で「覗くだけ」(tail は進めない)。成功してから消費する方式にし、
+    // エラー時の tail 巻き戻し (producer と競合しうる) を排除する。
+    uint16_t n = 0;
+    {
+      uint32_t s = save_and_disable_interrupts();
+      uint32_t t = tx_tail;
+      while (n < max_payload && t != tx_head) {
+        chunk[n++] = tx_ring[t];
+        t = (t + 1) & TX_RING_MASK;
+      }
+      restore_interrupts(s);
     }
-    restore_interrupts(s);
-  }
-  if (n == 0)
-    return;
+    if (n == 0)
+      break;
 
-  // btstack 呼び出しはロック外で行う。
-  int err = att_server_notify(
-      con_handle,
-      ATT_CHARACTERISTIC_6E400003_B5A3_F393_E0A9_E50E24DCCA9E_01_VALUE_HANDLE,
-      chunk, n);
-  if (err == 0) {
+    // btstack 呼び出しはロック外で行う。
+    int err = att_server_notify(
+        con_handle,
+        ATT_CHARACTERISTIC_6E400003_B5A3_F393_E0A9_E50E24DCCA9E_01_VALUE_HANDLE,
+        chunk, n);
+    if (err != 0)
+      break; // クレジット切れ (等)。tail は進めていないので次の機会に再送。
+
     // 送信成功した分だけ tail を進めて消費を確定する。
     uint32_t s = save_and_disable_interrupts();
     tx_tail = (tx_tail + n) & TX_RING_MASK;
     restore_interrupts(s);
+    ++tx_stat_pkts;
+    tx_stat_bytes += n;
   }
-  // err != 0 のときは tail を進めないので、次の CAN_SEND_NOW で再送される。
 
   // まだ残っていれば次の送信機会を要求。
   if (!tx_empty()) {
@@ -322,14 +339,50 @@ static constexpr uint16_t FORCED_CI = 12;
 // 行として notify でホストへ流す。母艦側も自分の RSSI を測るので双方が並ぶ。
 static constexpr uint32_t RSSI_PERIOD_MS = 1000;
 
+// ---- CI ネゴシエーションの状態機械 ------------------------------------------
+// 実測: (min=12, max=24) で要求すると macOS は max 側の 24 (30ms) を選ぶ。
+// そこで 1 回目は min=max=12 (15ms 丁度 = Apple の床) をピン留めして要求する。
+// ただし Apple の旧アクセサリガイドラインに「max ≥ min+15ms」の推奨があり、
+// min=max が拒否される可能性もゼロではないため、
+//   ・L2CAP の CONNECTION_PARAMETER_UPDATE_RESPONSE が reject だった
+//   ・または updated CI が 12 にならなかった
+// 場合に限り、1 回だけ (12, 24) へフォールバック再要求する。それ以上は追わない
+// (無限再要求ループ = macOS との要求合戦は禁止)。
+//   0 = 未要求 / 1 = (12,12) 要求済み / 2 = フォールバック (12,24) 要求済み (終端)
+static uint8_t ci_nego_stage = 0;
+
 static void request_fast_ci() {
   if (con_handle == HCI_CON_HANDLE_INVALID)
     return;
+  ci_nego_stage = 1;
   int r = gap_request_connection_parameter_update(con_handle, FORCED_CI,
-                                                  2*FORCED_CI, 0, 400);
+                                                  FORCED_CI, 0, 400);
   uint32_t ms100 = (uint32_t)FORCED_CI * 125u; // 単位 1.25ms → ms×100
-  printf("[BLE_UART] request CI min=%lu.%02lu ms -> %d\n",
+  printf("[BLE_UART] request CI pinned %lu.%02lu ms -> %d\n",
          (unsigned long)(ms100 / 100), (unsigned long)(ms100 % 100), r);
+}
+
+// min=max ピン留めが通らなかったときの一度きりのフォールバック (12, 24)。
+static void request_ci_fallback(const char *why) {
+  if (con_handle == HCI_CON_HANDLE_INVALID || ci_nego_stage != 1)
+    return;
+  ci_nego_stage = 2; // 終端: これ以上再要求しない
+  int r = gap_request_connection_parameter_update(con_handle, FORCED_CI,
+                                                  2 * FORCED_CI, 0, 400);
+  printf("[BLE_UART] CI fallback (12,24) [%s] -> %d\n", why, r);
+}
+
+// 2M PHY を要求する。CYW43439 の BT FW が 2M PHY 対応かは要実測確認
+// (PHY_UPDATE_COMPLETE が来ない実測あり。LE features ログと Command Status
+// ログで切り分ける)。2M 化で 1 LL PDU の空中時間が半減し、同じ CI (15ms) に
+// より多くの PDU を詰められる。適用可否は HCI_SUBEVENT_LE_PHY_UPDATE_COMPLETE
+// で分かる (packet_handler がログを出す)。
+// tx_phys/rx_phys: bit0=1M, bit1=2M, bit2=Coded。all_phys=0 = 両方向とも希望を指定。
+static void request_2m_phy() {
+  if (con_handle == HCI_CON_HANDLE_INVALID)
+    return;
+  uint8_t r = gap_le_set_phy(con_handle, 0, 0x02, 0x02, 0);
+  printf("[BLE_UART] request 2M PHY -> %u\n", r);
 }
 
 // ---- HCI / ATT イベント ----------------------------------------------------
@@ -348,8 +401,50 @@ static void packet_handler(uint8_t packet_type, uint16_t channel,
     if (btstack_event_state_get_state(packet) == HCI_STATE_WORKING) {
       printf("[BLE_UART] HCI ready, advertising start\n");
       gap_advertisements_enable(1);
+      // 2M PHY サポートの白黒付け: ローカル LE features を読む。結果は
+      // COMMAND_COMPLETE (opcode 0x2003) で拾い、bit8 (=byte1 bit0) をログ。
+      hci_send_cmd(&hci_le_read_local_supported_features);
     }
     break;
+
+  case HCI_EVENT_COMMAND_COMPLETE:
+    if (hci_event_command_complete_get_command_opcode(packet) ==
+        HCI_OPCODE_HCI_LE_READ_LOCAL_SUPPORTED_FEATURES) {
+      // return params: [0]=status, [1..8]=LE features (LSB first)。
+      // LE 2M PHY = feature bit 8 = byte1 の bit0。
+      const uint8_t *rp = hci_event_command_complete_get_return_parameters(packet);
+      printf("[BLE_UART] LE features: status=0x%02x 2M_PHY=%s "
+             "(bytes[0..1]=%02x %02x)\n",
+             rp[0], (rp[2] & 0x01) ? "supported" : "NOT supported", rp[1],
+             rp[2]);
+    }
+    break;
+
+  case HCI_EVENT_COMMAND_STATUS: {
+    // LE Set PHY はまず Command Status が返る (0x00=実行中 → 後で
+    // PHY_UPDATE_COMPLETE)。0x11=Unsupported Feature or Parameter 等なら
+    // その場で棄却されており、PHY_UPDATE_COMPLETE は永遠に来ない。
+    uint16_t opcode = hci_event_command_status_get_command_opcode(packet);
+    if (opcode == HCI_OPCODE_HCI_LE_SET_PHY) {
+      uint8_t st = hci_event_command_status_get_status(packet);
+      printf("[BLE_UART] LE Set PHY command status = 0x%02x%s\n", st,
+             st == 0 ? " (pending, wait for PHY update)" : " (REJECTED)");
+    }
+    break;
+  }
+
+  case L2CAP_EVENT_CONNECTION_PARAMETER_UPDATE_RESPONSE: {
+    // gap_request_connection_parameter_update (L2CAP 経由) への Central の
+    // accept(0)/reject(1)。reject ならピン留め (12,12) が蹴られたので 1 回
+    // だけ (12,24) へフォールバック。
+    uint16_t result =
+        l2cap_event_connection_parameter_update_response_get_result(packet);
+    printf("[BLE_UART] CI param update response: %s (result=%u)\n",
+           result == 0 ? "accepted" : "rejected", result);
+    if (result != 0)
+      request_ci_fallback("rejected");
+    break;
+  }
 
   case HCI_EVENT_LE_META:
     switch (hci_event_le_meta_get_subevent_code(packet)) {
@@ -376,6 +471,7 @@ static void packet_handler(uint8_t packet_type, uint16_t channel,
       tx_notify_enabled = false;
       can_send_requested = false;
       cmd_authorized = false;
+      ci_nego_stage = 0; // 新しい接続: CI ネゴシエーションを仕切り直す
       printf("[BLE_UART] connected, handle=0x%04x (requesting pairing)\n", h);
       sm_request_pairing(con_handle); // ★ 接続直後に Security Request を送る
       break;
@@ -385,7 +481,21 @@ static void packet_handler(uint8_t packet_type, uint16_t channel,
       conn_interval =
           hci_subevent_le_connection_update_complete_get_conn_interval(packet);
       print_conn_interval("updated");
+      // ピン留め要求 (12,12) の実績確認: 12 にならなかったら一度だけ (12,24) へ。
+      if (conn_interval != FORCED_CI)
+        request_ci_fallback("updated CI != 12");
       break;
+    case HCI_SUBEVENT_LE_PHY_UPDATE_COMPLETE: {
+      // 2M PHY 要求 (request_2m_phy) の結果。tx/rx: 1=1M, 2=2M, 3=Coded。
+      uint8_t st = hci_subevent_le_phy_update_complete_get_status(packet);
+      uint8_t txp = hci_subevent_le_phy_update_complete_get_tx_phy(packet);
+      // この btstack には rx_phy の getter が無い。HCI 仕様上 tx_phy(event[6])
+      // の次のバイトが rx_phy。
+      uint8_t rxp = packet[7];
+      printf("[BLE_UART] PHY update: status=0x%02x tx=%uM rx=%uM\n", st, txp,
+             rxp);
+      break;
+    }
     default:
       break;
     }
@@ -400,6 +510,7 @@ static void packet_handler(uint8_t packet_type, uint16_t channel,
     tx_notify_enabled = false;
     can_send_requested = false;
     cmd_authorized = false; // 切断時は必ず locked へ倒す
+    ci_nego_stage = 0;
     nc_pending_handle = HCI_CON_HANDLE_INVALID;
     gap_advertisements_enable(1);
     break;
@@ -407,6 +518,7 @@ static void packet_handler(uint8_t packet_type, uint16_t channel,
   case ATT_EVENT_CAN_SEND_NOW:
     can_send_requested = false;
     note_conn_activity(); // Central が notify を受けている = 生存の兆候
+    ++tx_stat_csn;
     flush_tx();
     break;
 
@@ -475,6 +587,7 @@ static void sm_packet_handler(uint8_t packet_type, uint16_t channel,
       printf("[BLE_UART] pairing complete -> authorized\n");
       print_conn_interval("paired"); // ★ ペアリング直後に CI を表示
       request_fast_ci();             // ★ CI=12 (15ms) を強制要求
+      request_2m_phy();              // ★ 2M PHY を要求 (結果は PHY update イベント)
     } else {
       cmd_authorized = false;
       printf("[BLE_UART] pairing failed (status 0x%02x)\n",
@@ -493,6 +606,7 @@ static void sm_packet_handler(uint8_t packet_type, uint16_t channel,
       printf("[BLE_UART] reencryption complete -> authorized\n");
       print_conn_interval("paired"); // ★ 再接続(再暗号化)直後にも CI を表示
       request_fast_ci();             // ★ CI=12 (15ms) を強制要求
+      request_2m_phy();              // ★ 2M PHY を要求 (結果は PHY update イベント)
     } else {
       cmd_authorized = false;
       printf("[BLE_UART] reencryption failed -> stays locked\n");
@@ -593,12 +707,15 @@ static void bt_stack_bringup() {
   // ATT サーバ (生成済み profile_data を渡す)
   att_server_init(profile_data, att_read_callback, att_write_callback);
 
-  // HCI / ATT / SM イベント登録
+  // HCI / ATT / SM / L2CAP イベント登録
   hci_event_callback_registration.callback = &packet_handler;
   hci_add_event_handler(&hci_event_callback_registration);
   att_server_register_packet_handler(packet_handler);
   sm_event_callback_registration.callback = &sm_packet_handler;
   sm_add_event_handler(&sm_event_callback_registration);
+  // CI パラメータ更新の accept/reject (L2CAP signaling 応答) を受けるため。
+  l2cap_event_callback_registration.callback = &packet_handler;
+  l2cap_add_event_handler(&l2cap_event_callback_registration);
 
   // 3) 広告設定
   build_adv_data();
@@ -655,9 +772,24 @@ void BLE_UART_DRIVER::init() {
   // 3) poll ループ
   absolute_time_t next_rssi = make_timeout_time_ms(RSSI_PERIOD_MS);
   absolute_time_t next_adv_ensure = make_timeout_time_ms(1000);
+  absolute_time_t next_tx_stat = make_timeout_time_ms(1000);
   while (true) {
     ble_dbg_poll = ble_dbg_poll + 1;
     cyw43_arch_poll();
+
+    // TX 統計 (A/B 計測用): 1 秒窓の notify 数 / CAN_SEND_NOW 数 / バイト数。
+    // pkts/csn が 1.0 を超えていれば 1 CI に複数発詰められている証拠。
+    if (time_reached(next_tx_stat)) {
+      if (tx_stat_pkts != 0 || tx_stat_csn != 0) {
+        printf("[BLE_UART] tx 1s: %lu pkts / %lu csn / %lu B\n",
+               (unsigned long)tx_stat_pkts, (unsigned long)tx_stat_csn,
+               (unsigned long)tx_stat_bytes);
+        tx_stat_pkts = 0;
+        tx_stat_csn = 0;
+        tx_stat_bytes = 0;
+      }
+      next_tx_stat = make_timeout_time_ms(1000);
+    }
 
     // RSSI を周期サンプリング。認可済み (notify が流れる状態) のときだけ投げ、
     // 結果は GAP_EVENT_RSSI_MEASUREMENT で受けてホストへ送る。

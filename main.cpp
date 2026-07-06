@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <hardware/exception.h>
 #include <hardware/gpio.h>
+#include <core_ring.hpp> // core1_io_launch (センサ I/O の core1 分離)
 #include <pico/stdio.h>
 #include <pico/stdlib.h>
 #include <pico/time.h>
@@ -91,6 +92,12 @@ int main(int argc, char const *argv[]) {
   // 生存ビーコン開始 (5s 周期、タイマ IRQ 駆動なのでスレッドが固まっても出続ける)。
   static repeating_timer_t beacon_timer;
   add_repeating_timer_ms(-5000, beacon_cb, nullptr, &beacon_timer);
+  // core1 のセンサ I/O ループを起動 (I2C と BNO055/BME280 は core1 が専有)。
+  // cyw43/BTstack の初期化は core0 の Shizuku スレッド (BLE_UART_DRIVER) 内で
+  // 後から走るが、poll モードで core1 を使わないため順序上の競合はない。
+  // Shizuku 起動前に立ち上げておけば、ドライバスレッドが動き出す頃には
+  // リングへレコードが流れ始めている。
+  shizu::core1_io_launch();
   shizu::init();
   while (1) {
     sleep_ms(500);

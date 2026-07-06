@@ -78,9 +78,14 @@ enum struct kernel_object_svc_num : uint32_t {
 };
 
 struct context_t {
-  uint32_t r4, r5, r6, r7, r8, r9, r10, r11;
-  exception_frame_t *sp;
-  uint32_t CONTROL;
+  uint32_t r4, r5, r6, r7, r8, r9, r10, r11; // offset 0..28
+  exception_frame_t *sp;                      // offset 32 (must stay 32)
+  // --- 遅延 FPU コンテキストスイッチ用 (lazy FPU context switch) ---
+  // exc_return: スレッドごとにキャッシュした EXC_RETURN。bit4=0 なら拡張(FP)フレーム。
+  // fp[16]    : callee-saved な FP レジスタ S16-S31 の退避域。
+  // svc_asm_handler.S の .equ CTX_EXC_RETURN(36)/CTX_FP(40) と一致させること。
+  uint32_t exc_return; // offset 36
+  uint32_t fp[16];     // offset 40 (S16-S31)
 };
 
 struct exception_frame_t {
