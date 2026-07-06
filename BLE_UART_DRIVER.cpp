@@ -41,16 +41,39 @@ static uint16_t conn_interval = 0;
 // (fail-closed)。独自の秘密は持たず、SM の判定を読むだけ。
 static bool cmd_authorized = false;
 
-// ---- 接続ウォッチドッグ ----------------------------------------------------
-// Central(母艦)が消えても DISCONNECTION_COMPLETE を取りこぼすと con_handle が
-// 有効なまま残り、アドバタイズが再開されず新規接続を受けられない=母艦から再接続
-// できない。そこで「Central が生きている兆候(接続確立/認可/can-send-now/RX 書込)」
-// が一定時間途絶えたら gap_disconnect で強制切断し再アドバタイズへ戻す。健全な
-// 通信中は notify のたびに can-send-now が来るので誤発火しない。人手が絡むペアリング
-// 確認中の誤切断を避けるため、認可済み(cmd_authorized)のセッションだけを対象にする。
-static constexpr uint64_t CONN_IDLE_TIMEOUT_US = 5000000ull; // 5s
+// ---- 接続ウォッチドッグ (修正版で復活) --------------------------------------
+// DISCONNECTION_COMPLETE は取りこぼすことがある (センサ障害等で長時間ストール
+// した間に HCI イベントが溢れるケースをビーコン計測で実測)。取りこぼすと
+// con_handle が幽霊のまま残り、再アドバタイズ経路が二度と走らない=母艦から
+// 再接続できない。そこで「Central の生存兆候 (接続確立/認可/CAN_SEND_NOW/
+// RSSI イベント/RX 書込)」が一定時間途絶えたらローカル状態を畳み、下の広告保険
+// で connectable へ戻す。健全な通信中は notify のたびに CAN_SEND_NOW が、毎秒
+// RSSI イベントが来るので誤発火しない。
+// ※ 旧版ウォッチドッグが「再接続不能を招いた」ように見えたのは、当時は
+//    センサ起因でシステム全体が凍結しており、再アドバタイズ自体が実行されて
+//    いなかったため。凍結修正後の現在はこの機構が正しく機能する。
+static constexpr uint64_t CONN_IDLE_TIMEOUT_US = 5000000ull;     // 認可+notify 中: 5s
+static constexpr uint64_t CONN_PAIRING_TIMEOUT_US = 30000000ull; // それ以外: 30s
 static uint64_t last_conn_activity_us = 0;
 static inline void note_conn_activity() { last_conn_activity_us = time_us_64(); }
+
+// ---- ウォッチドッグのエスカレーション (BT 電源再投入) -----------------------
+// 上の掃除 (gap_disconnect + 広告保険) はコントローラが生きている前提の復旧。
+// 実測した重い故障モードでは HCI イベントの流れごと死んでおり (RSSI コマンドの
+// 応答すら来ない)、HCI コマンドを積んでも送信されないため掃除では復帰しない。
+// 判定: 掃除直後の gap_disconnect / 広告 enable に対して、生きたコントローラは
+// 必ず応答イベント (COMMAND_COMPLETE 等 → ble_dbg_evt が進む) を返す。
+// WD_RECOVERY_TIMEOUT_US 待ってもイベントがゼロのままなら無応答と断定し、
+// BT コアを電源 OFF → FW 再ダウンロード → ON で丸ごと入れ直す
+// (ボード再起動と同等の効果を BT だけに適用)。
+static bool wd_recovery_pending = false;  // 掃除後、復旧確認中
+static uint64_t wd_cleanup_us = 0;        // 掃除した時刻
+static uint32_t wd_evt_snapshot = 0;      // 掃除時点のイベント数
+static constexpr uint64_t WD_RECOVERY_TIMEOUT_US = 10000000ull; // 10s
+
+// ---- 生存カウンタ (ビーコン診断用。main.cpp の [BEACON] が extern 参照) ------
+volatile uint32_t ble_dbg_poll = 0; // poll ループの回転数
+volatile uint32_t ble_dbg_evt = 0;  // HCI/SM イベント受信数
 
 // ---- 受信バイトの配送先 (sink) --------------------------------------------
 // set_rx_sink で設定。0xFFFF は無効。
@@ -188,9 +211,10 @@ static void flush_tx() {
   uint16_t mtu = att_server_get_mtu(con_handle);
   uint16_t max_payload = (mtu > 3) ? (mtu - 3) : 20; // ATT_NOTIFY = MTU-3
 
-  // MTU をなるべく使い切る (MTU=527 なら 1 notify で最大 524B)。chunk は
-  // この関数のローカル (BLE スレッドのスタック 8KB) なので 512B でも余裕。
-  // 大きい行を 1 接続イベントで送り切れるようにしてスループットを上げる。
+  // MTU をなるべく使い切る (現構成は HCI_ACL_PAYLOAD_SIZE=259 → ATT MTU ~247、
+  // notify ペイロード ~244B。CYW43 はこれ以上=LL 251B 超の ACL 分割で固まる
+  // 既知バグがあるため、btstack_config.h 側で意図的に制限している)。chunk の
+  // 512B は上限保険で、実際の 1 notify は max_payload (=MTU-3) で切られる。
   uint8_t chunk[512];
   if (max_payload > sizeof(chunk))
     max_payload = sizeof(chunk);
@@ -270,7 +294,7 @@ static int att_write_callback(hci_con_handle_t connection_handle,
   // RX characteristic の値への書き込み = Central からの受信データ
   if (att_handle ==
       ATT_CHARACTERISTIC_6E400002_B5A3_F393_E0A9_E50E24DCCA9E_01_VALUE_HANDLE) {
-    note_conn_activity(); // Central からの書込=生存の兆候
+    note_conn_activity(); // Central からの書込 = 生存の兆候
     process_rx(buffer, buffer_size);
     return 0;
   }
@@ -315,6 +339,7 @@ static void packet_handler(uint8_t packet_type, uint16_t channel,
   (void)size;
   if (packet_type != HCI_EVENT_PACKET)
     return;
+  ble_dbg_evt = ble_dbg_evt + 1;
 
   uint8_t event = hci_event_packet_get_type(packet);
   switch (event) {
@@ -329,12 +354,22 @@ static void packet_handler(uint8_t packet_type, uint16_t channel,
   case HCI_EVENT_LE_META:
     switch (hci_event_le_meta_get_subevent_code(packet)) {
     case HCI_SUBEVENT_LE_CONNECTION_COMPLETE: {
+      // status != 0 は「接続確立失敗」(例 0x3E)。このとき handle はゴミなので
+      // 取り込むと con_handle が偽の有効値になり、以後 DISCONNECTION も来ない
+      // ため再アドバタイズ経路が完全に死ぬ(=再起動するまで再接続不能)。
+      uint8_t st = hci_subevent_le_connection_complete_get_status(packet);
+      if (st != ERROR_CODE_SUCCESS) {
+        printf("[BLE_UART] connection failed (status=0x%02x), re-advertising\n",
+               st);
+        gap_advertisements_enable(1);
+        break;
+      }
       hci_con_handle_t h =
           hci_subevent_le_connection_complete_get_connection_handle(packet);
       if (h == con_handle)
         break; // ← 二重配送ガード(下記参照)
       con_handle = h;
-      note_conn_activity(); // ウォッチドッグの基準時刻を接続時に更新
+      note_conn_activity(); // ウォッチドッグの基準時刻を接続時に仕切り直す
       // 接続時の Connection Interval を捕捉 (ペアリング完了時に表示する)。
       conn_interval =
           hci_subevent_le_connection_complete_get_conn_interval(packet);
@@ -357,7 +392,10 @@ static void packet_handler(uint8_t packet_type, uint16_t channel,
     break;
 
   case HCI_EVENT_DISCONNECTION_COMPLETE:{
-    printf("[BLE_UART] disconnected, re-advertising\n");
+    // reason: 0x13=central(mac)側が切断 / 0x08=supervision timeout /
+    // 0x3D=MIC failure / 0x16=こちら(host)発。原因切り分けの決定打になる。
+    printf("[BLE_UART] disconnected (reason=0x%02x), re-advertising\n",
+           hci_event_disconnection_complete_get_reason(packet));
     con_handle = HCI_CON_HANDLE_INVALID;
     tx_notify_enabled = false;
     can_send_requested = false;
@@ -368,7 +406,7 @@ static void packet_handler(uint8_t packet_type, uint16_t channel,
   }
   case ATT_EVENT_CAN_SEND_NOW:
     can_send_requested = false;
-    note_conn_activity(); // Central が notify を受けている=生存の兆候
+    note_conn_activity(); // Central が notify を受けている = 生存の兆候
     flush_tx();
     break;
 
@@ -381,6 +419,7 @@ static void packet_handler(uint8_t packet_type, uint16_t channel,
     // gap_read_rssi の結果。getter は uint8_t を返すが値は dBm の符号付きなので
     // int8_t へ落としてから扱う。"RSSI=<dBm>\n" 行にして notify でホストへ。
     int rssi = (int8_t)gap_event_rssi_measurement_get_rssi(packet);
+    note_conn_activity(); // RSSI が測れている = リンク生存の兆候
     char buf[24];
     snprintf(buf, sizeof(buf), "RSSI=%d\n", rssi);
     tx_emit_line(buf);
@@ -406,6 +445,7 @@ static void sm_packet_handler(uint8_t packet_type, uint16_t channel,
   (void)size;
   if (packet_type != HCI_EVENT_PACKET)
     return;
+  ble_dbg_evt = ble_dbg_evt + 1;
 
   switch (hci_event_packet_get_type(packet)) {
 
@@ -449,7 +489,7 @@ static void sm_packet_handler(uint8_t packet_type, uint16_t channel,
     if (sm_event_reencryption_complete_get_status(packet) ==
         ERROR_CODE_SUCCESS) {
       cmd_authorized = true;
-      note_conn_activity(); // 再接続(再暗号化)直後もウォッチドッグの窓を仕切り直す
+      note_conn_activity(); // 再接続(再暗号化)直後も窓を仕切り直す
       printf("[BLE_UART] reencryption complete -> authorized\n");
       print_conn_interval("paired"); // ★ 再接続(再暗号化)直後にも CI を表示
       request_fast_ci();             // ★ CI=12 (15ms) を強制要求
@@ -524,17 +564,16 @@ static void method_set_rx_sink(uint32_t _caller_obj_id,
 }
 
 // ===========================================================================
-//  オブジェクトエントリ
+//  BT スタック一式の起動/再起動
 // ===========================================================================
-void BLE_UART_DRIVER::init() {
-  printf("[BLE_UART] init\n");
-
-  // 1) メソッドを先にエクスポート (BT が立ち上がる前でも積める)
-  export_method<method_send_byte>(BLE_UART_DRIVER::METHOD_IDs::send_byte);
-  export_method<method_send_buf>(BLE_UART_DRIVER::METHOD_IDs::send_buf);
-  export_method<method_set_rx_sink>(BLE_UART_DRIVER::METHOD_IDs::set_rx_sink);
-
-  // 2) CYW43 / BTstack 初期化
+// 初回起動と「チップリセット後の再起動」で共用する。cyw43_arch_init() が
+// btstack コア (hci_init / run loop / TLV) まで初期化するので、その上の
+// プロトコル層 (L2CAP/SM/ATT) と GAP 設定をここで毎回積み直す。
+// 再起動時は呼び出し前に bt_stack_teardown() で各層を deinit しておくこと
+// (sm_init 等は再初期化ガード付きのため、deinit しないと no-op になり、
+// 新しい hci にハンドラが再登録されず SM が沈黙する)。
+static void bt_stack_bringup() {
+  // CYW43 チップ起動 (WiFi/BT ファームウェアのロードを含む)
   cyw43_arch_init();
   l2cap_init();
   sm_init();
@@ -572,13 +611,52 @@ void BLE_UART_DRIVER::init() {
   gap_advertisements_set_data(adv_len, adv_buffer);
   // gap_advertisements_enable は HCI_STATE_WORKING で行う。
 
-  // 4) 電源 ON
+  // 電源 ON (HCI_STATE_WORKING 到達で packet_handler が広告を開始する)
   hci_power_control(HCI_POWER_ON);
+}
 
-  // 5) poll ループ
+// BT スタック一式の解体 → チップ電源断。上位層の明示 deinit が重要
+// (bt_stack_bringup のコメント参照)。cyw43_arch_deinit() は内部で
+// hci_power_control(OFF) + hci_close + run loop/メモリ解体まで行い、
+// チップの電源も落とす (次の cyw43_arch_init で FW が再ロードされる)。
+static void bt_stack_teardown() {
+  att_server_deinit();
+  sm_deinit();
+  l2cap_deinit();
+  cyw43_arch_deinit();
+}
+
+// コントローラ完全無応答 (HCI 電源再投入でも FW 再ダウンロードが通らない
+// ケースを実測) からの最終復旧手段: CYW43 チップごとリセットして全部作り直す。
+// ~2s ブロックする (協調スケジューラなので全スレッド停止) が、BT が死んでいる
+// 時点でテレメトリは既に止まっており、代償より復旧を優先する。
+static void bt_full_chip_restart() {
+  printf("[BLE_UART] full CYW43 chip reset...\n");
+  bt_stack_teardown();
+  obj_api::yield_us(100000); // 100ms: チップ電源断を落ち着かせつつ他スレッドへ譲る
+  bt_stack_bringup();
+  printf("[BLE_UART] chip reset done, waiting for HCI ready\n");
+}
+
+// ===========================================================================
+//  オブジェクトエントリ
+// ===========================================================================
+void BLE_UART_DRIVER::init() {
+  printf("[BLE_UART] init\n");
+
+  // 1) メソッドを先にエクスポート (BT が立ち上がる前でも積める)
+  export_method<method_send_byte>(BLE_UART_DRIVER::METHOD_IDs::send_byte);
+  export_method<method_send_buf>(BLE_UART_DRIVER::METHOD_IDs::send_buf);
+  export_method<method_set_rx_sink>(BLE_UART_DRIVER::METHOD_IDs::set_rx_sink);
+
+  // 2) BT スタック起動 (CYW43 チップ + btstack 全層 + 広告設定 + 電源 ON)
+  bt_stack_bringup();
+
+  // 3) poll ループ
   absolute_time_t next_rssi = make_timeout_time_ms(RSSI_PERIOD_MS);
   absolute_time_t next_adv_ensure = make_timeout_time_ms(1000);
   while (true) {
+    ble_dbg_poll = ble_dbg_poll + 1;
     cyw43_arch_poll();
 
     // RSSI を周期サンプリング。認可済み (notify が流れる状態) のときだけ投げ、
@@ -611,25 +689,49 @@ void BLE_UART_DRIVER::init() {
       att_server_request_can_send_now_event(con_handle);
     }
 
-    // 接続ウォッチドッグ: 認可済みセッションで Central の生存兆候が
-    // CONN_IDLE_TIMEOUT_US 途絶えたら強制切断する (消えた母艦/取りこぼした切断からの
-    // 復帰用)。DISCONNECTION_COMPLETE を取りこぼしてもハングしないよう、ローカル状態も
-    // その場で畳む。実際の再アドバタイズは下の「広告保険」が未接続を見て行う。
-    if (con_handle != HCI_CON_HANDLE_INVALID && cmd_authorized &&
-        time_us_64() - last_conn_activity_us > CONN_IDLE_TIMEOUT_US) {
-      printf("[BLE_UART] link idle > %lums, forcing disconnect\n",
-             (unsigned long)(CONN_IDLE_TIMEOUT_US / 1000));
-      gap_disconnect(con_handle);
-      con_handle = HCI_CON_HANDLE_INVALID;
-      tx_notify_enabled = false;
-      can_send_requested = false;
-      cmd_authorized = false;
-      nc_pending_handle = HCI_CON_HANDLE_INVALID;
+    // 接続ウォッチドッグ: 生存兆候が途絶えたらローカル状態を畳む (冒頭コメント
+    // 参照)。通信中 (認可+notify) は CAN_SEND_NOW/RSSI が毎秒来るので 5s、
+    // ペアリング途中など人手が絡む段階は 30s の猶予にする。実際の再アドバタイズ
+    // は下の広告保険が「未接続」を見て行う。
+    if (con_handle != HCI_CON_HANDLE_INVALID) {
+      uint64_t idle = time_us_64() - last_conn_activity_us;
+      uint64_t limit = (cmd_authorized && tx_notify_enabled)
+                           ? CONN_IDLE_TIMEOUT_US
+                           : CONN_PAIRING_TIMEOUT_US;
+      if (idle > limit) {
+        printf("[BLE_UART] link idle %lums — force cleanup & re-advertise\n",
+               (unsigned long)(idle / 1000));
+        gap_disconnect(con_handle); // リンクがまだ生きていれば正規に切る (死んでいれば無害)
+        con_handle = HCI_CON_HANDLE_INVALID;
+        tx_notify_enabled = false;
+        can_send_requested = false;
+        cmd_authorized = false;
+        nc_pending_handle = HCI_CON_HANDLE_INVALID;
+        // 掃除で戻れたかの確認を開始: この gap_disconnect / 直後の広告 enable に
+        // 対する応答イベントが来なければコントローラごと無応答 → 電源再投入へ。
+        wd_recovery_pending = true;
+        wd_cleanup_us = time_us_64();
+        wd_evt_snapshot = ble_dbg_evt;
+      }
     }
 
-    // 広告保険: 未接続なのに広告が出ていない状況(切断イベント取りこぼし/enable 失敗)を
-    // 避けるため、切断中は 1s ごとに広告を張り直す。enable は冪等なので無害。これが
-    // 無いと一度切れたら二度と見つからず、母艦から再接続できない。
+    // ウォッチドッグのエスカレーション: 掃除後 WD_RECOVERY_TIMEOUT_US 経っても
+    // HCI イベントが 1 つも来ない = コントローラ/トランスポート無応答。BT を
+    // 電源から入れ直す (bt_loaded を倒すことで FW 再ダウンロード=コア完全リセット)。
+    if (wd_recovery_pending) {
+      if (ble_dbg_evt != wd_evt_snapshot) {
+        wd_recovery_pending = false; // 応答あり = コントローラ生存、掃除で十分
+      } else if (time_us_64() - wd_cleanup_us > WD_RECOVERY_TIMEOUT_US) {
+        wd_recovery_pending = false;
+        printf("[BLE_UART] controller unresponsive — resetting CYW43\n");
+        // hci_power_control の OFF→ON (+BT FW 再ダウンロード) では蘇生しない
+        // ことを実測済み。チップごとリセットして btstack 全層を作り直す。
+        bt_full_chip_restart();
+      }
+    }
+
+    // 広告保険: 未接続なのに広告が止まっている事態 (切断イベント取りこぼし後や
+    // enable 失敗) を避けるため、切断中は 1s ごとに広告を張り直す (enable は冪等)。
     if (con_handle == HCI_CON_HANDLE_INVALID && time_reached(next_adv_ensure)) {
       gap_advertisements_enable(1);
       next_adv_ensure = make_timeout_time_ms(1000);

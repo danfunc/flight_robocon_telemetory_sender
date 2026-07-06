@@ -23,7 +23,17 @@
 #define MAX_NR_LE_DEVICE_DB_ENTRIES 1
 #define NVM_NUM_DEVICE_DB_ENTRIES 1
 
-#define HCI_ACL_PAYLOAD_SIZE 1021
+// ★ CYW43 の実用上限に合わせる。以前の 1021 (→ ATT MTU 527, 512B notify) は
+//   CYW43 コントローラの既知バグを踏む: notify ストリーミング中に切断/再接続を
+//   繰り返すと BT コアが完全無応答になり (HCI イベント全停止・切断イベント喪失)、
+//   チップリセットまで再接続不能になる (btstack #654, pico-sdk #2181 と同一症状)。
+//   トリガーは「LL 1 パケット (DLE 上限 251B) を超える ACL の分割送信」。
+//   LL 251B = L2CAP ヘッダ 4B + ATT PDU 247B なので、ACL ペイロードを
+//   247+4=251 に抑えると ATT MTU=247 / notify データ 244B となり、フルサイズ
+//   notify がちょうど 1 LL パケットに収まって分割が消える。
+//   ※ 一度 (255+4)=259 を試したが ATT MTU 255 → ACL 259B は LL 251+8 の
+//     2 パケットに割れて、数回目の切断/再接続でまだ死んだ (実測)。
+#define HCI_ACL_PAYLOAD_SIZE (247 + 4)
 #define HCI_OUTGOING_PRE_BUFFER_SIZE 64
 #define HCI_ACL_CHUNK_SIZE_ALIGNMENT 64
 

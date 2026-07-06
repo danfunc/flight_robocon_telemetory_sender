@@ -275,12 +275,14 @@ static void method_set_ffff_reject(uint32_t, uint32_t, uint32_t on, uint32_t) {
 
 // arg0 = (obj<<16)|method。新サンプル push 先を登録。
 static void method_set_sample_sink(uint32_t, uint32_t, uint32_t packed, uint32_t) {
+  printf("[BNO055]set_sample_sink called\n");
   sample_sink_obj = (packed >> 16) & 0xFFFF;
   sample_sink_method = packed & 0xFFFF;
 }
 
 // arg0 = (obj<<16)|method。較正 save/load 完了の push 先を登録。
 static void method_set_calib_sink(uint32_t, uint32_t, uint32_t packed, uint32_t) {
+  printf("[BNO055]set_calib_sink called\n");
   calib_sink_obj = (packed >> 16) & 0xFFFF;
   calib_sink_method = packed & 0xFFFF;
 }
@@ -346,6 +348,7 @@ void BNO055_DRIVER::init() {
   // NDOF フュージョン出力はハード的に 100Hz 固定なので、その限界で読み続ける
   // (これより速く読んでも同じ値しか出ない)。
   uint64_t next = time_us_64();
+  int fail_streak = 0; // 連続 I2C 失敗回数 (バス救出/再初期化のエスカレーション用)
   while (true) {
     // スループット試験中は I2C/融合を止めて帯域を空ける(yield で BLE は回り続ける)。
     if (g_paused) {
@@ -361,6 +364,7 @@ void BNO055_DRIVER::init() {
     next += 10000; // 100Hz の絶対グリッド
     bno055_sample_t s = {};
     if (read_motion(&s)) {
+      fail_streak = 0;
       s.seq = latest.seq + 1;
       s.valid = true;
       latest = s;
@@ -368,13 +372,33 @@ void BNO055_DRIVER::init() {
       if (sample_sink_obj != 0xFFFF)
         obj_api::svc(obj_api::svc_num::CALL_METHOD, sample_sink_obj,
                      sample_sink_method, (uint32_t)(uintptr_t)&latest);
-    } else
+    } else {
       latest.valid = false;
+      // I2C 失敗が続く間の扱いが重要: 1 回の失敗はタイムアウト待ちだけで
+      // 10〜30ms を消費して常に周期超過になるため、旧実装 (再同期パスで
+      // yield しない) では本スレッドが CPU を独占し、BLE を含む全スレッドが
+      // 数十秒単位で凍結していた (→ macOS 側は無応答と見て切断、HCI イベント
+      // も溢れて切断イベントを取りこぼす)。失敗中は 20Hz へ落として譲る。
+      ++fail_streak;
+      if (fail_streak >= 20) {
+        // バス救出でも戻らない → センサごと再初期化 (POR ~700ms、yield あり)。
+        printf("[BNO055] I2C still failing — sensor reinit\n");
+        bno_init_sensor();
+        fail_streak = 0;
+      } else if (fail_streak % 5 == 0) {
+        // 5 連続失敗ごとにバス救出 (BNO055 のクロックストレッチ起因ロック
+        // アップでスレーブが SDA を掴んだままの状態を解く)。
+        printf("[BNO055] I2C fail x%d — bus recover\n", fail_streak);
+        i2c_bus::recover();
+      }
+      next = time_us_64() + 50000; // 失敗中は 20Hz でリトライ (必ず下で yield)
+    }
 
     uint64_t now = time_us_64();
-    if ((int64_t)(next - now) < 0) // 万一読みが10ms超 → 取りこぼし再同期
+    if ((int64_t)(next - now) < 0) {
       next = now;
-    else
+      obj_api::yield(); // 周期超過でも必ず 1 回は譲る (無 yield 凍結の防止)
+    } else
       obj_api::yield_until_us(next); // 締切に張り付いて true 100Hz(±数µs)
   }
 }

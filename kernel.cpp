@@ -244,6 +244,16 @@ void svc_cpp_handler(shizu::context_t *context) {
       // current object id を対象へ移すので、メソッド本体は対象オブジェクトの権限で
       // 同一スレッド上を走る (= 保護されたサブルーチン呼び出し)。
       // printf("call to %lx,%lx\n", arg0, arg1);
+      // 呼び先が未 export (nullptr) のまま飛ぶと pc=0 → 戻りで trap に落ち、
+      // 原因の特定が困難になる。ここで検出して呼び出し元/先を明示して止める。
+      // (典型例: スレッド番号の昇順で先に走ったオブジェクトが、まだ main が
+      //  走っていないオブジェクトのメソッドを呼んだ場合)
+      if (shizu::object_table[arg0].method_table[arg1] == nullptr) {
+        panic("METHOD_CALL to unexported method\n"
+              " caller obj: %lu\n callee obj: %lu\n method: %lu\n",
+              (unsigned long)current_thread.object_id, (unsigned long)arg0,
+              (unsigned long)arg1);
+      }
       current_thread.call_stack.push(
           {.stack_frame = *stack_frame,
            .context = *context,

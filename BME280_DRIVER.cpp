@@ -38,6 +38,10 @@ static int32_t t_fine;
 
 // ---- 高度ゼロ点 ------------------------------------------------------------
 static float ground_hpa = 1013.25f;
+// 地上較正時の基準温度 [℃]。測高公式には「地上と現在の平均温度 (気層平均)」を
+// 使う。瞬時のチップ温度だけを使うと、自己発熱の立ち上がりや気流による温度変動が
+// スケール係数としてそのまま高度に乗ってしまう (温度ベースの QNH 補正に相当)。
+static float ground_temp_c = 15.0f;
 
 // ---- 最新サンプル (read_latest が返す) -------------------------------------
 // 協調スケジューリングなので、更新中に別スレッドが割り込むことはない
@@ -126,9 +130,13 @@ static uint32_t compensate_P(int32_t adc_P) {
   return (uint32_t)p / 256;
 }
 
-// 気圧 → 高度 (国際標準大気の簡易式)。
+// 気圧 → 高度 (測高公式)。温度は「地上較正時 T0 と現在 T の平均」= 気層平均
+// 温度を使う (教科書どおりの hypsometric 式)。瞬時 T のみだと、チップ自己発熱の
+// 立ち上がり (起動後数分で +1〜2℃) や気流での温度揺れが高度スケールを直接
+// 変調する。平均化で温度由来の高度ドリフト/ノイズを半減できる。
 static float pressure_to_altitude(float press_hpa, float temp_c, float p0_hpa) {
-  return ((temp_c + 273.15f) / 0.0065f) *
+  float t_layer_c = 0.5f * (temp_c + ground_temp_c);
+  return ((t_layer_c + 273.15f) / 0.0065f) *
          (soft_math::powf(p0_hpa / press_hpa, 0.190234f) - 1.0f);
 }
 
@@ -144,14 +152,16 @@ static bool read_raw(float *temp_c, float *press_hpa) {
   return true;
 }
 
-// 地上気圧を複数サンプル平均で測る (高度ゼロ点)。長い待ちは yield で協調する。
+// 地上気圧を複数サンプル平均で測る (高度ゼロ点)。同時に基準温度 ground_temp_c
+// も平均で取り直す (測高公式の気層平均温度の片割れ)。長い待ちは yield で協調する。
 static float calibrate_ground(int samples) {
-  float sum_p = 0.0f;
+  float sum_p = 0.0f, sum_t = 0.0f;
   int ok = 0;
   for (int i = 0; i < samples; i++) {
     float t, p;
     if (read_raw(&t, &p)) {
       sum_p += p;
+      sum_t += t;
       ok++;
     }
     obj_api::yield_us(30000); // 30ms 毎。yield なので BLE 等も並行して回る
@@ -160,6 +170,7 @@ static float calibrate_ground(int samples) {
     printf("[BME280] *** all calibration reads failed ***\n");
     return 1013.25f;
   }
+  ground_temp_c = sum_t / ok;
   return sum_p / ok;
 }
 

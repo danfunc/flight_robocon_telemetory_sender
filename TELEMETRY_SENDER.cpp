@@ -41,9 +41,11 @@ static constexpr float A_Z_CLIP = 5.0f; // 世界鉛直加速度のクリップ 
 
 // 水平速度 (vx,vy) は GPS 等の位置基準が無く、加速度の積分だけでは
 // ドリフトが止まらない。そこでリーク積分で有界化する: 静止時は 0 へ緩く戻り、
-// 巡航時はやや低め (参考値) に出る。時定数を大きくするほどドリフトを許容して
-// 追従が良く、小さくするほど安定するがバイアスが増える。
-static constexpr float HVEL_LEAK_TAU = 3.0f; // 水平速度リーク時定数 [s]
+// 巡航時はやや低め (参考値) に出る。加速度バイアス a_b に対する定常オフセットは
+// a_b×τ (例: 0.05 m/s² × 2s = 0.1 m/s)。τ を小さくするほど「微小に減衰し続ける」
+// 側に倒れてドリフト残差が減り、代わりに巡航中の読みが下振れする。位置基準が
+// 無い以上ドリフト抑制を優先し 3.0 → 2.0 に短縮。
+static constexpr float HVEL_LEAK_TAU = 2.0f; // 水平速度リーク時定数 [s]
 
 // テレメトリの elev 方向ヒントを FLIGHT_CONTROLLER のエレベータ指令から導く閾値 [deg]。
 // (飛行制御の本体は FLIGHT_CONTROLLER に分離済み。ここは融合+通信のみ担う。)
@@ -445,11 +447,12 @@ struct __attribute__((packed)) batch_sample_t {
 // クライアント (struct.unpack '<HhIiiiiihhhhhhHhhBBBhhB') と一致させる。
 static_assert(sizeof(batch_sample_t) == 54, "batch_sample_t must be 54 bytes");
 
-// 1 バッチに詰める最大サンプル数。スタッフィング後でも BLE 側の
-// TX_LINE_MAX(1024) に収まり、かつ概ね 1 notify(~512B) に乗るサイズに抑える。
-// サンプルが 51B に増えたため 9 に低減 (17+9*51+2=478B、最悪 2倍スタッフでも
-// 2*478+2=958 < 1024)。
-static constexpr int BATCH_MAX = 9;
+// 1 バッチに詰める最大サンプル数。CYW43 は notify 244B (LL 251B = DLE 上限に
+// 1 パケットで収まるサイズ) までが安全圏 (btstack_config.h の
+// HCI_ACL_PAYLOAD_SIZE 参照。512B notify は切断/再接続で BT コアが固まる既知
+// バグを踏む)。17+4*54+2=235B ≤ 244B で、スタッフィング少なめなら 1 フレーム
+// = 1 notify に乗る。最悪 2 倍スタッフでも 2*235+2=472 < TX_LINE_MAX(1024)。
+static constexpr int BATCH_MAX = 4;
 // バッチを送出する最大間隔。これを超えたら満杯でなくても flush する。
 static constexpr uint64_t BATCH_FLUSH_US = 50000; // 50ms
 
@@ -773,9 +776,10 @@ void TELEMETRY_SENDER::main() {
     seq++;
     next_us += telemetry_period_us; // 絶対グリッドを1周期進める
     uint64_t end_us = time_us_64();
-    if ((int64_t)(next_us - end_us) < 0)
+    if ((int64_t)(next_us - end_us) < 0) {
       next_us = end_us; // 処理が周期を超えた → 取りこぼし再同期
-    else
+      obj_api::yield(); // 超過が続いても必ず 1 回は譲る (無 yield 凍結の防止)
+    } else
       obj_api::yield_us(next_us - end_us); // 残り時間だけ待って真の周期を保つ
   }
 }

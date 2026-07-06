@@ -37,19 +37,26 @@ public:
     read_latest = 0,
     // arg0 = 0:26B ブロック読み(既定) / 1:16bit 値ごとの 2B 個別読み。
     set_read_mode = 1,
-    // arg0 無視。現オフセットプロファイルを内部バッファへ吸い出す(非同期、calib_get で取得)。
+    // arg0
+    // 無視。現オフセットプロファイルを内部バッファへ吸い出す(非同期、calib_get
+    // で取得)。
     calib_save = 2,
-    // arg0 = uint8_t[22] への ptr。そのオフセットプロファイルを書き戻す(非同期)。
+    // arg0 = uint8_t[22] への
+    // ptr。そのオフセットプロファイルを書き戻す(非同期)。
     calib_load = 3,
-    // arg0 = bno055_calib_xfer_t* 。done/ok とダンプをコピーする(save/load の結果取得)。
+    // arg0 = bno055_calib_xfer_t* 。done/ok とダンプをコピーする(save/load
+    // の結果取得)。
     calib_get = 4,
     // arg0 = 0:0xFFFF 破損バーストをそのまま公開 / 1:検出して破棄(既定)。
     set_ffff_reject = 5,
-    // arg0 = (obj_id<<16)|method_id。新サンプル push 先(sink)を登録。0xFFFF.. で無効。
+    // arg0 = (obj_id<<16)|method_id。新サンプル push 先(sink)を登録。0xFFFF..
+    // で無効。
     set_sample_sink = 6,
+    // ↑未実装
     // arg0 = (obj_id<<16)|method_id。較正 save/load 完了の push 先を登録。
     set_calib_sink = 7,
-    // arg0 = 0:サンプリング再開 / 非0:一時停止(スループット試験中に I2C を空ける)。
+    // arg0 = 0:サンプリング再開 / 非0:一時停止(スループット試験中に I2C
+    // を空ける)。
     set_paused = 8,
   };
 };

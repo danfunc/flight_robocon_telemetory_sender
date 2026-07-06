@@ -39,10 +39,13 @@ void shizu::IO_CONTROLLER::main() {
                          (uintptr_t)BME280_DRIVER::init);
   obj_api::create_object((uint32_t)object_ids::BNO055_DRIVER, 14,
                          (uintptr_t)BNO055_DRIVER::init);
-  // 飛行制御は TELEMETRY より先に立て、on_state push を受けられるようにする。
-  obj_api::create_object((uint32_t)object_ids::FLIGHT_CONTROLLER, 16,
+  // 飛行制御は TELEMETRY より先に走らせ、on_state/read_control の export を
+  // 済ませてから TELEMETRY の最初の call_method を受けられるようにする。
+  // ※ 初回実行順は create の順ではなく「スレッド番号の昇順」(YIELD が昇順スキャン)
+  //    なので、FLIGHT_CONTROLLER に小さい番号を割り当てることが本質。
+  obj_api::create_object((uint32_t)object_ids::FLIGHT_CONTROLLER, 15,
                          (uintptr_t)FLIGHT_CONTROLLER::main);
-  obj_api::create_object((uint32_t)object_ids::TELEMETRY_SENDER, 15,
+  obj_api::create_object((uint32_t)object_ids::TELEMETRY_SENDER, 16,
                          (uintptr_t)TELEMETRY_SENDER::main);
 
   // BLE スループット/RSSI ベンチマーク用の HELLO_WORLD を使いたい場合は、上の

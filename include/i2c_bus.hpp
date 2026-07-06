@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <hardware/gpio.h>
 #include <hardware/i2c.h>
+#include <pico/time.h> // busy_wait_us (バス救出のビットバンギング用)
 
 namespace shizu {
 namespace i2c_bus {
@@ -50,6 +51,38 @@ static inline int read_regs(uint8_t addr, uint8_t reg, uint8_t *buf,
   if (ret < 0)
     return ret;
   return i2c_read_timeout_us(port(), addr, buf, len, false, TIMEOUT_US);
+}
+
+// バス救出 (I2C-bus spec の bus clear 手順)。スレーブが転送途中で固まって
+// SDA を掴んだままになると (BNO055 はクロックストレッチ起因のロックアップを
+// 起こすことで知られる)、以後の全トランザクションがタイムアウトし続ける。
+// ピンを GPIO に戻して SCL を手動で 9 クロック叩き、スレーブに残りビットを
+// 吐かせて SDA を解放させ、STOP 条件を打ってから I2C を再初期化する。
+// 全体で ~100µs のビジーウェイトのみ (yield 不要、失敗側スレッドから呼んでよい)。
+static inline void recover() {
+  // open-drain 相当の駆動: 出力ラッチを Low に固定し、方向だけを
+  // OUT(=Low 駆動) / IN(=解放、pull-up で High) と切り替える。
+  gpio_set_function(SDA_PIN, GPIO_FUNC_SIO);
+  gpio_set_function(SCL_PIN, GPIO_FUNC_SIO);
+  gpio_put(SDA_PIN, 0);
+  gpio_put(SCL_PIN, 0);
+  gpio_set_dir(SDA_PIN, GPIO_IN);
+  gpio_set_dir(SCL_PIN, GPIO_IN);
+  gpio_pull_up(SDA_PIN);
+  gpio_pull_up(SCL_PIN);
+  busy_wait_us(5);
+  for (int i = 0; i < 9 && !gpio_get(SDA_PIN); ++i) {
+    gpio_set_dir(SCL_PIN, GPIO_OUT); // SCL Low
+    busy_wait_us(5);                 // 100kHz 相当
+    gpio_set_dir(SCL_PIN, GPIO_IN);  // SCL High (pull-up)
+    busy_wait_us(5);
+  }
+  // STOP 条件: SCL High のまま SDA を Low → High。
+  gpio_set_dir(SDA_PIN, GPIO_OUT);
+  busy_wait_us(5);
+  gpio_set_dir(SDA_PIN, GPIO_IN);
+  busy_wait_us(5);
+  init(); // ピンを I2C 機能へ戻し、コントローラも再初期化 (冪等)
 }
 
 } // namespace i2c_bus
