@@ -33,6 +33,9 @@ public:
     // arg0 = ble_tx_buf_t* 。バッファをまとめて TX リングへ積む(1 バイトずつ
     // call_method する代わりの一括送信)。send_byte と同じ行フレーミング(\n で確定)。
     send_buf = 2,
+    // arg0 = uint32_t* 。TX リングの現在の空きバイト数を書き込む。供給側の
+    // バックプレッシャ用 (ブラストが「入る分だけ生成」するために使う)。
+    get_tx_free = 3,
   };
 };
 } // namespace shizu

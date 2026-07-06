@@ -76,6 +76,15 @@ static void ble_send(const char *s, int len) {
               (uint32_t)(uintptr_t)&b);
 }
 
+// BLE TX リングの空きバイト数を問い合わせる (ブラストのバックプレッシャ用)。
+static uint32_t ble_tx_free() {
+  uint32_t v = 0;
+  call_method(object_ids::BLE_UART_DRIVER,
+              BLE_UART_DRIVER::METHOD_IDs::get_tx_free,
+              (uint32_t)(uintptr_t)&v);
+  return v;
+}
+
 // スループット試験中はセンサのサンプリングを止め、I2C/融合に食われる時間を帯域へ
 // 回す(協調スケジューラなので他スレッドの停止はできないが、無駄な仕事は消せる)。
 static void set_sensors_paused(bool paused) {
@@ -680,8 +689,13 @@ void TELEMETRY_SENDER::main() {
     // スループット試験中はテレメトリを止めてブラストに専念する。
     if (blast_active) {
       flush_batch(); // 溜まっていれば吐き出してからブラストへ
-      blast_step(line, (int)sizeof(line));
-      obj_api::yield_us(30000);
+      // 旧実装は「1 step 生成 → yield_us(30000)」で供給が 33Hz×~465B ≈
+      // 15.4kB/s に律速され、radio (CI 15ms × 2発/CSN) が飢えていた (実測:
+      // csn≈33/s = この 30ms 寝と一致)。TX リングに行が丸ごと入る空きが
+      // ある限り詰め、無くなったら yield で BLE poll スレッドに排出させる。
+      while (blast_active && ble_tx_free() >= (uint32_t)BLAST_LINE_LEN + 4)
+        blast_step(line, (int)sizeof(line));
+      obj_api::yield(); // 必ず譲る (協調スケジューラ。排出は BLE スレッド)
       next_us = time_us_64(); // ブラスト後はグリッドを取り直す
       continue;
     }

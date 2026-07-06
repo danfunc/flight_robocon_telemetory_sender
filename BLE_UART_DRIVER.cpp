@@ -89,7 +89,10 @@ static uint32_t rx_sink_method_id = 0;
 // 関数の途中で切り替わらないが、将来のプリエンプティブ化や IRQ に備えて
 // インデックス更新だけを save_and_disable_interrupts でガードする (btstack
 // 呼び出しはロック外)。
-static constexpr uint32_t TX_RING_SIZE = 2048; // 2 の冪
+// 8KB: CI 15ms × 2 発/CSN の排出 (~32.5kB/s) に対し、printf (USB CDC) 等で
+// スケジューラが数十 ms 詰まっても供給が途切れない深さ (2048 だと ~60ms 分で
+// blast 飽和供給時に浅すぎた)。
+static constexpr uint32_t TX_RING_SIZE = 8192; // 2 の冪
 static constexpr uint32_t TX_RING_MASK = TX_RING_SIZE - 1;
 static uint8_t tx_ring[TX_RING_SIZE];
 static volatile uint32_t tx_head = 0; // 書き込み位置 (producer)
@@ -372,17 +375,35 @@ static void request_ci_fallback(const char *why) {
   printf("[BLE_UART] CI fallback (12,24) [%s] -> %d\n", why, r);
 }
 
-// 2M PHY を要求する。CYW43439 の BT FW が 2M PHY 対応かは要実測確認
-// (PHY_UPDATE_COMPLETE が来ない実測あり。LE features ログと Command Status
-// ログで切り分ける)。2M 化で 1 LL PDU の空中時間が半減し、同じ CI (15ms) に
-// より多くの PDU を詰められる。適用可否は HCI_SUBEVENT_LE_PHY_UPDATE_COMPLETE
-// で分かる (packet_handler がログを出す)。
+// ---- 2M PHY / LE features 診断 ----------------------------------------------
+// 実測で `LE features:` も `LE Set PHY command status` も出なかった件の対策:
+//  (a) hci_send_cmd はコマンドクレジットが無いと黙って捨てる (log_error のみ、
+//      戻り値 ERROR_CODE_COMMAND_DISALLOWED)。HCI ready 直後は btstack 自身の
+//      コマンドと競合しやすい → 送信は poll ループへ移し、
+//      hci_can_send_command_packet_now() を確認してから送る (成るまで再試行)。
+//  (b) 旧 FW のコントローラは未知オペコードに Command Status ではなく
+//      Command Complete (Unknown HCI Command) で応える場合がある →
+//      COMMAND_COMPLETE 側でも LE Set PHY オペコードを拾う。
+//  (c) 最終手段: request_2m_phy から 5 秒以内に PHY_UPDATE_COMPLETE が来なければ
+//      「no response (likely unsupported)」を 1 回だけログ (poll ループで監視)。
+static bool le_features_pending = false; // 読み出しコマンドの送信待ち
+static bool phy_probe_active = false;    // PHY update 応答待ち
+static uint64_t phy_req_us = 0;
+static constexpr uint64_t PHY_PROBE_TIMEOUT_US = 5000000ull;
+
+// 2M PHY を要求する。CYW43439 の BT FW が 2M PHY 対応かは要実測確認。
+// 2M 化で 1 LL PDU の空中時間が半減し、同じ CI (15ms) により多くの PDU を
+// 詰められる。gap_le_set_phy はコネクションにキューされ hci_run が送る
+// (この時点では捨てられない)。適用可否は HCI_SUBEVENT_LE_PHY_UPDATE_COMPLETE
+// / Command Status / 5s タイムアウトの 3 経路のどれかで必ずログに出る。
 // tx_phys/rx_phys: bit0=1M, bit1=2M, bit2=Coded。all_phys=0 = 両方向とも希望を指定。
 static void request_2m_phy() {
   if (con_handle == HCI_CON_HANDLE_INVALID)
     return;
   uint8_t r = gap_le_set_phy(con_handle, 0, 0x02, 0x02, 0);
-  printf("[BLE_UART] request 2M PHY -> %u\n", r);
+  phy_probe_active = true;
+  phy_req_us = time_us_64();
+  printf("[BLE_UART] request 2M PHY -> %u (watching for PHY update, 5s)\n", r);
 }
 
 // ---- HCI / ATT イベント ----------------------------------------------------
@@ -401,15 +422,17 @@ static void packet_handler(uint8_t packet_type, uint16_t channel,
     if (btstack_event_state_get_state(packet) == HCI_STATE_WORKING) {
       printf("[BLE_UART] HCI ready, advertising start\n");
       gap_advertisements_enable(1);
-      // 2M PHY サポートの白黒付け: ローカル LE features を読む。結果は
-      // COMMAND_COMPLETE (opcode 0x2003) で拾い、bit8 (=byte1 bit0) をログ。
-      hci_send_cmd(&hci_le_read_local_supported_features);
+      // 2M PHY サポートの白黒付け: ローカル LE features を読む。ここで直接
+      // hci_send_cmd すると btstack 自身のコマンドとクレジット競合して黙って
+      // 捨てられる (実測でログ不発の原因) ため、poll ループから
+      // hci_can_send_command_packet_now() を確認して送る。
+      le_features_pending = true;
     }
     break;
 
-  case HCI_EVENT_COMMAND_COMPLETE:
-    if (hci_event_command_complete_get_command_opcode(packet) ==
-        HCI_OPCODE_HCI_LE_READ_LOCAL_SUPPORTED_FEATURES) {
+  case HCI_EVENT_COMMAND_COMPLETE: {
+    uint16_t cc_opcode = hci_event_command_complete_get_command_opcode(packet);
+    if (cc_opcode == HCI_OPCODE_HCI_LE_READ_LOCAL_SUPPORTED_FEATURES) {
       // return params: [0]=status, [1..8]=LE features (LSB first)。
       // LE 2M PHY = feature bit 8 = byte1 の bit0。
       const uint8_t *rp = hci_event_command_complete_get_return_parameters(packet);
@@ -417,8 +440,17 @@ static void packet_handler(uint8_t packet_type, uint16_t channel,
              "(bytes[0..1]=%02x %02x)\n",
              rp[0], (rp[2] & 0x01) ? "supported" : "NOT supported", rp[1],
              rp[2]);
+    } else if (cc_opcode == HCI_OPCODE_HCI_LE_SET_PHY) {
+      // 旧 FW は未知オペコードに Command Complete (status=0x01 Unknown HCI
+      // Command) で応えることがある。ここに来たら 2M PHY 非対応がほぼ確定。
+      const uint8_t *rp = hci_event_command_complete_get_return_parameters(packet);
+      printf("[BLE_UART] LE Set PHY answered via Command Complete: "
+             "status=0x%02x (0x01 = Unknown HCI Command → 2M PHY unsupported)\n",
+             rp[0]);
+      phy_probe_active = false;
     }
     break;
+  }
 
   case HCI_EVENT_COMMAND_STATUS: {
     // LE Set PHY はまず Command Status が返る (0x00=実行中 → 後で
@@ -429,6 +461,8 @@ static void packet_handler(uint8_t packet_type, uint16_t channel,
       uint8_t st = hci_event_command_status_get_status(packet);
       printf("[BLE_UART] LE Set PHY command status = 0x%02x%s\n", st,
              st == 0 ? " (pending, wait for PHY update)" : " (REJECTED)");
+      if (st != 0)
+        phy_probe_active = false; // 棄却 = 応答済み。タイムアウトログは不要
     }
     break;
   }
@@ -494,6 +528,7 @@ static void packet_handler(uint8_t packet_type, uint16_t channel,
       uint8_t rxp = packet[7];
       printf("[BLE_UART] PHY update: status=0x%02x tx=%uM rx=%uM\n", st, txp,
              rxp);
+      phy_probe_active = false; // 応答あり → タイムアウト監視を解除
       break;
     }
     default:
@@ -665,6 +700,19 @@ static void method_send_buf(uint32_t _caller_obj_id, uint32_t _caller_thread_id,
     tx_stage_byte(b->data[i]);
 }
 
+// arg0 = uint32_t* out。TX リングの空きバイト数を書き込む (ブラスト等の
+// 供給側が「入る分だけ生成する」ためのバックプレッシャ問い合わせ)。
+static void method_get_tx_free(uint32_t _caller_obj_id,
+                               uint32_t _caller_thread_id, uint32_t out_ptr,
+                               uint32_t _arg1) {
+  (void)_caller_obj_id;
+  (void)_caller_thread_id;
+  (void)_arg1;
+  if (out_ptr == 0)
+    return;
+  *(uint32_t *)(uintptr_t)out_ptr = tx_free();
+}
+
 static void method_set_rx_sink(uint32_t _caller_obj_id,
                                uint32_t _caller_thread_id, uint32_t packed,
                                uint32_t _arg1) {
@@ -765,6 +813,7 @@ void BLE_UART_DRIVER::init() {
   export_method<method_send_byte>(BLE_UART_DRIVER::METHOD_IDs::send_byte);
   export_method<method_send_buf>(BLE_UART_DRIVER::METHOD_IDs::send_buf);
   export_method<method_set_rx_sink>(BLE_UART_DRIVER::METHOD_IDs::set_rx_sink);
+  export_method<method_get_tx_free>(BLE_UART_DRIVER::METHOD_IDs::get_tx_free);
 
   // 2) BT スタック起動 (CYW43 チップ + btstack 全層 + 広告設定 + 電源 ON)
   bt_stack_bringup();
@@ -776,6 +825,24 @@ void BLE_UART_DRIVER::init() {
   while (true) {
     ble_dbg_poll = ble_dbg_poll + 1;
     cyw43_arch_poll();
+
+    // LE features 読み出し (HCI ready 時に予約)。クレジットが空くのを待って
+    // から送る (hci_send_cmd はクレジット無しだと黙って捨てるため)。
+    if (le_features_pending && hci_can_send_command_packet_now()) {
+      le_features_pending = false;
+      uint8_t st = hci_send_cmd(&hci_le_read_local_supported_features);
+      printf("[BLE_UART] LE features read sent -> %u\n", st);
+      if (st != 0)
+        le_features_pending = true; // 万一失敗したら次周で再試行
+    }
+
+    // 2M PHY 応答ウォッチ: 要求から 5s、Command Status / PHY update のどちらも
+    // 来なければ 1 回だけ結論を出す (コントローラ FW 非対応の可能性が濃厚)。
+    if (phy_probe_active && time_us_64() - phy_req_us > PHY_PROBE_TIMEOUT_US) {
+      phy_probe_active = false;
+      printf("[BLE_UART] 2M PHY: no response in 5s (likely unsupported by "
+             "controller FW)\n");
+    }
 
     // TX 統計 (A/B 計測用): 1 秒窓の notify 数 / CAN_SEND_NOW 数 / バイト数。
     // pkts/csn が 1.0 を超えていれば 1 CI に複数発詰められている証拠。
