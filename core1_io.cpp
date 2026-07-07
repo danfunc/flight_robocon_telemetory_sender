@@ -97,6 +97,12 @@ uint8_t g_recover_count = 0;
 uint8_t g_reinit_count = 0;
 uint8_t g_last_calib = 0;
 
+// ---- 0xFFFF 破損率 A/B 測定 (ブロック vs split-read) の 1s 窓カウンタ ----------
+// X0/X1 でモードを切替え、CH_DIAG で「現モード + 直近 1s の 読み総数/破損数」を
+// core0 へ送る。core0 が破損率を printf する。AMG 化せず 0xFFFF を潰せるか判定用。
+uint16_t g_motion_reads = 0; // 成功したバースト読み総数
+uint16_t g_ffff_reads = 0;   // うち attempt0 に 1ch でも 0xFFFF があった数
+
 // ---- BNO055 整数ロジック -----------------------------------------------------
 int16_t held_raw[9] = {0};
 int16_t held_eul[3] = {0};
@@ -181,14 +187,21 @@ bool __not_in_flash_func(read_motion9)(int16_t r[9]) {
   for (int attempt = 0; attempt < 2; ++attempt) {
     if (!read_raw9(r))
       return false;
-    if (!g_reject_ffff)
-      break;
+    // 破損計数 (A/B 測定用): attempt0 のバーストに 0xFFFF が 1ch でもあるか。
+    // g_reject_ffff の設定に依らず常に測る (破損率の素の値が欲しい)。
     bool any_ffff = false;
     for (int k = 0; k < 9; ++k)
       if (r[k] == -1) {
         any_ffff = true;
         break;
       }
+    if (attempt == 0) {
+      ++g_motion_reads;
+      if (any_ffff)
+        ++g_ffff_reads;
+    }
+    if (!g_reject_ffff)
+      break;
     if (!any_ffff)
       break;
   }
@@ -532,6 +545,17 @@ bool __not_in_flash_func(handle_calib_sideband)() {
       pl[4] = g_recover_count;
       pl[5] = g_reinit_count;
       push_rec(CH_STATUS, (uint32_t)now, pl, 6);
+      // 0xFFFF 破損率 A/B: 現モード + 直近 1s の 読み総数/破損数 を DIAG で送る。
+      uint8_t dpl[6];
+      dpl[0] = g_split_read ? 1 : 0;
+      dpl[1] = g_reject_ffff ? 1 : 0;
+      dpl[2] = (uint8_t)(g_motion_reads & 0xFF);
+      dpl[3] = (uint8_t)(g_motion_reads >> 8);
+      dpl[4] = (uint8_t)(g_ffff_reads & 0xFF);
+      dpl[5] = (uint8_t)(g_ffff_reads >> 8);
+      push_rec(CH_DIAG, (uint32_t)now, dpl, 6);
+      g_motion_reads = 0;
+      g_ffff_reads = 0;
       next_status += 1000000;
       if ((int64_t)(now - next_status) > 0)
         next_status = now + 1000000;

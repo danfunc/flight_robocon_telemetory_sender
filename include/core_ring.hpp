@@ -36,6 +36,7 @@ enum ch_id : uint8_t {
   CH_EUL = 0x11,    // オイラー角 h/r/p 3×int16 (1/16 deg, デッドバンド適用済み)
   CH_LIA = 0x12,    // 線形加速度 x/y/z 3×int16 (1/100 m/s^2)
   CH_GRV = 0x13,    // 重力ベクトル x/y/z 3×int16 (1/100 m/s^2)
+  CH_DIAG = 0x7D,   // 1Hz: 0xFFFF 破損率 A/B [0]=read_mode(0blk/1split),[1]=reject,[2:3]=reads u16,[4:5]=ffff u16
   CH_STATUS = 0x7E, // 1Hz: [0]=calib,[1]=health,[2:3]=i2c_fail u16,[4]=recover,[5]=reinit
 };
 

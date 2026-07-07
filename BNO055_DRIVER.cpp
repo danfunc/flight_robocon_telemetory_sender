@@ -207,6 +207,16 @@ static void dispatch_record(const core_ring::record_t &rec) {
     g_health = rec.payload[1];
     (void)g_health; // (現状は保持のみ。将来 STATUS のダウンリンクに使う)
     break;
+  case core_ring::CH_DIAG: { // 0xFFFF 破損率 A/B (X0=block / X1=split で切替え)
+    uint16_t reads, ffff;
+    memcpy(&reads, &rec.payload[2], 2);
+    memcpy(&ffff, &rec.payload[4], 2);
+    unsigned pm = reads ? (unsigned)((uint32_t)ffff * 1000u / reads) : 0;
+    printf("[BNO055] 0xFFFF diag: mode=%s reject=%u reads=%u ffff=%u (%u.%u%%)\n",
+           rec.payload[0] ? "split" : "block", (unsigned)rec.payload[1],
+           (unsigned)reads, (unsigned)ffff, pm / 10, pm % 10);
+    break;
+  }
   default:
     break;
   }
