@@ -44,7 +44,6 @@ NUS / Shizuku 側定数 (BLE_UART_DRIVER.cpp / ble_uart.gatt と一致):
 """
 
 import asyncio
-import collections
 import csv
 import os
 import queue
@@ -58,81 +57,8 @@ from tkinter import filedialog, messagebox, scrolledtext, ttk
 from shizuku_link import *  # 共有プロトコル層(BLE/フレーム解析)
 
 
-class StripChart(tk.Canvas):
-    """複数系列を時間軸で重ね描きする軽量ストリップチャート (tk Canvas のみ)。"""
-
-    WINDOW_SEC = 30.0
-
-    def __init__(self, master, series, ymin, ymax, ylabel, **kw):
-        super().__init__(master, height=160, bg="white",
-                         highlightthickness=1, highlightbackground="#ccc", **kw)
-        # series: {key: color}
-        self.colors = series
-        self.ymin, self.ymax, self.ylabel = ymin, ymax, ylabel
-        self._data = {k: collections.deque() for k in series}
-        self.bind("<Configure>", lambda _e: self.redraw())
-
-    def add(self, key: str, value: float):
-        now = time.monotonic()
-        dq = self._data[key]
-        dq.append((now, value))
-        cutoff = now - self.WINDOW_SEC
-        while dq and dq[0][0] < cutoff:
-            dq.popleft()
-
-    def clear(self):
-        for dq in self._data.values():
-            dq.clear()
-        self.redraw()
-
-    def _autoscale(self):
-        vals = [v for dq in self._data.values() for _, v in dq]
-        if not vals:
-            return self.ymin, self.ymax
-        lo, hi = min(vals), max(vals)
-        if hi - lo < 1e-6:
-            lo, hi = lo - 1, hi + 1
-        m = (hi - lo) * 0.1
-        return lo - m, hi + m
-
-    def _y(self, v, y0, y1, lo, hi):
-        v = max(lo, min(hi, v))
-        return y0 + (hi - v) / (hi - lo) * (y1 - y0)
-
-    def redraw(self):
-        self.delete("all")
-        w, h = self.winfo_width(), self.winfo_height()
-        if w < 60 or h < 50:
-            return
-        ml, mr, mt, mb = 52, 70, 10, 16
-        x0, x1, y0, y1 = ml, w - mr, mt, h - mb
-        lo, hi = self._autoscale()
-
-        for i in range(5):
-            yy = y0 + i / 4 * (y1 - y0)
-            val = hi - i / 4 * (hi - lo)
-            self.create_line(x0, yy, x1, yy, fill="#eee")
-            self.create_text(x0 - 4, yy, text=f"{val:.2f}", anchor="e",
-                            fill="#999", font=("Menlo", 8))
-        self.create_text((x0 + x1) / 2, h - 3,
-                        text=f"直近 {self.WINDOW_SEC:.0f} 秒 ({self.ylabel})",
-                        anchor="s", fill="#999", font=("Menlo", 8))
-
-        now = time.monotonic()
-        t_left = now - self.WINDOW_SEC
-        legend_y = y0 + 6
-        for key, color in self.colors.items():
-            dq = self._data[key]
-            self.create_text(x1 + 6, legend_y, text=key, anchor="w",
-                            fill=color, font=("Menlo", 8))
-            legend_y += 14
-            if len(dq) < 2:
-                continue
-            pts = []
-            for t, v in dq:
-                x = x0 + (t - t_left) / self.WINDOW_SEC * (x1 - x0)
-                pts.extend((x, self._y(v, y0, y1, lo, hi)))
-            self.create_line(*pts, fill=color, width=2)
+# StripChart (ライブグラフ) は撤去した。本ツールは記録 (ロギング) に集中し、
+# 時系列の可視化はオフライン (記録した CSV) 側で行う方針。
 
 
 class App:
@@ -169,6 +95,16 @@ class App:
         self._rec_writer = None
         self._rec_count = 0
         self._rec_path = None
+        self._rec_t0 = None            # 記録開始時刻 (monotonic)。経過/レート計算用
+        self._rec_lost0 = 0            # 記録開始時点の累積欠落 (パネルは差分を表示)
+        self._rec_rate = 0.0           # ローリング記録レート [Hz]
+        self._rec_rate_last_n = 0
+        self._rec_rate_last_t = 0.0
+        # イベントマーカー (記録中に打刻し、別 CSV へ host 時刻+経過+sample idx で残す。
+        # 離陸/着陸/外乱などを後でサンプルに対応づけられる)。
+        self._marker_file = None
+        self._marker_writer = None
+        self._marker_count = 0
 
         # BNO055 読みモード / 較正
         self._read_split = False           # False=BLK, True=2B 個別読み
@@ -179,12 +115,13 @@ class App:
         self._calib_save_to_file = False   # CDUMP 受信時にファイル保存するか
         self._last_calib_hex = None        # 直近に保存したオフセット(44 hex)
 
-        root.title("Shizuku テレメトリ — エンジニア (グラフ/デバッグ)")
+        root.title("Shizuku テレメトリ — 記録 / デバッグ")
         root.geometry("860x900")
         root.minsize(720, 700)
 
         self._build_ui()
         self.root.after(50, self._poll_queue)
+        self.root.after(500, self._poll_record_status)
         self.root.after(1000, self._poll_rssi)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -234,17 +171,8 @@ class App:
         for c in range(cols):
             panel.columnconfigure(c, weight=1)
 
-        # --- グラフ (高度 / 速度) ---
-        self.alt_chart = StripChart(
-            self.root, {"alt_fused": "#06c", "alt_baro": "#0a0"},
-            -2, 3, "m")
-        self.alt_chart.pack(fill=tk.X, padx=6, pady=2)
-        self.vel_chart = StripChart(
-            self.root, {"vel": "#c30", "az": "#909"}, -2, 2, "m/s, m/s²")
-        self.vel_chart.pack(fill=tk.X, padx=6, pady=2)
-        self.rssi_chart = StripChart(
-            self.root, {"host": "#06c", "pico": "#0a0"}, -100, -30, "dBm")
-        self.rssi_chart.pack(fill=tk.X, padx=6, pady=2)
+        # --- 記録 (ロギング) パネル ---
+        self._build_record_panel(self.root)
 
         # --- ログ ---
         self.text = scrolledtext.ScrolledText(
@@ -284,8 +212,7 @@ class App:
                                     values=["BIN", "CSV"])
         self.fmt_box.pack(side=tk.LEFT)
         self.fmt_box.bind("<<ComboboxSelected>>", lambda _e: self._on_set_format())
-        self.rec_btn = ttk.Button(bottom, text="記録開始", command=self._toggle_record)
-        self.rec_btn.pack(side=tk.LEFT, padx=4)
+        # 記録ボタンは記録パネル (_build_record_panel) へ移した。
         # BNO055 読みモード切替 (X0=ブロック / X1=2B 個別読み)。
         self.readmode_btn = ttk.Button(bottom, text="読み:BLK",
                                        command=self._toggle_read_mode)
@@ -455,7 +382,6 @@ class App:
         m = re.match(r"RSSI=(-?\d+)", line)
         if m:
             self._pico_rssi = int(m.group(1))
-            self.rssi_chart.add("pico", self._pico_rssi)
             self._set_rssi()
             return
 
@@ -561,12 +487,6 @@ class App:
                 else:
                     self.value_vars[key].set(f"{v:.3f} {unit}".strip())
 
-        # グラフ更新
-        self.alt_chart.add("alt_fused", vals["alt_fused_m"])
-        self.alt_chart.add("alt_baro", vals["alt_baro_m"])
-        self.vel_chart.add("vel", vals["vel_m_s"])
-        self.vel_chart.add("az", vals["az_m_s2"])
-
         # 受信レート / パケロス
         now = time.monotonic()
         if self._telem_t0 is None:
@@ -588,6 +508,39 @@ class App:
     # 受信した全テレメトリサンプルを host 受信時刻つきで CSV に追記する。バッチで
     # 複数サンプルが来ても 1 行ずつ残るので、0.06° ディザのような微小な時系列を
     # オフラインで解析できる。GUI スレッドからのみ呼ばれるのでロック不要。
+    # -- 記録パネル (グラフを撤去して空いた領域に配置) ----------------------
+    def _build_record_panel(self, parent):
+        frame = ttk.LabelFrame(parent, text="記録 (ロギング)")
+        frame.pack(fill=tk.X, padx=6, pady=4)
+
+        row1 = ttk.Frame(frame)
+        row1.pack(fill=tk.X, padx=6, pady=(4, 2))
+        self.rec_btn = ttk.Button(row1, text="● 記録開始", width=12,
+                                  command=self._toggle_record)
+        self.rec_btn.pack(side=tk.LEFT)
+        self.rec_state_var = tk.StringVar(value="停止中")
+        ttk.Label(row1, textvariable=self.rec_state_var,
+                  foreground="#c30", font=("Menlo", 12, "bold")).pack(
+                      side=tk.LEFT, padx=10)
+
+        self.rec_stats_var = tk.StringVar(
+            value="経過 00:00   サンプル 0   0.0 Hz   欠落 0   マーカー 0")
+        ttk.Label(frame, textvariable=self.rec_stats_var,
+                  font=("Menlo", 11)).pack(anchor="w", padx=8)
+        self.rec_file_var = tk.StringVar(value="ファイル: -")
+        ttk.Label(frame, textvariable=self.rec_file_var, foreground="#666",
+                  font=("Menlo", 9)).pack(anchor="w", padx=8)
+
+        row2 = ttk.Frame(frame)
+        row2.pack(fill=tk.X, padx=6, pady=(2, 6))
+        ttk.Label(row2, text="マーカー").pack(side=tk.LEFT)
+        self.marker_entry = ttk.Entry(row2)
+        self.marker_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 4))
+        self.marker_entry.bind("<Return>", lambda _e: self._add_marker())
+        self.marker_btn = ttk.Button(row2, text="マーカー記録",
+                                     command=self._add_marker)
+        self.marker_btn.pack(side=tk.LEFT)
+
     def _toggle_record(self):
         if self._rec_file is None:
             self._start_record()
@@ -595,9 +548,12 @@ class App:
             self._stop_record()
 
     def _start_record(self):
-        path = os.path.join(os.getcwd(), time.strftime("telemetry_%Y%m%d_%H%M%S.csv"))
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        path = os.path.join(os.getcwd(), f"telemetry_{stamp}.csv")
+        mpath = os.path.join(os.getcwd(), f"telemetry_{stamp}_markers.csv")
         try:
             f = open(path, "w", newline="")
+            mf = open(mpath, "w", newline="")
         except OSError as e:  # noqa: BLE001
             self._append("log", f"記録ファイルを開けません: {e}\n")
             return
@@ -605,10 +561,23 @@ class App:
         self._rec_writer = csv.writer(f)
         self._rec_count = 0
         self._rec_path = path
+        self._rec_t0 = time.monotonic()
+        self._rec_lost0 = self._telem_lost
+        self._rec_rate = 0.0
+        self._rec_rate_last_n = 0
+        self._rec_rate_last_t = self._rec_t0
         cols = ["host_unix", "host_time"] + [k for k, _l, _s, _u in TELEMETRY_FIELDS]
         self._rec_writer.writerow(cols)
         f.flush()
-        self.rec_btn.config(text="記録停止")
+        # マーカー用の別 CSV
+        self._marker_file = mf
+        self._marker_writer = csv.writer(mf)
+        self._marker_count = 0
+        self._marker_writer.writerow(
+            ["host_unix", "host_time", "elapsed_s", "sample_idx", "text"])
+        mf.flush()
+        self.rec_btn.config(text="■ 記録停止")
+        self.rec_state_var.set("● 記録中")
         self._append("log", f"記録開始: {path}\n")
 
     def _stop_record(self):
@@ -619,11 +588,71 @@ class App:
             except OSError:
                 pass
             self._append("log",
-                         f"記録停止: {self._rec_count} サンプル → {self._rec_path}\n")
+                         f"記録停止: {self._rec_count} サンプル / "
+                         f"{self._marker_count} マーカー → {self._rec_path}\n")
+        if self._marker_file is not None:
+            try:
+                self._marker_file.flush()
+                self._marker_file.close()
+            except OSError:
+                pass
         self._rec_file = None
         self._rec_writer = None
+        self._marker_file = None
+        self._marker_writer = None
+        self._rec_t0 = None
         if hasattr(self, "rec_btn"):
-            self.rec_btn.config(text="記録開始")
+            self.rec_btn.config(text="● 記録開始")
+            self.rec_state_var.set("停止中")
+
+    # -- イベントマーカー ---------------------------------------------------
+    def _add_marker(self):
+        text = self.marker_entry.get().strip()
+        if not text:
+            return
+        if self._marker_writer is None:
+            self._append("log", "記録中のみマーカーを打てます\n")
+            return
+        now = time.time()
+        elapsed = (time.monotonic() - self._rec_t0) if self._rec_t0 else 0.0
+        ms = int((now % 1) * 1000)
+        hs = time.strftime("%H:%M:%S", time.localtime(now)) + f".{ms:03d}"
+        try:
+            self._marker_writer.writerow(
+                [f"{now:.6f}", hs, f"{elapsed:.3f}", self._rec_count, text])
+            self._marker_file.flush()
+            self._marker_count += 1
+        except (OSError, ValueError) as e:  # noqa: BLE001
+            self._append("log", f"マーカー書き込み失敗: {e}\n")
+            return
+        self.marker_entry.delete(0, tk.END)
+        self._append("log",
+                     f"マーカー #{self._marker_count} @ {elapsed:.1f}s "
+                     f"(sample {self._rec_count}): {text}\n")
+
+    # -- 記録ステータスの定期更新 -------------------------------------------
+    def _poll_record_status(self):
+        if self._rec_file is not None and self._rec_t0 is not None:
+            elapsed = time.monotonic() - self._rec_t0
+            tnow = time.monotonic()
+            dt = tnow - self._rec_rate_last_t
+            if dt >= 1.0:
+                self._rec_rate = (self._rec_count - self._rec_rate_last_n) / dt
+                self._rec_rate_last_n = self._rec_count
+                self._rec_rate_last_t = tnow
+            mm, ss = divmod(int(elapsed), 60)
+            lost = self._telem_lost - self._rec_lost0
+            self.rec_stats_var.set(
+                f"経過 {mm:02d}:{ss:02d}   サンプル {self._rec_count}   "
+                f"{self._rec_rate:.1f} Hz   欠落 {lost}   マーカー {self._marker_count}")
+            try:
+                size = os.path.getsize(self._rec_path)
+                self.rec_file_var.set(
+                    f"ファイル: {os.path.basename(self._rec_path)}  "
+                    f"({size / 1024:.1f} KB)")
+            except OSError:
+                pass
+        self.root.after(500, self._poll_record_status)
 
     def _record_sample(self, vals: dict):
         if self._rec_writer is None:
@@ -800,11 +829,6 @@ class App:
                 self._handle(kind, payload)
         except queue.Empty:
             pass
-        # チャートはまとめて再描画 (描画コストを抑える)
-        if self.connected:
-            self.alt_chart.redraw()
-            self.vel_chart.redraw()
-            self.rssi_chart.redraw()
         self.root.after(100, self._poll_queue)
 
     def _handle(self, kind: str, payload: dict):
@@ -821,7 +845,6 @@ class App:
             val = payload.get("value")
             if val is not None:
                 self._host_rssi = val
-                self.rssi_chart.add("host", val)
                 self._set_rssi()
             elif payload.get("unsupported"):
                 if not self._host_rssi_unsupported:
@@ -872,9 +895,6 @@ class App:
             self._pending_pings.clear()
             self._rx_bytes = bytearray()
             self._last_telem_seq = None
-            self.alt_chart.clear()
-            self.vel_chart.clear()
-            self.rssi_chart.clear()
 
     def _append(self, tag: str, text: str):
         self.text.config(state=tk.NORMAL)

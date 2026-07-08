@@ -74,6 +74,9 @@ static_assert(offsetof(shizu::context_t, exc_return) == 36,
               "context_t layout mismatch: exc_return offset (asm CTX_EXC_RETURN)");
 static_assert(offsetof(shizu::context_t, fp) == 40,
               "context_t layout mismatch: fp offset (asm CTX_FP)");
+// claim は (uint32_t*)&thread.state を __atomic で叩くので 4B 幅を保証する。
+static_assert(sizeof(shizu::thread_t::state_t) == 4,
+              "thread state must be a 32-bit word for __atomic claim CAS");
 extern "C" {
 void svc_asm_handler();
 shizu::context_t *get_current_context();
@@ -102,13 +105,15 @@ void create_object(uint32_t obj_num) {
 void thread_table_init() {
   for (size_t i = 0; i < 128; i++) {
     thread_table[i].state = thread_t::state_t::UNINITIALIZED;
+    thread_table[i].affinity = AFFINITY_CORE0; // 既定は core0 ピン (core1 は明示のみ)
+    thread_table[i].wake_at = 0;               // 0 = sleep していない (即 runnable)
     thread_table[i].context = nullptr;
     thread_table[i].object_id = 0;
     thread_table[i].thread_id = i;
   }
 }
 
-uint32_t cpu_manager::current_thread_id = 0;
+uint32_t cpu_manager::current_thread_id[2] = {0, 0};
 
 void cpu_manager::init() {
   exception_set_exclusive_handler(SVCALL_EXCEPTION, svc_asm_handler);
@@ -151,6 +156,12 @@ void create_thread(uint32_t obj_num, uint32_t thread_num, method_t entry) {
     // 新規スレッドは基本フレーム (FP 無効) の Thread/PSP へ復帰する。
     // 0 のままだと初回復帰で bx 0 → 即 HardFault。必ず明示的に種を入れる。
     thread_table[thread_num].context->exc_return = 0xFFFFFFFD;
+    // 呼び出しスタックは create 時 (スレッドモード) に 1 回だけ確保する。以後 SVC
+    // 例外ハンドラ内 (METHOD_CALL / トランポリン) では malloc しない。
+    thread_table[thread_num].call_stack.frames =
+        (method_call_stack_t *)malloc(sizeof(method_call_stack_t) *
+                                      call_stack_t::MAX_DEPTH);
+    thread_table[thread_num].call_stack.depth = 0;
     object_table[obj_num].thread_table.insert(thread_num);
   } else {
     panic("this thread is already initialized\ncalling this system call for "
@@ -170,7 +181,8 @@ void exit_method(uint32_t return_code) {
 } // namespace shizu
 
 shizu::context_t *get_current_context() {
-  return shizu::thread_table[shizu::cpu_manager::current_thread_id].context;
+  return shizu::thread_table[shizu::cpu_manager::current_thread_id[get_core_num()]]
+      .context;
 }
 
 __always_inline void set_return_code(uint32_t return_code,
@@ -197,7 +209,7 @@ void svc_cpp_handler(shizu::context_t *context) {
            arg2 = stack_frame->r2, arg3 = stack_frame->r3,
            r12 = stack_frame->r12, lr = stack_frame->lr, pc = stack_frame->pc;
   shizu::thread_t &current_thread =
-      shizu::thread_table[shizu::cpu_manager::current_thread_id];
+      shizu::thread_table[shizu::cpu_manager::current_thread_id[get_core_num()]];
   shizu::kernel_object_svc_num svc_num =
       (shizu::kernel_object_svc_num)(*(uint16_t *)(pc - 2) & 0xff);
   /*{
@@ -267,6 +279,12 @@ void svc_cpp_handler(shizu::context_t *context) {
       // 元の位置に居続けなければならない (フレームを別アドレスへ再配置しない)。
       // FP 拡張分 (S0-S15/FPSCR) は PSP 上に残り、call_stack.context.sp が
       // 指す位置は不変なので、ここは basic 部のみのコピーで正しい。
+      if (current_thread.call_stack.full()) {
+        panic("call_stack overflow (METHOD_CALL)\n caller obj: %lu\n callee "
+              "obj: %lu\n method: %lu\n",
+              (unsigned long)current_thread.object_id, (unsigned long)arg0,
+              (unsigned long)arg1);
+      }
       current_thread.call_stack.push(
           {.stack_frame = *stack_frame,
            .context = *context,
@@ -316,28 +334,49 @@ void svc_cpp_handler(shizu::context_t *context) {
     case shizu::kernel_object_svc_num::SET_SVC_HANDLER: {
       shizu::cpu_manager::svc_handler_info.entry_point = (shizu::method_t)arg0;
       shizu::cpu_manager::svc_handler_info.handling_object_id =
-          shizu::thread_table[shizu::cpu_manager::current_thread_id].object_id;
+          shizu::thread_table[shizu::cpu_manager::current_thread_id[get_core_num()]]
+              .object_id;
       break;
     }
 
     case shizu::kernel_object_svc_num::GET_CURRENT_THREAD_ID: {
-      stack_frame->r1 = shizu::cpu_manager::current_thread_id;
+      stack_frame->r1 = shizu::cpu_manager::current_thread_id[get_core_num()];
       stack_frame->r0 = 0;
       break;
     }
-    case shizu::kernel_object_svc_num::SWITCH_THREAD: {
-      if (arg0 == shizu::cpu_manager::current_thread_id) {
+    case shizu::kernel_object_svc_num::SWITCH_THREAD: { // = TRY_SWITCH_THREAD
+      // check + claim + switch を 1 SVC に畳んだ原子操作。r0 に switch_error を返す。
+      // 「READY を見てから別 SVC で切替」を 2 コアでやると TOCTOU レースになるので、
+      // ここで CAS 込みの単一操作にしておく (単一コアでも意味論は等価)。
+      const uint32_t core = get_core_num();
+      const uint32_t cur = shizu::cpu_manager::current_thread_id[core];
+      if (arg0 == cur) {
+        stack_frame->r0 = (uint32_t)shizu::switch_error::OK; // 自スレッドへは no-op
         break;
       }
-      shizu::thread_t &current_thread =
-          shizu::thread_table[shizu::cpu_manager::current_thread_id];
       shizu::thread_t &next_thread = shizu::thread_table[arg0];
-      if (current_thread.state == shizu::thread_t::state_t::RUNNING &&
-          next_thread.state == shizu::thread_t::state_t::READY) {
-        current_thread.state = shizu::thread_t::state_t::READY;
-        next_thread.state = shizu::thread_t::state_t::RUNNING;
-        shizu::cpu_manager::current_thread_id = arg0;
+      if (!(next_thread.affinity & (1u << core))) {
+        stack_frame->r0 = (uint32_t)shizu::switch_error::BAD_AFFINITY;
+        break;
       }
+      // claim: READY→RUNNING を CAS で原子的に取る。これが「2 コアが同一 context_t を
+      // 走らせない」根 = context の所有権ロックそのもの (別途 LOCK_CONTEXT は不要)。
+      // 負け/READY でない = NOT_READY。ACQUIRE で以後の context 読みを claim 後に固定。
+      uint32_t expected = (uint32_t)shizu::thread_t::state_t::READY;
+      if (!__atomic_compare_exchange_n(
+              (uint32_t *)&next_thread.state, &expected,
+              (uint32_t)shizu::thread_t::state_t::RUNNING, false,
+              __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+        stack_frame->r0 = (uint32_t)shizu::switch_error::NOT_READY;
+        break;
+      }
+      shizu::cpu_manager::current_thread_id[core] = arg0;
+      // 旧スレッドを release。RELEASE store 以降、他コアが cur を claim してよい
+      // (SVC 入口 asm が cur の context 退避を完了済みなので自己完結)。
+      __atomic_store_n((uint32_t *)&shizu::thread_table[cur].state,
+                       (uint32_t)shizu::thread_t::state_t::READY,
+                       __ATOMIC_RELEASE);
+      stack_frame->r0 = (uint32_t)shizu::switch_error::OK;
       break;
     }
     case shizu::kernel_object_svc_num::GET_THREAD_STATE: {
@@ -362,6 +401,11 @@ void svc_cpp_handler(shizu::context_t *context) {
     // r4/r5/r6 に載せて渡す (ハンドラ側はこれを引数として受け取る)。
     uint32_t caller_obj_num = current_thread.object_id;
     uint32_t caller_thread_id = current_thread.thread_id;
+    if (current_thread.call_stack.full()) {
+      panic("call_stack overflow (svc trampoline)\n caller obj: %lu\n thread: "
+            "%lu\n",
+            (unsigned long)caller_obj_num, (unsigned long)caller_thread_id);
+    }
     current_thread.call_stack.push(
         {.stack_frame = *stack_frame,
          .context = *context,

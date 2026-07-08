@@ -18,6 +18,15 @@ enum struct svc_num : uint32_t {
   GET_CURRENT_OBJ_ID = 9,
   SET_OBJ_MEMORY = 10,
   GET_OBJ_MEMORY = 11,
+  // ---- ストリーム制御プレーン (include/stream.hpp)。データプレーン(push/pop)は
+  //      SVC を通らないライブラリ。ここはディスクリプタ登録・discovery・待ち/起こし
+  //      だけをカーネルに委ねる (カーネルハンドラは別途実装予定) ----
+  CREATE_STREAM = 12,  // r1=id, r2=stream_desc_t*, r3=flags。owner=呼び出し元 obj
+  OPEN_STREAM = 13,    // r1=id → r1(戻)=stream_desc_t*。consumer の discovery 用
+  BIND_STREAM = 14,    // r1=id, r2=role。単一 producer/consumer をカーネルが強制
+  STREAM_WAIT = 15,    // r1=id。空なら consumer を SUSPEND (SVC 内で空再検査→寝る)
+  STREAM_NOTIFY = 16,  // r1=id。waiter がいれば起こす (producer が稀パスで呼ぶ)
+  SLEEP_US = 17,       // r1=µs。締切まで自スレッドを scheduler にスキップさせる
 };
 
 template <typename T>
@@ -70,6 +79,10 @@ static __always_inline result_t<uint32_t> svc(uintptr_t arg0, uintptr_t arg1,
 
 static void yield() { svc(svc_num::YIELD, 0, 0, 0, 0); }
 
+// 締切 (now + us) まで自スレッドをスケジューラの round-robin から外す (sleep)。
+// busy-yield と違い、寝ている間は他スレッドが走り、CPU を無駄に舐めない。
+static void sleep_us(uint32_t us) { svc(svc_num::SLEEP_US, us, 0, 0, 0); }
+
 __always_inline static void yield_until(bool (*condition)()) {
   while (1) {
     if (condition() == false) {
@@ -90,10 +103,10 @@ result_t<uint32_t> set_object_md(uint32_t md_id, uint32_t target_obj_id,
                                  uint32_t target_method_id);
 
 __always_inline static void yield_us(uint64_t us) {
-  uint64_t start = time_us_64();
-  while (time_us_64() - start < us) {
-    shizu::obj_api::yield();
-  }
+  // sleep 化: スケジューラが締切まで自スレッドを round-robin から外す (旧: busy-yield
+  // ループで毎周期起こされていた)。呼び出し側は正のデルタを渡す前提 (絶対グリッドは
+  // next<now を signed で弾いてから呼ぶ)。
+  sleep_us((uint32_t)us);
 }
 
 // 絶対締切 deadline_us まで待つ。余裕があるうちは yield で他スレッドに譲り、最後の
@@ -104,9 +117,11 @@ __always_inline static void yield_us(uint64_t us) {
 // 既に締切を過ぎていれば即 return。
 __always_inline static void yield_until_us(uint64_t deadline_us,
                                            uint64_t spin_us = 300) {
-  while ((int64_t)(deadline_us - time_us_64()) > (int64_t)spin_us) {
-    shizu::obj_api::yield();
-  }
+  uint64_t now = time_us_64();
+  // 締切の spin_us 手前まではスケジューラにスキップさせ (sleep)、最後の spin_us だけ
+  // busy-spin で締切に張り付く (sleep の round-robin ジッタを避け ±数µs に収める)。
+  if ((int64_t)(deadline_us - now) > (int64_t)spin_us)
+    sleep_us((uint32_t)(deadline_us - now - spin_us));
   while ((int64_t)(deadline_us - time_us_64()) > 0) {
     tight_loop_contents();
   }

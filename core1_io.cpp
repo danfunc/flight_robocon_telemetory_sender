@@ -84,10 +84,15 @@ constexpr uint8_t BME_REG_CONFIG = 0xF5;
 constexpr uint8_t BME_REG_PRESS_MSB = 0xF7;
 
 // ---- 実行時状態 (コマンドリング経由で core0 から変更される) -----------------
-bool g_split_read = false;
+bool g_split_read = true;
 bool g_reject_ffff = true;
 bool g_paused_bno = false;
 bool g_paused_bme = false;
+// 連続 I2C 失敗が何回目で 20Hz バックオフに入るか。1=毎回退避 (旧挙動)、大きいほど
+// 一過性の単発失敗を 100Hz グリッドのまま突き抜ける。K コマンドで可変 (既定 5)。
+// 一過性の読み衝突 (NDOF フュージョン更新との衝突。0xFFFF と同根) に 50ms 罰を
+// 与えて実効レートが 50〜70Hz に落ちていたのを、この閾値で吸収する。
+int g_fail_backoff_n = 5;
 
 // ---- 健全性カウンタ (STATUS レコードで core0 へ) -----------------------------
 bool g_bno_ok = false;
@@ -328,7 +333,8 @@ void __not_in_flash_func(push_rec)(uint8_t ch, uint32_t t_us, const void *pl, si
   r.t_us = t_us;
   memset(r.payload, 0, sizeof(r.payload));
   memcpy(r.payload, pl, n);
-  g_data_ring.push(r);
+  g_data_stream.hdl().push(
+      r); // stream API のライブラリ push (SVC 無し、SRAM 内)
 }
 
 void __not_in_flash_func(push_baro_like)(uint8_t ch, uint32_t t_us, uint32_t press_pa,
@@ -365,6 +371,9 @@ void __not_in_flash_func(handle_cmds)() {
     case CMD_REZERO:
       if (g_bme_ok)
         ground_start(20);
+      break;
+    case CMD_SET_FAIL_BACKOFF:
+      g_fail_backoff_n = (int)c.arg; // 0/1=毎回退避(旧), N=N回連続で退避
       break;
     default:
       break;
@@ -405,10 +414,16 @@ bool __not_in_flash_func(handle_calib_sideband)() {
   return true;
 }
 
+} // namespace
+
 // ===========================================================================
-//  core1 メインループ
+//  センサ I/O ループ本体 — Shizuku の SENSOR_IO スレッド entry (core1
+//  ピン留め、 POC=1) 兼ベアメタル core1 entry (POC=0)。yield は呼ばず core1
+//  を専有する (協調スケジューラ上でも「決して yield しないスレッド」=
+//  実質コア占有)。中身は 従来の core1_main と完全に同一 (I2C / 整数 / busy_wait
+//  / stream push)。
 // ===========================================================================
-[[noreturn]] void __not_in_flash_func(core1_main)() {
+[[noreturn]] void __not_in_flash_func(sensor_io_main)() {
   i2c_bus::init();
   g_bno_ok = bno_init_sensor();
   g_bme_ok = bme_init_sensor();
@@ -454,7 +469,6 @@ bool __not_in_flash_func(handle_calib_sideband)() {
         // 現行のエスカレーションを core1 内で完結 (printf の代わりにカウンタ)。
         ++g_i2c_fail_count;
         ++fail_streak;
-        uint64_t backoff = 50000; // 一時的な失敗: 20Hz でリトライ
         if (fail_streak >= 20) {
           // バス救出でも戻らない → センサごと再 init (POR ~700ms busy_wait、
           // core0 には影響しない)。それも失敗 = センサ不在が続いている:
@@ -463,15 +477,26 @@ bool __not_in_flash_func(handle_calib_sideband)() {
           if (bno_init_sensor()) {
             ++g_reinit_count; // 実際に再初期化できた回数を数える
             fail_streak = 0;
+            next_bno = now_us();
           } else {
-            fail_streak = 20;  // 次の失敗でも即この分岐 (reinit 試行) に入る
-            backoff = 500000;  // 不在中は 2Hz
+            fail_streak = 20;          // 次の失敗でも即この分岐 (reinit 試行) に入る
+            next_bno = now_us() + 500000; // 不在中は 2Hz
           }
-        } else if (fail_streak % 5 == 0) {
-          i2c_bus::recover();
-          ++g_recover_count;
+        } else {
+          if (fail_streak % 5 == 0) {
+            i2c_bus::recover();
+            ++g_recover_count;
+          }
+          if (fail_streak >= g_fail_backoff_n) {
+            next_bno = now_us() + 50000; // 連続失敗が閾値到達 → 20Hz 退避
+          } else {
+            // 一過性の単発失敗: 50ms 罰を与えず 100Hz グリッドを維持して突き抜ける
+            // (単発の読み衝突は次グリッドで直ることが多い)。
+            next_bno += 10000;
+            if ((int64_t)(now_us() - next_bno) > 0)
+              next_bno = now_us();
+          }
         }
-        next_bno = now_us() + backoff;
       }
     }
 
@@ -564,8 +589,6 @@ bool __not_in_flash_func(handle_calib_sideband)() {
   }
 }
 
-} // namespace
-
-void core1_io_launch() { multicore_launch_core1(core1_main); }
+void core1_io_launch() { multicore_launch_core1(sensor_io_main); }
 
 } // namespace shizu

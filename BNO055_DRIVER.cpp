@@ -102,6 +102,11 @@ static void method_set_paused(uint32_t, uint32_t, uint32_t on, uint32_t) {
   send_cmd(core_ring::CMD_SET_PAUSED_BNO, on != 0);
 }
 
+// arg0: N=連続失敗 N 回目で 20Hz 退避 (1=毎回=旧, 既定5)。core1 へ転送。
+static void method_set_fail_backoff(uint32_t, uint32_t, uint32_t n, uint32_t) {
+  send_cmd(core_ring::CMD_SET_FAIL_BACKOFF, (uint8_t)(n & 0xFF));
+}
+
 // 較正オフセットの吸い出し要求 (実処理は core1。完了はサイドバンド ack で届く)。
 static void method_calib_save(uint32_t, uint32_t, uint32_t, uint32_t) {
   g_calib_done = false;
@@ -202,11 +207,22 @@ static void dispatch_record(const core_ring::record_t &rec) {
     bme280_on_ground(pa, cc);
     break;
   }
-  case core_ring::CH_STATUS:
+  case core_ring::CH_STATUS: {
     g_last_calib = rec.payload[0];
     g_health = rec.payload[1];
     (void)g_health; // (現状は保持のみ。将来 STATUS のダウンリンクに使う)
+    // I2C 失敗の毎秒デルタを可視化 (レート低下の裏取り: reads 低下と同期して
+    // i2c_fail が増えていれば「失敗→バックオフ」が犯人と確定できる)。
+    uint16_t fail;
+    memcpy(&fail, &rec.payload[2], 2);
+    static uint16_t prev_fail = 0;
+    uint16_t dfail = (uint16_t)(fail - prev_fail); // uint16 でラップ安全
+    prev_fail = fail;
+    printf("[BNO055] status: i2c_fail=+%u (%u tot) recover=%u reinit=%u calib=0x%02X\n",
+           (unsigned)dfail, (unsigned)fail, (unsigned)rec.payload[4],
+           (unsigned)rec.payload[5], (unsigned)g_last_calib);
     break;
+  }
   case core_ring::CH_DIAG: { // 0xFFFF 破損率 A/B (X0=block / X1=split で切替え)
     uint16_t reads, ffff;
     memcpy(&reads, &rec.payload[2], 2);
@@ -236,6 +252,8 @@ void BNO055_DRIVER::init() {
   export_method<method_set_calib_sink>(
       BNO055_DRIVER::METHOD_IDs::set_calib_sink);
   export_method<method_set_paused>(BNO055_DRIVER::METHOD_IDs::set_paused);
+  export_method<method_set_fail_backoff>(
+      BNO055_DRIVER::METHOD_IDs::set_fail_backoff);
   export_method<method_calib_save>(BNO055_DRIVER::METHOD_IDs::calib_save);
   export_method<method_calib_load>(BNO055_DRIVER::METHOD_IDs::calib_load);
   export_method<method_calib_get>(BNO055_DRIVER::METHOD_IDs::calib_get);
@@ -252,7 +270,7 @@ void BNO055_DRIVER::init() {
     // ---- データリング排出 (1 tick の上限 64 件: 遅延回復中も yield を守る) ----
     core_ring::record_t rec;
     for (int budget = 64;
-         budget > 0 && core_ring::g_data_ring.pop(&rec, &g_drop_count);
+         budget > 0 && core_ring::g_data_stream.hdl().pop(&rec, &g_drop_count);
          --budget)
       dispatch_record(rec);
     if (g_drop_count != last_drop_report) {

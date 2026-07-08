@@ -22,6 +22,7 @@
 #include <cstring>
 #include <hardware/sync.h> // __dmb
 #include <pico/platform.h> // __not_in_flash_func
+#include <stream.hpp>      // データリングを stream API の storage として正式化
 
 namespace shizu {
 namespace core_ring {
@@ -120,6 +121,7 @@ enum cmd_op : uint8_t {
   CMD_SET_READ_MODE = 3,  // arg: 0=26B ブロック読み / 非0=2B 個別読み
   CMD_SET_FFFF_REJECT = 4,// arg: 0=素通し / 非0=0xFFFF 破損を据え置き (既定)
   CMD_REZERO = 5,         // 地上気圧再較正 (20 サンプル平均 → CH_GROUND で返る)
+  CMD_SET_FAIL_BACKOFF = 6, // arg: N=連続失敗 N 回目で 20Hz 退避 (1=毎回退避=旧, 既定5)
 };
 struct cmd_rec_t {
   uint8_t op;
@@ -147,18 +149,25 @@ struct calib_sideband_t {
 // データリング: 682 レコード × 12B = 8184B ≈ 8KB (設計書 §4)。定常 ~323 rec/s
 // (NDOF 100Hz×3 + BARO 21 + STATUS 1) の ~2.1 秒分。u32 インデックスのラップは
 // このレートで ~150 日なので考慮不要。
-using data_ring_t = spsc_ring_t<record_t, 682>;
 using cmd_ring_t = spsc_ring_t<cmd_rec_t, 16>;
 
-inline data_ring_t g_data_ring;
+// データストリーム (core1 SENSOR_IO producer → core0 consumer)。stream API の storage
+// として正式化した。アルゴリズムは従来の spsc_ring_t と同一 (LOSSY 上書き)、ただし
+// ディスクリプタ/データ領域分離の DMA・MPU 対応レイアウト。両端は g_data_stream.hdl()
+// の push/pop を使う (SVC を通らないライブラリ)。cmd/calib は従来の機構のまま。
+inline stream::storage<record_t, 682> g_data_stream;
 inline cmd_ring_t g_cmd_ring;
 inline calib_sideband_t g_calib_xfer;
 
 } // namespace core_ring
 
-// core1 の I/O ループを起動する (core1_io.cpp)。cyw43/Shizuku 初期化より前に
-// main() から 1 回だけ呼ぶ。
+// core1 の I/O ループを起動する (core1_io.cpp、ベアメタル経路 = POC=0)。cyw43/Shizuku
+// 初期化より前に main() から 1 回だけ呼ぶ。
 void core1_io_launch();
+
+// センサ I/O ループ本体。Shizuku の SENSOR_IO スレッド entry (core1 ピン留め、POC=1)
+// 兼ベアメタル core1 entry。core1_boot.cpp が method_t として起動する。
+[[noreturn]] void sensor_io_main();
 
 // core0 側ディスパッチフック: データリングの唯一の consumer (BNO055_DRIVER の
 // スレッド) が BARO/GROUND レコードを BME280 モジュールへ渡す (BME280_DRIVER.cpp)。

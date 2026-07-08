@@ -97,7 +97,16 @@ int main(int argc, char const *argv[]) {
   // 後から走るが、poll モードで core1 を使わないため順序上の競合はない。
   // Shizuku 起動前に立ち上げておけば、ドライバスレッドが動き出す頃には
   // リングへレコードが流れ始めている。
+#if !SHIZU_CORE1_KERNEL_POC
+  // 従来経路: core1 はベアメタルのセンサ I/O ループ。
   shizu::core1_io_launch();
+#else
+  // デュアルコア: core1 は Shizuku カーネルが取り、センサ I/O は SENSOR_IO スレッド
+  // (core1 ピン留め) として走る。ベアメタル core1_io は起動しない (kernel_object_main
+  // が core1_kernel_launch で SENSOR_IO を立ち上げる)。SHIZU_CORE1_KERNEL_POC は
+  // include/kernel.hpp で定義。
+  printf("[main] dual-core: core1 = Shizuku kernel + SENSOR_IO (sensors ON)\n");
+#endif
   shizu::init();
   while (1) {
     sleep_ms(500);

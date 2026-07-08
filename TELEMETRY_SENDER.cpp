@@ -263,6 +263,23 @@ static void handle_line() {
     printf("[TELEMETRY] 0xFFFF reject -> %s\n", on ? "on" : "off");
     break;
   }
+  case 'K': { // I2C 失敗バックオフ閾値: "K<n>" (連続 n 回で 20Hz 退避。1=毎回=旧, 既定5)
+    uint32_t n = 0;
+    bool any = false;
+    for (uint32_t i = 1; i < rxlen; ++i) {
+      if (rxline[i] < '0' || rxline[i] > '9')
+        break;
+      n = n * 10u + (uint32_t)(rxline[i] - '0');
+      any = true;
+    }
+    if (any) {
+      call_method(object_ids::BNO055_DRIVER,
+                  BNO055_DRIVER::METHOD_IDs::set_fail_backoff, n);
+      printf("[TELEMETRY] BNO fail-backoff threshold -> %lu\n",
+             (unsigned long)n);
+    }
+    break;
+  }
   case 'C': { // 較正オフセット: "CS"=保存(吸出), "CL<44hex>"=復元(書込)
     if (rxlen >= 2 && rxline[1] == 'S') {
       call_method(object_ids::BNO055_DRIVER,

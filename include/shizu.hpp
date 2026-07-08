@@ -14,6 +14,10 @@ namespace shizu {
   thread_table[0].context->sp = (shizu::exception_frame_t *)entry_PSP;
   // スレッド 0 も基本フレーム/PSP へ復帰する前提で EXC_RETURN を種付けする。
   thread_table[0].context->exc_return = 0xFFFFFFFD;
+  // カーネルオブジェクトの呼び出しスタックも create 時に 1 回だけ確保 (SVC パス脱 malloc)。
+  thread_table[0].call_stack.frames = (method_call_stack_t *)malloc(
+      sizeof(method_call_stack_t) * call_stack_t::MAX_DEPTH);
+  thread_table[0].call_stack.depth = 0;
   thread_table[0].state = thread_t::state_t::RUNNING;
   uintptr_t CONTROL_MASK = 1 << 1;
   asm volatile("MSR PSP,%[entry_psp];"

@@ -21,6 +21,9 @@ enum struct object_ids : uint32_t {
   BNO055_DRIVER=14,     // 9 軸 IMU (I2C 0x28)。重力/線形加速度/姿勢を公開する。
   TELEMETRY_SENDER=15,  // 上記 2 ドライバを購読し融合 → BLE UART で母艦へ送信する。
   FLIGHT_CONTROLLER=16, // TELEMETRY から状態を受け、ピッチ/ヨー/スロットルの制御則を回す。
+  CORE1_TEST=20,        // デュアルコア PoC: core1 の idle スレッドの所属先。
+  STREAM_TEST=21,       // ストリーム自己テスト: producer/consumer スレッド対の所属先。
+  SENSOR_IO=22,         // core1 ピン留めのセンサ I/O スレッド (旧 core1_io ベアメタル)。
 };
 
 #endif // SHIZU_OBJECT_ID_HPP
