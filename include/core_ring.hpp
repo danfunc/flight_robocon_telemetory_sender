@@ -59,8 +59,9 @@ struct __attribute__((packed)) record_t {
   uint8_t flags;
   uint32_t t_us;      // time_us_64() 下位 32bit (両コア共通タイマ)
   uint8_t payload[6]; // チャンネル固有
+  uint8_t _pad[4];    // DMA_RING 用: 16B(2冪)へパディング。未使用 (consumer は無視)
 };
-static_assert(sizeof(record_t) == 12, "record_t must be 12 bytes");
+static_assert(sizeof(record_t) == 16, "record_t padded to 16B for DMA_RING ring");
 
 // ---- SPSC リング (上書き式) -------------------------------------------------
 template <typename REC, uint32_t N> struct spsc_ring_t {
@@ -146,16 +147,15 @@ struct calib_sideband_t {
 };
 
 // ---- リングの実体 (inline 変数、.bss でゼロ初期化) ---------------------------
-// データリング: 682 レコード × 12B = 8184B ≈ 8KB (設計書 §4)。定常 ~323 rec/s
-// (NDOF 100Hz×3 + BARO 21 + STATUS 1) の ~2.1 秒分。u32 インデックスのラップは
-// このレートで ~150 日なので考慮不要。
 using cmd_ring_t = spsc_ring_t<cmd_rec_t, 16>;
 
 // データストリーム (core1 SENSOR_IO producer → core0 consumer)。stream API の storage
-// として正式化した。アルゴリズムは従来の spsc_ring_t と同一 (LOSSY 上書き)、ただし
-// ディスクリプタ/データ領域分離の DMA・MPU 対応レイアウト。両端は g_data_stream.hdl()
+// として正式化 + DMA_RING レイアウト化した。16B × 512 = 8192B (2冪) で、バッファは
+// その境界にアラインされる (RP2350 DMA のリングラップ要件)。実 DMA チャネルは未接続
+// だが、将来 producer/consumer を DMA 化できる配置。定常 ~323 rec/s の ~1.6 秒分。
+// アルゴリズムは従来の spsc_ring_t と同一 (LOSSY 上書き)。両端は g_data_stream.hdl()
 // の push/pop を使う (SVC を通らないライブラリ)。cmd/calib は従来の機構のまま。
-inline stream::storage<record_t, 682> g_data_stream;
+inline stream::storage<record_t, 512, stream::DMA_RING> g_data_stream;
 inline cmd_ring_t g_cmd_ring;
 inline calib_sideband_t g_calib_xfer;
 

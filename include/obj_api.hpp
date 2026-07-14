@@ -2,6 +2,7 @@
 #define SHIZU_OBJ_API_HPP
 #include <cstdint>
 #include <cstdlib>
+#include <kernel.hpp> // grant_error / grant_end (run_for の戻り型)
 #include <pico/stdlib.h>
 
 namespace shizu {
@@ -27,6 +28,9 @@ enum struct svc_num : uint32_t {
   STREAM_WAIT = 15,    // r1=id。空なら consumer を SUSPEND (SVC 内で空再検査→寝る)
   STREAM_NOTIFY = 16,  // r1=id。waiter がいれば起こす (producer が稀パスで呼ぶ)
   SLEEP_US = 17,       // r1=µs。締切まで自スレッドを scheduler にスキップさせる
+  CREATE_OBJECT_ONLY = 18, // r1=obj_id。オブジェクトのみ生成 (スレッド無し)
+  ASYNC_CALL = 19,     // r1=obj_id, r2=entry, r3=arg。空き tid に spawn → r1(戻)=tid
+  RUN_FOR = 20, // r1=tid, r2=µs。時限実行権移譲 → r1(戻)=(error<<16)|reason
 };
 
 template <typename T>
@@ -82,6 +86,35 @@ static void yield() { svc(svc_num::YIELD, 0, 0, 0, 0); }
 // 締切 (now + us) まで自スレッドをスケジューラの round-robin から外す (sleep)。
 // busy-yield と違い、寝ている間は他スレッドが走り、CPU を無駄に舐めない。
 static void sleep_us(uint32_t us) { svc(svc_num::SLEEP_US, us, 0, 0, 0); }
+
+// オブジェクト起動の 2 段構え。create_object(id) でオブジェクトだけ作り、
+// async_call(id, entry) で空きスレッドを自動確保して entry を非同期起動する。
+// 従来の create_object(id, thread, entry) 3 引数の代替 (手動 thread 番号を廃止)。
+[[maybe_unused]] static result_t<uint32_t> create_object(uint32_t obj_id) {
+  return svc(svc_num::CREATE_OBJECT_ONLY, obj_id, 0, 0);
+}
+[[maybe_unused]] static result_t<uint32_t>
+async_call(uint32_t obj_id, uintptr_t entry, uint32_t arg = 0) {
+  return svc(svc_num::ASYNC_CALL, obj_id, entry, arg); // value = 割り当て tid
+}
+
+// 時限実行権移譲: スレッド tid に最大 us µs だけ実行権を貸す (現行 SWITCH_THREAD の
+// 「無限時間移譲」の時限版)。復帰は 2 経路 — 期限到来 (EXPIRED, PendSV 強制切替) か、
+// 移譲先の yield/sleep/switch (YIELDED, 早期復帰)。ネスト可 (期限は外側にクランプ)。
+// 注意: 移譲先として走るコード (grantee) は期限で任意点プリエンプトされるので、
+// malloc / printf などロック持ちのライブラリ呼び出しを避けること (grantor が同じ
+// ロックを取るとコア内デッドロック)。センサポーリング/計算ループが想定用途。
+struct run_for_result_t {
+  grant_error error; // OK / NOT_READY / BAD_AFFINITY / DEPTH
+  grant_end reason;  // EXPIRED (期限) / YIELDED (早期復帰)。error==OK のときのみ有効
+  constexpr bool is_ok() const { return error == grant_error::OK; }
+};
+[[maybe_unused]] static run_for_result_t run_for(uint32_t tid, uint32_t us) {
+  result_t<uint32_t> r = svc(svc_num::RUN_FOR, tid, us, 0);
+  const uint32_t packed = r.value; // (error<<16)|reason (kernel_obj_svc_handler)
+  return {.error = (grant_error)(packed >> 16),
+          .reason = (grant_end)(packed & 0xFFFFu)};
+}
 
 __always_inline static void yield_until(bool (*condition)()) {
   while (1) {

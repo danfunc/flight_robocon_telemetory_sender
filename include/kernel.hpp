@@ -2,6 +2,7 @@
 #ifndef SHIZU_KERNEL_HPP
 #define SHIZU_KERNEL_HPP
 #include <cstdint>
+#include <pico.h> // get_core_num (grant_active_this_core)
 #include <set>
 
 // デュアルコアトグル: 1 = core1 を Shizuku カーネルとして起動し、センサ I/O を
@@ -17,6 +18,12 @@
 #define SHIZU_STREAM_SELFTEST 0
 #endif
 
+// 時限実行権移譲 (run_for/GRANT_CPU) の自己テスト トグル: 1 = GRANT_TEST オブジェクトの
+// スレッド群で EXPIRED/YIELDED/ネスト/長期限 (SysTick チャンク継ぎ) を実動確認する。
+#ifndef SHIZU_GRANT_SELFTEST
+#define SHIZU_GRANT_SELFTEST 1
+#endif
+
 int main(int argc, char const *argv[]);
 
 namespace shizu {
@@ -27,6 +34,14 @@ void exit(uint32_t return_code);
 [[noreturn]] void init_core1();  // core1 のカーネル入口 (core1_boot.cpp)
 void core1_kernel_launch();      // core0 から core1 を起動する (core1_boot.cpp)
 void stream_selftest_launch();   // ストリーム自己テストの起動 (stream_selftest.cpp)
+void grant_selftest_launch();    // 時限移譲自己テストの起動 (grant_selftest.cpp)
+// per-core の例外優先度設定 (SVC 最優先 > SysTick > PendSV 最低)。SHPR は banked な
+// ので core0 は cpu_manager::init、core1 は init_core1 がそれぞれ呼ぶ。
+void init_exception_priorities();
+enum struct grant_end : uint32_t; // 前方宣言 (定義は下の grant セクション)
+// grant を 1 段 pop して grantor へ復帰させる (kernel.cpp 内部: PendSV=EXPIRED /
+// SWITCH_THREAD インターセプト=YIELDED の共通経路)。
+void grant_pop_to_grantor(uint32_t core, grant_end reason);
 class cpu_manager;
 struct object_t;
 struct thread_t;
@@ -40,15 +55,23 @@ namespace FOR_KERNEL_OBJECT {
 void export_method(uint32_t obj_num, uint32_t method_num, method_t entry);
 void exit_method(uint32_t return_code);
 void create_object(uint32_t obj_num, uint32_t thread_num, method_t entry);
-void create_thread(uint32_t obj_num, uint32_t thread_num, method_t entry);
+void create_object(uint32_t obj_num); // オブジェクトのみ生成 (スレッド無し)
+void create_thread(uint32_t obj_num, uint32_t thread_num, method_t entry,
+                   uint32_t arg = 0); // arg は entry の r0 に載る
+// 空きスレッドスロット (1..127) を自動確保して entry を非同期起動する。戻り = 割り当てた
+// thread_id。オブジェクト起動 = create_object(id) + async_call(id, main) の 2 段で行う。
+uint32_t async_call(uint32_t obj_num, method_t entry, uint32_t arg = 0);
 } // namespace FOR_KERNEL_OBJECT
 
 } // namespace shizu
 
 extern "C" {
 void svc_asm_handler();
+void pendsv_asm_handler(); // grant 期限の強制切替入口 (svc_asm_handler.S)
 shizu::context_t *get_current_context();
 void svc_cpp_handler(shizu::context_t *context);
+void pendsv_cpp_handler(shizu::context_t *context);
+void systick_grant_handler(); // grant 期限の監視 (tickless ワンショット)
 }
 
 namespace shizu {
@@ -65,6 +88,8 @@ class cpu_manager {
   friend shizu::context_t * ::get_current_context();
   friend int ::main(int argc, char const *argv[]);
   friend void ::svc_cpp_handler(shizu::context_t *context);
+  friend void ::pendsv_cpp_handler(shizu::context_t *context);
+  friend void shizu::grant_pop_to_grantor(uint32_t core, grant_end reason);
 };
 
 struct object_t {
@@ -93,6 +118,10 @@ enum struct kernel_object_svc_num : uint32_t {
   TRY_SWITCH_THREAD = 203,
   GET_OBJECT_ID_FROM_THREAD_ID = 204,
   GET_THREAD_STATE = 205,
+  // 時限実行権移譲: arg0=対象 tid, arg1=最大実行時間[µs]。対象を claim して切替え、
+  // 期限到来 (SysTick→PendSV 強制切替) か対象の yield/switch (早期復帰) で戻る。
+  // 戻り: r0=grant_error, r1=grant_end (EXPIRED/YIELDED)。
+  GRANT_CPU = 206,
 
 };
 
@@ -110,6 +139,41 @@ enum struct switch_error : uint32_t {
 constexpr uint32_t AFFINITY_CORE0 = 0b01;
 constexpr uint32_t AFFINITY_CORE1 = 0b10;
 constexpr uint32_t AFFINITY_ALL = 0b11;
+
+// ---- 時限実行権移譲 (GRANT_CPU / run_for) ---------------------------------
+// GRANT_CPU の型付きエラー。先頭 3 値は switch_error と値を揃える (claim 共通ヘルパの
+// 結果をそのままキャストで写せるように)。
+enum struct grant_error : uint32_t {
+  OK = 0,       // 移譲成功 (自スレッド指定の no-op も OK)
+  NOT_READY,    // 対象が READY でない / claim 競り負け
+  BAD_AFFINITY, // 対象がこのコアで走ることを許されていない
+  DEPTH,        // grant スタック満杯 (ネスト深さ上限)
+};
+// grant の終了理由 (r1 で返る)。
+enum struct grant_end : uint32_t {
+  EXPIRED = 0, // 期限到来による強制復帰 (PendSV)
+  YIELDED = 1, // 移譲先の yield/switch/sleep による早期復帰
+};
+// per-core grant スタック。ネスト許容 (内側 deadline は外側へクランプされるので
+// over-time は構造的に不可能)。SVC/SysTick/PendSV は全て自コアのスタックだけを触り、
+// 優先度 (SVC > SysTick > PendSV) で直列化されるためロック不要。SVC パス脱 malloc
+// 方針に従い固定配列。
+struct grant_frame_t {
+  uint32_t grantor;  // 復帰先スレッド (WAIT_GRANT で待つ)
+  uint64_t deadline; // 期限 (µs, time_us_64 基準)。外側 deadline でクランプ済み
+};
+struct grant_stack_t {
+  static constexpr uint32_t MAX_DEPTH = 8;
+  grant_frame_t frames[MAX_DEPTH];
+  uint32_t depth;
+};
+extern grant_stack_t grant_stacks[2]; // per-core (SIO cpuid で索引)
+
+// 自コアで grant がアクティブか (= 自分は誰かの grantee として走っているか)。
+// kernel_obj_svc_handler の YIELD/SLEEP_US が「grantor への早期復帰」へ分岐するのに使う。
+inline bool grant_active_this_core() {
+  return grant_stacks[get_core_num()].depth != 0;
+}
 
 struct context_t {
   uint32_t r4, r5, r6, r7, r8, r9, r10, r11; // offset 0..28
@@ -155,7 +219,10 @@ struct thread_t {
     UNINITIALIZED = 0,
     READY,
     RUNNING,
-    SUSPENDED
+    SUSPENDED,
+    // grant 発行中の grantor。READY でないので他コアの claim 対象にならず、復帰は
+    // 発行コア上の PendSV (期限) か SWITCH_THREAD インターセプト (早期復帰) のみ。
+    WAIT_GRANT,
   } state;
   // affinity: 走行を許すコアのビットマスク (bit0=core0, bit1=core1)。既定は全コア。
   // TRY_SWITCH_THREAD の claim がこれを検査する (AMP 相当は「core1 固定」等の policy)。

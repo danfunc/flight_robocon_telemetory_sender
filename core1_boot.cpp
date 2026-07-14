@@ -29,8 +29,9 @@
 namespace shizu {
 namespace {
 
-constexpr uint32_t CORE1_IDLE_TID = 100;   // core1 の初期(idle)スレッド
-constexpr uint32_t CORE1_SENSOR_TID = 101; // core1 ピン留めのセンサ I/O スレッド
+// idle スレッドは init_core1 が直接 (create_thread を通さず) 仕立てるので tid を高位に
+// 予約する。async_call の自動割当 (1 から昇順) と衝突しない範囲 (実働スレッド << 100)。
+constexpr uint32_t CORE1_IDLE_TID = 100;
 
 // idle: init_core1 が core1 の初期スレッドとして走らせる。起動直後の 1 回の yield で
 // READY な SENSOR_IO (affinity=core1) を claim させる。SENSOR_IO は以後 yield しない
@@ -50,9 +51,13 @@ constexpr uint32_t CORE1_SENSOR_TID = 101; // core1 ピン留めのセンサ I/O
 // センサ I/O ループを走らせる (= 旧 core1_io と同じ「core1 専有センサ I/O」を Shizuku
 // スレッドとして実現)。
 void core1_kernel_launch() {
-  FOR_KERNEL_OBJECT::create_object((uint32_t)object_ids::SENSOR_IO,
-                                   CORE1_SENSOR_TID, (method_t)sensor_io_main);
-  thread_table[CORE1_SENSOR_TID].affinity = AFFINITY_CORE1; // core1 ピン留め
+  // SENSOR_IO = create_object + async_call (空き tid 自動確保)。返った tid に affinity を
+  // 立てて core1 ピン留めする。ここは thread0 が yield/switch する前 (逐次) なので、
+  // affinity を立てる前に core0 が拾う窓は無い。
+  FOR_KERNEL_OBJECT::create_object((uint32_t)object_ids::SENSOR_IO);
+  uint32_t tid = FOR_KERNEL_OBJECT::async_call((uint32_t)object_ids::SENSOR_IO,
+                                               (method_t)sensor_io_main);
+  thread_table[tid].affinity = AFFINITY_CORE1;
   multicore_launch_core1(init_core1);
 }
 
@@ -64,6 +69,11 @@ void core1_kernel_launch() {
   // 退避と将来の FP スレッドのために揃えておく。
   *(volatile uint32_t *)0xE000ED88 |= (0xFu << 20);
   __asm volatile("dsb; isb" ::: "memory");
+
+  // 例外優先度 (SVC > SysTick > PendSV)。SHPR は per-core banked なので core1 でも
+  // 設定が要る。ハンドラ登録自体は共有ベクタテーブル経由で core0 の分が効いている
+  // (再登録は exclusive 二重登録 panic するのでしない — 上記コメント参照)。
+  init_exception_priorities();
 
   void *psp = (void *)(((uint32_t)malloc(4096) + 4096) & ~0xFu);
   thread_t &idle = thread_table[CORE1_IDLE_TID];

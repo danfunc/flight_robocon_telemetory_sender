@@ -61,8 +61,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <hardware/clocks.h>            // clock_get_hz (SysTick 装填のサイクル換算)
 #include <hardware/exception.h>
 #include <hardware/irq.h>
+#include <hardware/regs/m33.h>          // M33_ICSR_PENDSVSET_BITS
+#include <hardware/structs/scb.h>       // scb_hw->icsr (PendSV pend)
+#include <hardware/structs/systick.h>   // systick_hw (banked per-core)
 #include <kernel.hpp>
 #include <pico/stdlib.h>
 #include <shizu.hpp>
@@ -115,8 +119,86 @@ void thread_table_init() {
 
 uint32_t cpu_manager::current_thread_id[2] = {0, 0};
 
+// ---------------------------------------------------------------------------
+//  時限実行権移譲 (GRANT_CPU) の期限強制 — tickless SysTick + PendSV
+// ---------------------------------------------------------------------------
+//  grant 未使用時のコストは厳密ゼロ (SysTick は grant がある間しか動かない)。
+//  プリエンプトされ得るのはアクティブ grant の grantee だけで、それ以外の
+//  スレッドは従来の協調保証 (yield しない限り原子) を完全に維持する。
+//  優先度 SVC > SysTick > PendSV により、SVC プリミティブ実行中に期限処理が
+//  割り込むことはなく、grant スタックは自コア内で直列化される (ロック不要)。
+grant_stack_t grant_stacks[2] = {};
+
+// clk_sys のサイクル/µs。cpu_manager::init で実クロックから 1 回キャッシュする
+// (両コア同一クロック)。150 MHz 既定値は init 前の保険。
+static uint32_t g_cycles_per_us = 150;
+
+static constexpr uint32_t SYSTICK_MAX_LOAD = 0x00FFFFFF; // 24bit (~111ms @150MHz)
+// PendSV がカーネルオブジェクト走行中に切替を延期したときの再試行間隔 [µs]。
+static constexpr uint32_t GRANT_RETRY_US = 50;
+
+// 自コアの SysTick を deadline (µs 絶対時刻) に向けてワンショット装填する。
+// 残りが 24bit を超えるときは最大チャンクで装填し、systick_grant_handler が継ぐ。
+static void systick_arm_for(uint64_t deadline) {
+  const uint64_t now = time_us_64();
+  uint64_t cycles = (deadline > now) ? (deadline - now) * g_cycles_per_us : 1;
+  if (cycles > SYSTICK_MAX_LOAD)
+    cycles = SYSTICK_MAX_LOAD;
+  if (cycles < 100)
+    cycles = 100; // 装填直後発火の下限 (rvr=0 は SysTick 停止扱いになるのも防ぐ)
+  systick_hw->rvr = (uint32_t)cycles;
+  systick_hw->cvr = 0; // 書き込みでカウンタクリア → rvr から再カウント
+  systick_hw->csr = 0x7; // ENABLE | TICKINT | CLKSOURCE(プロセッサクロック)
+}
+
+static void systick_disarm() { systick_hw->csr = 0; }
+
+// grant を 1 段 pop して grantor へ復帰させる。PendSV (期限, EXPIRED) と
+// SWITCH_THREAD インターセプト (早期復帰, YIELDED) の共通経路。呼び出し文脈は
+// 自コアの SVC または PendSV で、優先度により直列化済み。grantee (現行スレッド)
+// の context 退避は asm 入口が完了させていること。
+void grant_pop_to_grantor(uint32_t core, grant_end reason) {
+  grant_stack_t &gs = grant_stacks[core];
+  const uint32_t grantee = cpu_manager::current_thread_id[core];
+  const uint32_t grantor = gs.frames[gs.depth - 1].grantor;
+  gs.depth--;
+  // grantor の復帰値: r0=OK は GRANT_CPU 成功時に設定済み。r1 に終了理由。
+  thread_table[grantor].context->sp->r1 = (uint32_t)reason;
+  // WAIT_GRANT→RUNNING は発行コアだけが遷移させる単独所有 (plain store で足りる)。
+  thread_table[grantor].state = thread_t::state_t::RUNNING;
+  cpu_manager::current_thread_id[core] = grantor;
+  // grantee を release。RELEASE store 以降、他コアが claim してよい。
+  __atomic_store_n((uint32_t *)&thread_table[grantee].state,
+                   (uint32_t)thread_t::state_t::READY, __ATOMIC_RELEASE);
+  // 次の期限: 空→SysTick 停止 / 既期限→即 PendSV 連鎖 (クランプ同時期限の多段
+  // ネストはここで連鎖的に巻き戻る) / それ以外→新 top へ再装填。
+  if (gs.depth == 0) {
+    systick_disarm();
+  } else if (gs.frames[gs.depth - 1].deadline <= time_us_64()) {
+    scb_hw->icsr = M33_ICSR_PENDSVSET_BITS;
+  } else {
+    systick_arm_for(gs.frames[gs.depth - 1].deadline);
+  }
+}
+
+// per-core の例外優先度。SVC 最優先 = プリミティブの原子性 (現行の暗黙前提の明示化)。
+// SysTick は SVC 未満・SDK IRQ(0x80) 以上 (期限判定 + pend だけの極小ハンドラ)。
+// PendSV 最低 = 全 IRQ が捌けてからコンテキストスイッチ。SHPR は banked なので
+// core0 は cpu_manager::init、core1 は init_core1 がそれぞれ呼ぶ。
+void init_exception_priorities() {
+  exception_set_priority(SVCALL_EXCEPTION, 0x00);
+  exception_set_priority(SYSTICK_EXCEPTION, 0x40);
+  exception_set_priority(PENDSV_EXCEPTION, PICO_LOWEST_IRQ_PRIORITY);
+}
+
 void cpu_manager::init() {
   exception_set_exclusive_handler(SVCALL_EXCEPTION, svc_asm_handler);
+  // grant 期限強制の土台。RAM ベクタテーブルは両コア共有なので登録はここ (core0)
+  // の 1 回だけ (core1 で再登録すると exclusive 二重登録 panic)。
+  exception_set_exclusive_handler(PENDSV_EXCEPTION, pendsv_asm_handler);
+  exception_set_exclusive_handler(SYSTICK_EXCEPTION, systick_grant_handler);
+  g_cycles_per_us = clock_get_hz(clk_sys) / 1000000u;
+  init_exception_priorities();
 }
 
 void thread_t::ready_to_run() {
@@ -133,7 +215,24 @@ void create_object(uint32_t obj_num, uint32_t thread_num, method_t entry) {
   shizu::FOR_KERNEL_OBJECT::create_thread(obj_num, thread_num, entry);
 }
 
-void create_thread(uint32_t obj_num, uint32_t thread_num, method_t entry) {
+// オブジェクトのみ生成 (スレッド無し)。起動は別途 async_call(id, main) で行う。
+void create_object(uint32_t obj_num) { shizu::create_object(obj_num); }
+
+// 空きスレッドスロット (1..127, 0 はカーネルオブジェクト予約) を自動確保して entry を
+// 非同期起動する。戻り = 割り当てた thread_id。
+uint32_t async_call(uint32_t obj_num, method_t entry, uint32_t arg) {
+  for (uint32_t t = 1; t < 128; ++t) {
+    if (thread_table[t].state == thread_t::state_t::UNINITIALIZED) {
+      shizu::FOR_KERNEL_OBJECT::create_thread(obj_num, t, entry, arg);
+      return t;
+    }
+  }
+  panic("async_call: no free thread slot (all 127 in use)");
+  return 0;
+}
+
+void create_thread(uint32_t obj_num, uint32_t thread_num, method_t entry,
+                   uint32_t arg) {
   if (thread_table[thread_num].state == thread_t::state_t::UNINITIALIZED) {
     thread_table[thread_num].object_id = obj_num;
     thread_table[thread_num].ready_to_run();
@@ -147,7 +246,7 @@ void create_thread(uint32_t obj_num, uint32_t thread_num, method_t entry) {
     thread_table[thread_num].context->sp->pc = (uint32_t)entry;
     thread_table[thread_num].context->sp->lr =
         (uint32_t)shizu::FOR_KERNEL_OBJECT::exit_method;
-    thread_table[thread_num].context->sp->r0 = 0;
+    thread_table[thread_num].context->sp->r0 = arg; // entry の第1引数
     thread_table[thread_num].context->sp->r1 = 0;
     thread_table[thread_num].context->sp->r2 = 0;
     thread_table[thread_num].context->sp->r3 = 0;
@@ -185,6 +284,49 @@ shizu::context_t *get_current_context() {
       .context;
 }
 
+// SysTick (banked, 自コア): grant スタック top の期限監視。tickless ワンショット
+// なので発火 = 「期限到来」か「24bit を超える期限のチャンク継ぎ」のどちらか。
+void systick_grant_handler() {
+  const uint32_t core = get_core_num();
+  shizu::grant_stack_t &gs = shizu::grant_stacks[core];
+  if (gs.depth == 0) { // 早期復帰との競合で grant が消えた後の遅延発火
+    systick_hw->csr = 0;
+    return;
+  }
+  const uint64_t deadline = gs.frames[gs.depth - 1].deadline;
+  if (time_us_64() >= deadline) {
+    systick_hw->csr = 0; // 停止。再装填は PendSV 側 (pop 後の新 top) が判断する
+    scb_hw->icsr = M33_ICSR_PENDSVSET_BITS; // 切替本体は最低優先度の PendSV へ
+  } else {
+    shizu::systick_arm_for(deadline); // チャンク継ぎ足し (>111ms の期限)
+  }
+}
+
+// PendSV (最低優先度): grant 期限の強制コンテキストスイッチ本体。ガードは
+// 自己安定型 — 「depth==0 / top 未期限なら no-op 復帰」なので、早期復帰や
+// SysTick との順序競合で余分に発火しても壊れない (PENDSVCLR 不要)。
+void pendsv_cpp_handler(shizu::context_t *context) {
+  (void)context; // grantee の退避は asm 入口 (CTX_SAVE) が完了済み
+  const uint32_t core = get_core_num();
+  shizu::grant_stack_t &gs = shizu::grant_stacks[core];
+  if (gs.depth == 0)
+    return;
+  if (gs.frames[gs.depth - 1].deadline > time_us_64()) {
+    shizu::systick_arm_for(gs.frames[gs.depth - 1].deadline); // spurious → 再装填
+    return;
+  }
+  const uint32_t grantee = shizu::cpu_manager::current_thread_id[core];
+  // grantee がカーネルオブジェクトとして走行中 (トランポリン/METHOD_CALL 中) は
+  // 切替を延期する — カーネルオブジェクトが自身の内部状態 (method_map / malloc
+  // 経路) を原子に保つための方針 (機構はカーネル、原子性はオブジェクトの方針)。
+  if (shizu::object_table[shizu::thread_table[grantee].object_id].state ==
+      shizu::object_t::state_t::KERNEL_OBJECT) {
+    shizu::systick_arm_for(time_us_64() + shizu::GRANT_RETRY_US);
+    return;
+  }
+  shizu::grant_pop_to_grantor(core, shizu::grant_end::EXPIRED);
+}
+
 __always_inline void set_return_code(uint32_t return_code,
                                      shizu::exception_frame_t &context) {
   context.r0 = return_code;
@@ -199,6 +341,20 @@ void trap() {
     printf("trapped\n");
     sleep_ms(1000);
   }
+}
+
+// READY→RUNNING を CAS で原子的に claim する (SWITCH_THREAD / GRANT_CPU 共用)。
+// これが「2 コアが同一 context_t を走らせない」根 = context の所有権ロックそのもの。
+// ACQUIRE で以後の context 読みを claim 後に固定。
+static shizu::switch_error try_claim(shizu::thread_t &t, uint32_t core) {
+  if (!(t.affinity & (1u << core)))
+    return shizu::switch_error::BAD_AFFINITY;
+  uint32_t expected = (uint32_t)shizu::thread_t::state_t::READY;
+  if (!__atomic_compare_exchange_n((uint32_t *)&t.state, &expected,
+                                   (uint32_t)shizu::thread_t::state_t::RUNNING,
+                                   false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+    return shizu::switch_error::NOT_READY;
+  return shizu::switch_error::OK;
 }
 
 // 本当はcontext_t* svc_cpp_handler(context_t
@@ -350,24 +506,24 @@ void svc_cpp_handler(shizu::context_t *context) {
       // ここで CAS 込みの単一操作にしておく (単一コアでも意味論は等価)。
       const uint32_t core = get_core_num();
       const uint32_t cur = shizu::cpu_manager::current_thread_id[core];
+      // grant アクティブ中の switch 発行 = grantee の早期復帰。対象 (arg0) は無視して
+      // 最寄りの grantor へ 1 段 pop する (時限移譲は「呼び出し」であり、grantee の
+      // yield は「早期 return」)。grantee は READY へ戻り、再開時の r0 は OK。
+      if (shizu::grant_stacks[core].depth != 0) {
+        stack_frame->r0 = (uint32_t)shizu::switch_error::OK;
+        shizu::grant_pop_to_grantor(core, shizu::grant_end::YIELDED);
+        break;
+      }
       if (arg0 == cur) {
         stack_frame->r0 = (uint32_t)shizu::switch_error::OK; // 自スレッドへは no-op
         break;
       }
-      shizu::thread_t &next_thread = shizu::thread_table[arg0];
-      if (!(next_thread.affinity & (1u << core))) {
-        stack_frame->r0 = (uint32_t)shizu::switch_error::BAD_AFFINITY;
-        break;
-      }
-      // claim: READY→RUNNING を CAS で原子的に取る。これが「2 コアが同一 context_t を
+      // claim: READY→RUNNING の CAS (try_claim)。これが「2 コアが同一 context_t を
       // 走らせない」根 = context の所有権ロックそのもの (別途 LOCK_CONTEXT は不要)。
-      // 負け/READY でない = NOT_READY。ACQUIRE で以後の context 読みを claim 後に固定。
-      uint32_t expected = (uint32_t)shizu::thread_t::state_t::READY;
-      if (!__atomic_compare_exchange_n(
-              (uint32_t *)&next_thread.state, &expected,
-              (uint32_t)shizu::thread_t::state_t::RUNNING, false,
-              __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
-        stack_frame->r0 = (uint32_t)shizu::switch_error::NOT_READY;
+      shizu::switch_error claim_result =
+          try_claim(shizu::thread_table[arg0], core);
+      if (claim_result != shizu::switch_error::OK) {
+        stack_frame->r0 = (uint32_t)claim_result;
         break;
       }
       shizu::cpu_manager::current_thread_id[core] = arg0;
@@ -377,6 +533,44 @@ void svc_cpp_handler(shizu::context_t *context) {
                        (uint32_t)shizu::thread_t::state_t::READY,
                        __ATOMIC_RELEASE);
       stack_frame->r0 = (uint32_t)shizu::switch_error::OK;
+      break;
+    }
+    case shizu::kernel_object_svc_num::GRANT_CPU: {
+      // 時限実行権移譲: arg0=対象 tid, arg1=最大実行時間[µs]。対象を claim して
+      // 切替え、期限到来 (SysTick→PendSV) か対象の yield/switch (早期復帰) で
+      // この SVC から戻る。戻り: r0=grant_error, r1=grant_end。
+      const uint32_t core = get_core_num();
+      const uint32_t cur = shizu::cpu_manager::current_thread_id[core];
+      shizu::grant_stack_t &gs = shizu::grant_stacks[core];
+      if (arg0 == cur) { // 自分への移譲は no-op (即 YIELDED 扱い)
+        stack_frame->r0 = (uint32_t)shizu::grant_error::OK;
+        stack_frame->r1 = (uint32_t)shizu::grant_end::YIELDED;
+        break;
+      }
+      if (gs.depth >= shizu::grant_stack_t::MAX_DEPTH) {
+        stack_frame->r0 = (uint32_t)shizu::grant_error::DEPTH;
+        break;
+      }
+      shizu::switch_error claim_result =
+          try_claim(shizu::thread_table[arg0], core);
+      if (claim_result != shizu::switch_error::OK) {
+        // grant_error の先頭 3 値は switch_error と同値なのでそのまま写せる。
+        stack_frame->r0 = (uint32_t)claim_result;
+        break;
+      }
+      // 期限はネストの外側 deadline でクランプ (over-time の構造的禁止)。
+      uint64_t deadline = time_us_64() + (uint64_t)arg1;
+      if (gs.depth > 0 && gs.frames[gs.depth - 1].deadline < deadline)
+        deadline = gs.frames[gs.depth - 1].deadline;
+      gs.frames[gs.depth++] = {cur, deadline};
+      // grantor の復帰値を先に用意: r0=OK 確定。r1 (EXPIRED/YIELDED) は復帰経路
+      // (pendsv_cpp_handler / SWITCH_THREAD インターセプト) が書く。
+      stack_frame->r0 = (uint32_t)shizu::grant_error::OK;
+      // grantor は WAIT_GRANT — READY でないので他コアに claim されず、復帰は
+      // このコアの pop 経路のみ (単独所有につき plain store で足りる)。
+      shizu::thread_table[cur].state = shizu::thread_t::state_t::WAIT_GRANT;
+      shizu::cpu_manager::current_thread_id[core] = arg0;
+      shizu::systick_arm_for(deadline);
       break;
     }
     case shizu::kernel_object_svc_num::GET_THREAD_STATE: {

@@ -24,8 +24,6 @@ struct test_rec_t {
   uint32_t seq;
 };
 constexpr uint32_t TEST_STREAM_ID = 0;
-constexpr uint32_t PROD_TID = 102;
-constexpr uint32_t CONS_TID = 103;
 
 // 共有メモリ (既定 lossy)。producer(owner) と consumer が同一実体を参照する。
 st::storage<test_rec_t, 64> g_test_stream;
@@ -80,10 +78,12 @@ void stream_test_consumer() {
 // core0 (kernel_object_main) から呼ぶ。STREAM_TEST オブジェクト + producer/consumer
 // スレッドを作る (両者 affinity 既定 = core0 で協調実行)。
 void stream_selftest_launch() {
-  FOR_KERNEL_OBJECT::create_object((uint32_t)object_ids::STREAM_TEST, PROD_TID,
-                                   (method_t)stream_test_producer);
-  FOR_KERNEL_OBJECT::create_thread((uint32_t)object_ids::STREAM_TEST, CONS_TID,
-                                   (method_t)stream_test_consumer);
+  // create_object + async_call ×2 (producer/consumer)。tid は自動確保。
+  FOR_KERNEL_OBJECT::create_object((uint32_t)object_ids::STREAM_TEST);
+  FOR_KERNEL_OBJECT::async_call((uint32_t)object_ids::STREAM_TEST,
+                                (method_t)stream_test_producer);
+  FOR_KERNEL_OBJECT::async_call((uint32_t)object_ids::STREAM_TEST,
+                                (method_t)stream_test_consumer);
 }
 
 } // namespace shizu

@@ -118,6 +118,18 @@ uint32_t kernel_obj_svc_handler(uint32_t r0, uint32_t r1, uint32_t r2,
     shizu::FOR_KERNEL_OBJECT::create_thread(r1, r2, (shizu::method_t)r3);
     break;
   }
+  case shizu::obj_api::svc_num::CREATE_OBJECT_ONLY: {
+    // r1=obj_id。オブジェクトのみ生成 (スレッド無し)。起動は ASYNC_CALL で。
+    shizu::FOR_KERNEL_OBJECT::create_object(r1);
+    break;
+  }
+  case shizu::obj_api::svc_num::ASYNC_CALL: {
+    // r1=obj_id, r2=entry, r3=arg。空き tid を自動確保して spawn。戻り r1=tid。
+    uint32_t tid =
+        shizu::FOR_KERNEL_OBJECT::async_call(r1, (shizu::method_t)r2, r3);
+    svc<(uint32_t)shizu::kernel_object_svc_num::METHOD_EXIT>(tid, 0, 0, 0, 0);
+    break;
+  }
   case shizu::obj_api::svc_num::EXPORT_METHOD: {
     // printf("EXPORT_METHOD\n");
     // r1: method_num, r2: entry
@@ -129,6 +141,13 @@ uint32_t kernel_obj_svc_handler(uint32_t r0, uint32_t r1, uint32_t r2,
     break;
   }
   case shizu::obj_api::svc_num::YIELD: {
+    // grant 中 (自分は誰かの grantee) の yield = grantor への早期復帰。
+    // SWITCH_THREAD はインターセプトされて対象を無視し grantor へ pop するので、
+    // 引数はダミーでよい。round-robin へは入らない (grantor が優先復帰先)。
+    if (shizu::grant_active_this_core()) {
+      ::svc<(uint32_t)shizu::kernel_object_svc_num::SWITCH_THREAD>(0, 0, 0, 0);
+      break;
+    }
     // sleep-aware round-robin: 次の runnable スレッドへ切替える。誰も居なければ何も
     // せず自スレッド続行 (= plain yield)。sleep 中 (wake_at>now) はスキップされる。
     const uint32_t self =
@@ -149,10 +168,29 @@ uint32_t kernel_obj_svc_handler(uint32_t r0, uint32_t r1, uint32_t r2,
     const uint64_t deadline = time_us_64() + (uint64_t)r1;
     shizu::thread_table[self].wake_at = deadline;
     while ((int64_t)(deadline - time_us_64()) > 0) {
+      // grant 中の sleep = grantor への早期復帰 (wake_at は設定済みなので、自分は
+      // READY+wake_at で round-robin から外れ、締切後に再 claim されて続きを走る)。
+      if (shizu::grant_active_this_core()) {
+        ::svc<(uint32_t)shizu::kernel_object_svc_num::SWITCH_THREAD>(0, 0, 0,
+                                                                     0);
+        continue;
+      }
       if (!sched_pick_next(self, get_core_num(), time_us_64()))
         tight_loop_contents(); // 他に runnable が居ない → 締切までスピン
     }
     shizu::thread_table[self].wake_at = 0; // 起床: 以後 plain yield でスキップされない
+    break;
+  }
+  case shizu::obj_api::svc_num::RUN_FOR: {
+    // r1=対象 tid, r2=最大実行時間[µs]。GRANT_CPU を発行し、この (grantor の)
+    // スレッドは復帰までここで待つ。復帰後、error(r0) と reason(r1) を 16bit ずつ
+    // にパックして METHOD_EXIT で返す (一般オブジェクトの戻りは r1 一語のため)。
+    result_t<uint32_t> grant_result =
+        ::svc<(uint32_t)shizu::kernel_object_svc_num::GRANT_CPU>(r1, r2, 0, 0);
+    svc<(uint32_t)shizu::kernel_object_svc_num::METHOD_EXIT>(
+        (((uint32_t)grant_result.result & 0xFFFFu) << 16) |
+            (grant_result.value & 0xFFFFu),
+        0, 0, 0, 0);
     break;
   }
   case shizu::obj_api::svc_num::CALL_METHOD: {
@@ -283,8 +321,11 @@ void kernel_object_main() {
   memory_map = {};
   svc<(uint32_t)shizu::kernel_object_svc_num::SET_SVC_HANDLER>(
       (uint32_t)(&shizu::wrapper<kernel_obj_svc_handler>), 0, 0, 0, 0);
-  FOR_KERNEL_OBJECT::create_object((uint32_t)object_ids::IO_CONTROLLER, 1,
-                                   (method_t)IO_CONTROLLER::main);
+  // オブジェクト起動 = create_object(id) + async_call(id, main)。thread 番号は
+  // async_call が自動確保する (手番廃止)。
+  FOR_KERNEL_OBJECT::create_object((uint32_t)object_ids::IO_CONTROLLER);
+  FOR_KERNEL_OBJECT::async_call((uint32_t)object_ids::IO_CONTROLLER,
+                                (method_t)IO_CONTROLLER::main);
 #if SHIZU_CORE1_KERNEL_POC
   // デュアルコア: core1 を Shizuku カーネルとして起動し、センサ I/O を SENSOR_IO
   // (affinity=core1) スレッドとして走らせる。thread0 がまだ yield/switch する前に
@@ -295,6 +336,10 @@ void kernel_object_main() {
   // ストリーム API の end-to-end 自己テスト (producer/consumer 対を core0
   // で協調実行)。
   shizu::stream_selftest_launch();
+#endif
+#if SHIZU_GRANT_SELFTEST
+  // 時限実行権移譲 (run_for/GRANT_CPU) の end-to-end 自己テスト。
+  shizu::grant_selftest_launch();
 #endif
   // スレッド 0 (カーネルオブジェクト) は以降 round-robin のアイドル/スケジューラ心拍。
   // 次の runnable スレッドへ切替え、誰も居なければ (全員 sleep 中/未生成) スピンする。

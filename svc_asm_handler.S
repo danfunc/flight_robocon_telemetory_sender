@@ -4,10 +4,6 @@
 .fpu fpv5-sp-d16   // .cpu 指定は FPU を含まないため、vstmia/vldmia 用に明示する
 #endif
 .thumb
-.thumb_func
-.global svc_asm_handler
-.align 8
-.type svc_asm_handler, %function
 
 // context_t のオフセット。kernel.cpp の static_assert と一致させること。
 //   0..28 : r4-r11
@@ -17,10 +13,13 @@
 .equ CTX_EXC_RETURN, 36
 .equ CTX_FP,         40
 
-// 遅延 (lazy) FPU コンテキストスイッチ対応の SVC 入口。
+// ---------------------------------------------------------------------------
+// CTX_SAVE — 現在スレッドの context_t へ {r4-r11, PSP, EXC_RETURN, 遅延 S16-S31}
+// を退避する。入口条件: lr = EXC_RETURN (例外入口直後)。出口: r0 = context 先頭。
 // FP ブロック以外は Cortex-M0+ 互換のエンコーディングに留め、FP 固有部のみ
 // __ARM_FP でガードする (armv8-m / FPv5 でのみ有効)。
-svc_asm_handler:
+// ---------------------------------------------------------------------------
+.macro CTX_SAVE
     push {lr}                     // EXC_RETURN を退避 (直後の bl で lr が壊れる)
     bl   get_current_context      // r0 = 現在スレッドの context 先頭
 
@@ -47,9 +46,13 @@ svc_asm_handler:
     vstmia r1!, {s16-s31}
 1:
 #endif
+.endm
 
-    bl   svc_cpp_handler          // svc_cpp_handler(context = r0)
-
+// ---------------------------------------------------------------------------
+// CTX_RESTORE — get_current_context を再取得し (cpp ハンドラが別スレッドへ
+// 切替えたかもしれない)、context_t から復元して例外復帰する。
+// ---------------------------------------------------------------------------
+.macro CTX_RESTORE
     bl   get_current_context      // r0 = 復帰対象 context (別スレッドかもしれない)
 
     // 整数 callee-saved と PSP を復元
@@ -75,3 +78,30 @@ svc_asm_handler:
 
     mov  lr, r3                   // LR = 復帰対象の EXC_RETURN
     bx   lr                       // 例外復帰
+.endm
+
+// ---------------------------------------------------------------------------
+// SVC 入口。CTX_SAVE → svc_cpp_handler(context) → CTX_RESTORE。
+// ---------------------------------------------------------------------------
+.thumb_func
+.global svc_asm_handler
+.align 8
+.type svc_asm_handler, %function
+svc_asm_handler:
+    CTX_SAVE
+    bl   svc_cpp_handler          // svc_cpp_handler(context = r0)
+    CTX_RESTORE
+
+// ---------------------------------------------------------------------------
+// PendSV 入口 (grant 期限の強制コンテキストスイッチ)。退避/復元は SVC と完全同型
+// (遅延 FPU 退避含む)。pendsv_cpp_handler が grant スタックを 1 段 pop して
+// current_thread_id を grantor へ戻す (無関係な発火はガードして no-op 復帰)。
+// ---------------------------------------------------------------------------
+.thumb_func
+.global pendsv_asm_handler
+.align 2
+.type pendsv_asm_handler, %function
+pendsv_asm_handler:
+    CTX_SAVE
+    bl   pendsv_cpp_handler       // pendsv_cpp_handler(context = r0)
+    CTX_RESTORE

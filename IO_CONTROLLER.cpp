@@ -16,43 +16,36 @@
 #include <pico/stdlib.h>
 #include <stdio.h>
 
+// オブジェクト起動 = create_object(id) + async_call(id, entry) の 2 段。thread 番号は
+// async_call が空きスロットを自動確保する。初回実行順は「スレッド番号の昇順」= この
+// async_call を呼んだ順なので、依存先 (BLE, BNO055, FLIGHT) を先に async_call すること
+// が本質 (手番の割り当てではなく呼び出し順で担保される)。
+static void start_object(object_ids id, uintptr_t entry) {
+  shizu::obj_api::create_object((uint32_t)id);
+  shizu::obj_api::async_call((uint32_t)id, entry);
+}
+
 void shizu::IO_CONTROLLER::main() {
   printf("IO_CONTROLLER::init\n");
-  obj_api::create_object((uint32_t)object_ids::WS2812_DRIVER, 10,
-                         (uintptr_t)WS2812_DRIVER::init);
+  start_object(object_ids::WS2812_DRIVER, (uintptr_t)WS2812_DRIVER::init);
 
   // CYW43 の無線は排他利用のため、CYW43_BL_DRIVER (プロコン HID) と
   // BLE_UART_DRIVER は同時起動できない。ここでは BLE UART を起動する。
-  // プロコン制御に戻す場合は下のオブジェクト生成を入れ替える。
-  // obj_api::create_object((uint32_t)object_ids::CYW43_BL_DRIVER, 9,
-  //                        (uintptr_t)CYW43_BL_DRIVER::init);
-  obj_api::create_object((uint32_t)object_ids::BLE_UART_DRIVER, 11,
-                         (uintptr_t)BLE_UART_DRIVER::init);
+  // プロコン制御に戻す場合は下を入れ替える。
+  // start_object(object_ids::CYW43_BL_DRIVER, (uintptr_t)CYW43_BL_DRIVER::init);
+  start_object(object_ids::BLE_UART_DRIVER, (uintptr_t)BLE_UART_DRIVER::init);
 
-  // 飛行テレメトリ構成:
-  //   BME280_DRIVER / BNO055_DRIVER … I2C センサを各々 Shizuku オブジェクト化し、
-  //                                    50Hz で読み続けて最新値をキャッシュする。
-  //   TELEMETRY_SENDER … 上記 2 つを read_latest で購読し、相補フィルタで融合して
-  //                       BLE_UART 経由で母艦 (mac) へ CSV テレメトリを送る。
-  // ※ BLE_UART を先に立ててから TELEMETRY (set_rx_sink / send_byte を叩く) を生成。
-  obj_api::create_object((uint32_t)object_ids::BME280_DRIVER, 13,
-                         (uintptr_t)BME280_DRIVER::init);
-  obj_api::create_object((uint32_t)object_ids::BNO055_DRIVER, 14,
-                         (uintptr_t)BNO055_DRIVER::init);
-  // 飛行制御は TELEMETRY より先に走らせ、on_state/read_control の export を
+  // 飛行テレメトリ構成: BME280/BNO055 (I2C センサ) → TELEMETRY_SENDER が購読して融合し
+  // BLE_UART 経由で送信。BLE_UART を先に、TELEMETRY を最後に async_call する。
+  start_object(object_ids::BME280_DRIVER, (uintptr_t)BME280_DRIVER::init);
+  start_object(object_ids::BNO055_DRIVER, (uintptr_t)BNO055_DRIVER::init);
+  // 飛行制御は TELEMETRY より先に async_call し、on_state/read_control の export を
   // 済ませてから TELEMETRY の最初の call_method を受けられるようにする。
-  // ※ 初回実行順は create の順ではなく「スレッド番号の昇順」(YIELD が昇順スキャン)
-  //    なので、FLIGHT_CONTROLLER に小さい番号を割り当てることが本質。
-  obj_api::create_object((uint32_t)object_ids::FLIGHT_CONTROLLER, 15,
-                         (uintptr_t)FLIGHT_CONTROLLER::main);
-  obj_api::create_object((uint32_t)object_ids::TELEMETRY_SENDER, 16,
-                         (uintptr_t)TELEMETRY_SENDER::main);
+  start_object(object_ids::FLIGHT_CONTROLLER, (uintptr_t)FLIGHT_CONTROLLER::main);
+  start_object(object_ids::TELEMETRY_SENDER, (uintptr_t)TELEMETRY_SENDER::main);
 
-  // BLE スループット/RSSI ベンチマーク用の HELLO_WORLD を使いたい場合は、上の
-  // TELEMETRY_SENDER の生成をコメントアウトし、下を有効化する (BLE 送信路の
-  // 取り合いになるため同時起動はしない)。
-  // obj_api::create_object((uint32_t)object_ids::HELLO_WORLD, 12,
-  //                        (uintptr_t)HELLO_WORLD::main);
+  // BLE スループット/RSSI ベンチ用の HELLO_WORLD を使う場合は上の TELEMETRY を外して:
+  // start_object(object_ids::HELLO_WORLD, (uintptr_t)HELLO_WORLD::main);
 
   // IO_CONTROLLER 自身は以降ハートビートを刻むだけ (BLE 送信は TELEMETRY が担う)。
   while (true) {
