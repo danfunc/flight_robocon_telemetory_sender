@@ -58,6 +58,10 @@ void core1_kernel_launch() {
   uint32_t tid = FOR_KERNEL_OBJECT::async_call((uint32_t)object_ids::SENSOR_IO,
                                                (method_t)sensor_io_main);
   thread_table[tid].affinity = AFFINITY_CORE1;
+  // SENSOR_IO は設計上 yield しない core1 専有スレッド = バトン組 (budget 無制限)。
+  // budget 付きにすると 3ms ごとに無意味な期限切れ/再 host が起き、1kHz センサ I/O の
+  // タイミングを乱すだけで守るものが無い (core1 には他に走るスレッドが居ない)。
+  thread_table[tid].grant_budget_us = 0;
   multicore_launch_core1(init_core1);
 }
 
@@ -86,6 +90,7 @@ void core1_kernel_launch() {
       sizeof(method_call_stack_t) * call_stack_t::MAX_DEPTH);
   idle.call_stack.depth = 0;
   idle.affinity = AFFINITY_CORE1;
+  idle.grant_budget_us = 0; // core1 idle もバトン組 (thread0 と同じ理由)
   idle.state = thread_t::state_t::RUNNING;
   cpu_manager::current_thread_id[1] = CORE1_IDLE_TID; // friend アクセス
 

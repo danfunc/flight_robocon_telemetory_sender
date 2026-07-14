@@ -231,7 +231,12 @@ void grant_selftest_launch() {
   g_mid_tid = FOR_KERNEL_OBJECT::async_call(obj, (method_t)mid_worker);
   for (uint32_t i = 0; i < 8; ++i)
     g_nest_tid[i] = FOR_KERNEL_OBJECT::async_call(obj, (method_t)nest_worker, i);
-  FOR_KERNEL_OBJECT::async_call(obj, (method_t)driver);
+  // driver は budget 0 (バトン組)。budget 付き guest として host されると自分の
+  // run_for(3ms/200ms) が親 budget にクランプされ、A/E の期限検証が成立しないため。
+  // = 「長い grant を張れるのは budget 0 のトップレベルだけ」の実例でもある。
+  const uint32_t driver_tid =
+      FOR_KERNEL_OBJECT::async_call(obj, (method_t)driver);
+  thread_table[driver_tid].grant_budget_us = 0;
 }
 
 } // namespace shizu

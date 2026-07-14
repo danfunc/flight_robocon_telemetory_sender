@@ -24,6 +24,14 @@
 #define SHIZU_GRANT_SELFTEST 1
 #endif
 
+// スケジューラが budget 付きスレッドへ与える時限の既定値 [µs]。
+// 意味論は quantum でなく「凍結ウォッチドッグ」: 全ドライバは正常時これより十分
+// 短い周期で yield する (最長の正当ホールドは I2C 100kHz 26B 読み ≈2.4ms) ので、
+// 期限切れは「従来なら全系凍結だった異常時」にしか発火しない。
+#ifndef SHIZU_DEFAULT_GRANT_BUDGET_US
+#define SHIZU_DEFAULT_GRANT_BUDGET_US 3000
+#endif
+
 int main(int argc, char const *argv[]);
 
 namespace shizu {
@@ -227,6 +235,12 @@ struct thread_t {
   // affinity: 走行を許すコアのビットマスク (bit0=core0, bit1=core1)。既定は全コア。
   // TRY_SWITCH_THREAD の claim がこれを検査する (AMP 相当は「core1 固定」等の policy)。
   uint32_t affinity;
+  // grant_budget_us: スケジューラ (sched_pick_next) がこのスレッドへ CPU を渡すときの
+  // 時限 [µs]。0 = 無制限 (従来の SWITCH_THREAD バトンパス)。>0 = GRANT_CPU で host
+  // される (期限で必ず回収される guest)。不変条件: budget>0 のスレッドは guest として
+  // しか走らないので、yield を怠っても系を凍らせられない。バトン (無限移譲) を受け
+  // 取れるのは budget 0 のスレッドだけ (thread0 idle / BLE_UART / core1 組)。
+  uint32_t grant_budget_us;
   // wake_at: sleep 中の起床時刻 (µs, time_us_64 基準)。スケジューラは wake_at > now の
   // スレッドをスキップする (sleep 中は round-robin から外す)。0 や過去値なら即 runnable。
   uint64_t wake_at;

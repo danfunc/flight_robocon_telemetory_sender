@@ -66,13 +66,26 @@ struct stream_reg_t {
 };
 static stream_reg_t stream_table[stream::MAX_STREAMS];
 
-// スケジューラ中核 (round-robin)。self の次のスロットから「今走らせてよい」スレッド
-// = affinity 一致 && READY && wake_at<=now を探し、try_switch_thread で claim する。
-// 切替えたら true。state/wake_at は素のロード (advisory) で、確定は claim の CAS。
-// affinity を先に見るので、他コア専用スレッドの wake_at(64bit) を跨いで torn 読みしない。
+// スケジューラ中核 (budget 付き round-robin)。「今走らせてよい」スレッド = affinity
+// 一致 && READY && wake_at<=now を探し、budget に応じて 2 通りで CPU を渡す:
+//   budget == 0 → try_switch_thread (従来のバトンパス: 無限移譲、自分は READY へ)
+//   budget > 0  → GRANT_CPU (host: 自分は WAIT_GRANT で待ち、guest の yield か期限
+//                 (≤budget) で戻って続行) = 凍結ウォッチドッグ。
+// 不変条件: budget>0 のスレッドは guest としてしか走らないので、yield を怠っても
+// 期限で必ず回収される。バトンを受け取れるのは budget 0 組だけ。
+//
+// スキャン起点は per-core rotor (最後に CPU を渡した tid)。host-guest 化では自分が
+// 復帰後も走り続けるため、self 起点だと「self の直後の tid」だけが毎回選ばれて他が
+// 飢餓する。rotor 起点でリング全体を公平に巡回させる。
+// state/wake_at は素のロード (advisory) で、確定は claim の CAS。affinity を先に
+// 見るので、他コア専用スレッドの wake_at(64bit) を跨いで torn 読みしない。
+static uint32_t sched_rotor[2] = {0, 0}; // per-core: 最後に CPU を渡した tid
 static bool sched_pick_next(uint32_t self, uint32_t core, uint64_t now) {
+  const uint32_t start = sched_rotor[core];
   for (uint32_t k = 1; k < 128; ++k) {
-    uint32_t i = (self + k) & 127u;
+    uint32_t i = (start + k) & 127u;
+    if (i == self)
+      continue; // 自分は候補外 (GRANT_CPU(self) は no-op になるだけ)
     shizu::thread_t &t = shizu::thread_table[i];
     if (!(t.affinity & (1u << core)))
       continue;
@@ -80,8 +93,24 @@ static bool sched_pick_next(uint32_t self, uint32_t core, uint64_t now) {
       continue;
     if (t.wake_at > now)
       continue; // sleep 中 → スキップ
-    if (shizu::try_switch_thread(i).error.is_ok())
-      return true; // claim 成功 (切替わった)
+    const uint32_t budget = t.grant_budget_us;
+    if (budget == 0) {
+      // バトンパス (無限移譲)。成功 = 自分は READY になり、切替わって戻ってきた。
+      if (shizu::try_switch_thread(i).error.is_ok()) {
+        sched_rotor[core] = i;
+        return true;
+      }
+    } else {
+      // host: guest の完了 (yield/期限) までこの SVC がブロックする。戻り r0 が
+      // OK なら guest は走った。NOT_READY (claim 負け) は次候補へ。
+      result_t<uint32_t> r =
+          ::svc<(uint32_t)shizu::kernel_object_svc_num::GRANT_CPU>(i, budget,
+                                                                   0, 0);
+      if ((uint32_t)r.result == (uint32_t)shizu::grant_error::OK) {
+        sched_rotor[core] = i;
+        return true;
+      }
+    }
   }
   return false;
 }
@@ -191,6 +220,13 @@ uint32_t kernel_obj_svc_handler(uint32_t r0, uint32_t r1, uint32_t r2,
         (((uint32_t)grant_result.result & 0xFFFFu) << 16) |
             (grant_result.value & 0xFFFFu),
         0, 0, 0, 0);
+    break;
+  }
+  case shizu::obj_api::svc_num::SET_THREAD_BUDGET: {
+    // r1=tid, r2=µs (0=無制限バトン)。scheduler が host するときの時限を変更する。
+    // 書き込みは u32 一語 (torn しない)。読む側 (sched_pick_next) は advisory。
+    if (r1 < 128)
+      shizu::thread_table[r1].grant_budget_us = r2;
     break;
   }
   case shizu::obj_api::svc_num::CALL_METHOD: {

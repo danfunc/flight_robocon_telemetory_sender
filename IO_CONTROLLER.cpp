@@ -20,9 +20,10 @@
 // async_call が空きスロットを自動確保する。初回実行順は「スレッド番号の昇順」= この
 // async_call を呼んだ順なので、依存先 (BLE, BNO055, FLIGHT) を先に async_call すること
 // が本質 (手番の割り当てではなく呼び出し順で担保される)。
-static void start_object(object_ids id, uintptr_t entry) {
+// 戻り値 = 割り当てられた thread_id (async_call の r1 戻り)。
+static uint32_t start_object(object_ids id, uintptr_t entry) {
   shizu::obj_api::create_object((uint32_t)id);
-  shizu::obj_api::async_call((uint32_t)id, entry);
+  return shizu::obj_api::async_call((uint32_t)id, entry).value;
 }
 
 void shizu::IO_CONTROLLER::main() {
@@ -33,7 +34,12 @@ void shizu::IO_CONTROLLER::main() {
   // BLE_UART_DRIVER は同時起動できない。ここでは BLE UART を起動する。
   // プロコン制御に戻す場合は下を入れ替える。
   // start_object(object_ids::CYW43_BL_DRIVER, (uintptr_t)CYW43_BL_DRIVER::init);
-  start_object(object_ids::BLE_UART_DRIVER, (uintptr_t)BLE_UART_DRIVER::init);
+  // BLE I/O は budget 除外 (無制限バトン組)。理由: cyw43/btstack は init や暗号化で
+  // 3ms を正当に超える上、malloc/ロックを内部で使うため期限スライスできない。
+  // 「BLE 以外は 3ms 以上 CPU をロックしない」ポリシーの唯一の例外。
+  const uint32_t ble_tid =
+      start_object(object_ids::BLE_UART_DRIVER, (uintptr_t)BLE_UART_DRIVER::init);
+  shizu::obj_api::set_thread_budget(ble_tid, 0);
 
   // 飛行テレメトリ構成: BME280/BNO055 (I2C センサ) → TELEMETRY_SENDER が購読して融合し
   // BLE_UART 経由で送信。BLE_UART を先に、TELEMETRY を最後に async_call する。

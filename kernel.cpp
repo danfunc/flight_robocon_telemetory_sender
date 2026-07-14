@@ -48,12 +48,19 @@
 //     呼び出し先がコピーする (単一アドレス空間なのでポインタが共有できる)。
 //
 //  【スケジューリング — 方針はカーネルではなくカーネルオブジェクトが持つ】
-//   プリエンプションは無い。カーネルが提供するのは SWITCH_THREAD という機構
-//   だけ (「指定スレッドが READY なら、そこへ切り替える」というプリミティブ)。
-//   「次にどのスレッドを走らせるか」というスケジューリング方針はカーネル側には
-//   無く、カーネルオブジェクトの YIELD ハンドラが GET_THREAD_STATE で READY な
-//   次スレッドを探し、SWITCH_THREAD を発行することで実現する。各スレッドが
-//   明示的に yield しない限り、I2C/SVC 等の処理は原子的に走る。
+//   カーネルが提供する機構は 2 つだけ: SWITCH_THREAD (無限時間のバトンパス) と
+//   GRANT_CPU (時限移譲 = SysTick/PendSV による期限回収付き)。方針 (誰にどちらで
+//   渡すか) はカーネルオブジェクトの sched_pick_next が持つ:
+//     ・grant_budget_us == 0 のスレッド → バトンパス (従来の協調、無限移譲)。
+//        該当: thread0 idle / BLE_UART / core1 idle / SENSOR_IO。
+//     ・grant_budget_us > 0 のスレッド → GRANT_CPU で host (既定 3ms、凍結
+//        ウォッチドッグ)。guest は yield で host へ早期復帰し、yield を怠っても
+//        期限で必ず回収される = 1 ドライバの暴走が全系を凍らせられない。
+//   期限は quantum ではなく異常時の安全網: 全ドライバは正常時 3ms より十分短く
+//   yield するので発火せず、その限り従来の協調原子性 (yield しない限り I2C/共有
+//   状態の処理は原子) は保たれる。発火した瞬間だけ torn read があり得る (従来の
+//   全系凍結の代替として許容)。budget>0 のスレッドは guest としてしか走らない
+//   ため、バトン (無限移譲) を受け取れるのは budget 0 組だけ。
 //
 //  svc_asm_handler.S が例外入口で {r4-r11, PSP} を context_t に退避し、ここで
 //  svc_cpp_handler が論理を処理して context を更新、復帰時に書き戻す。
@@ -111,6 +118,9 @@ void thread_table_init() {
     thread_table[i].state = thread_t::state_t::UNINITIALIZED;
     thread_table[i].affinity = AFFINITY_CORE0; // 既定は core0 ピン (core1 は明示のみ)
     thread_table[i].wake_at = 0;               // 0 = sleep していない (即 runnable)
+    // 既定は budget 付き (凍結ウォッチドッグ)。無制限にしたいスレッドだけ 0 を明示
+    // する (thread0 / BLE_UART / core1 組)。
+    thread_table[i].grant_budget_us = SHIZU_DEFAULT_GRANT_BUDGET_US;
     thread_table[i].context = nullptr;
     thread_table[i].object_id = 0;
     thread_table[i].thread_id = i;

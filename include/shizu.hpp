@@ -18,6 +18,9 @@ namespace shizu {
   thread_table[0].call_stack.frames = (method_call_stack_t *)malloc(
       sizeof(method_call_stack_t) * call_stack_t::MAX_DEPTH);
   thread_table[0].call_stack.depth = 0;
+  // thread0 (カーネルオブジェクトの idle/スケジューラ心拍) はバトン組 = budget 無制限。
+  // guest として host されると自分の GRANT_CPU がネスト扱いになるため必ず 0。
+  thread_table[0].grant_budget_us = 0;
   thread_table[0].state = thread_t::state_t::RUNNING;
   uintptr_t CONTROL_MASK = 1 << 1;
   asm volatile("MSR PSP,%[entry_psp];"

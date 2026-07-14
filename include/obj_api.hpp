@@ -31,6 +31,7 @@ enum struct svc_num : uint32_t {
   CREATE_OBJECT_ONLY = 18, // r1=obj_id。オブジェクトのみ生成 (スレッド無し)
   ASYNC_CALL = 19,     // r1=obj_id, r2=entry, r3=arg。空き tid に spawn → r1(戻)=tid
   RUN_FOR = 20, // r1=tid, r2=µs。時限実行権移譲 → r1(戻)=(error<<16)|reason
+  SET_THREAD_BUDGET = 21, // r1=tid, r2=µs。scheduler の host 時限 (0=無制限バトン)
 };
 
 template <typename T>
@@ -114,6 +115,13 @@ struct run_for_result_t {
   const uint32_t packed = r.value; // (error<<16)|reason (kernel_obj_svc_handler)
   return {.error = (grant_error)(packed >> 16),
           .reason = (grant_end)(packed & 0xFFFFu)};
+}
+
+// スケジューラがスレッド tid を host するときの時限 [µs] を変更する。0 = 無制限
+// (バトンパス、凍結ウォッチドッグの対象外)。BLE_UART のようにロック/タイミング都合で
+// スライスできないスレッドだけ 0 を指定する。既定は SHIZU_DEFAULT_GRANT_BUDGET_US。
+[[maybe_unused]] static void set_thread_budget(uint32_t tid, uint32_t us) {
+  svc(svc_num::SET_THREAD_BUDGET, tid, us, 0);
 }
 
 __always_inline static void yield_until(bool (*condition)()) {
