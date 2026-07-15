@@ -36,6 +36,11 @@ public:
     // arg0 = uint32_t* 。TX リングの現在の空きバイト数を書き込む。供給側の
     // バックプレッシャ用 (ブラストが「入る分だけ生成」するために使う)。
     get_tx_free = 3,
+    // arg0 = (stream_id << 16) | priority。外部 producer が自分の TX ストリーム
+    // (ble_tx::frame_t の Shizuku ストリーム) を BLE_UART の優先度付き排出表へ登録
+    // する。BLE_UART は open + bind(CONSUMER) して priority 降順に挿入し、
+    // CAN_SEND_NOW ごとに空でない最高優先度ストリームから先に notify する。
+    register_tx_stream = 4,
   };
 };
 } // namespace shizu

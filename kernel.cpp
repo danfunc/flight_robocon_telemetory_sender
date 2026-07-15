@@ -139,6 +139,9 @@ uint32_t cpu_manager::current_thread_id[2] = {0, 0};
 //  割り込むことはなく、grant スタックは自コア内で直列化される (ロック不要)。
 grant_stack_t grant_stacks[2] = {};
 
+// per-core CPU 使用率計測 (スケジューラが実務へ渡した時間の累積)。宣言は kernel.hpp。
+volatile uint64_t cpu_busy_us[2] = {0, 0};
+
 // clk_sys のサイクル/µs。cpu_manager::init で実クロックから 1 回キャッシュする
 // (両コア同一クロック)。150 MHz 既定値は init 前の保険。
 static uint32_t g_cycles_per_us = 150;

@@ -140,6 +140,28 @@ public:
   // producer (単一, SPSC)。lossy=常に true / lossless=満杯で false。
   SHIZU_STREAM_AINLINE bool push(const REC &r) { return push_core(r); }
 
+  // producer: 現在 push できる空きレコード数 (LOSSLESS の残容量)。単一 producer が
+  // マルチレコードのメッセージを「全部入るときだけ push」する事前チェックに使う。
+  // consumer は空きを増やす方向にしか動かないので、単一 producer 文脈では安全。
+  SHIZU_STREAM_AINLINE uint32_t writable_slots() const {
+    return d_->capacity - (d_->wr - d_->rd);
+  }
+
+  // consumer: 先頭レコードを覗く (rd は進めない)。空なら false。送信成功後に drop()
+  // で消費確定する「成功してから消費」方式用 (credit 切れで送れなかったフレームを
+  // 失わない)。単一 consumer 文脈で使うこと。
+  SHIZU_STREAM_AINLINE bool peek(REC *out) {
+    uint32_t w = d_->wr;
+    __dmb(); // wr 観測 → buf 読みの順序を保証
+    if (d_->rd == w)
+      return false; // 空
+    *out = at(d_->rd);
+    return true;
+  }
+
+  // consumer: peek した 1 件を消費確定 (rd を 1 進める)。peek が true を返した後のみ。
+  SHIZU_STREAM_AINLINE void drop() { d_->rd = d_->rd + 1; }
+
   // producer (複数, MP_PROD)。prod_lock を CAS で取ってから push。
   SHIZU_STREAM_AINLINE bool push_mp(const REC &r) {
     uint32_t expected = 0;

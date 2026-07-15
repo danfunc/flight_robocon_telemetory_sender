@@ -183,6 +183,18 @@ inline bool grant_active_this_core() {
   return grant_stacks[get_core_num()].depth != 0;
 }
 
+// ---- per-core CPU 使用率計測 (スケジューラが実務へ渡した時間の累積) ---------
+// 各コアの共通 idle ループ (scheduler_idle_loop) が sched_pick_next 1 回ごとに、
+// 「実際にスレッドを走らせて戻ってきた経過時間」を cpu_busy_us へ足す。誰も runnable
+// でなくスピンした分は足さない。使用率 = Δcpu_busy_us/Δwall。スケジューラが唯一の
+// 会計点なので core0/core1 一様、core1 専用計装が不要 (SENSOR_IO が idle 時に sleep で
+// スケジューラへ戻る前提)。単一コアが自分の要素だけ触るのでロック不要。
+extern volatile uint64_t cpu_busy_us[2]; // スケジューラが実務へ渡した累積時間 [µs]
+
+// 各コアの共通スケジューラ idle ループ (kernel_object.cpp)。core0=thread0、
+// core1=idle スレッドがそれぞれ自分の tid で呼び、以後この 1 実装だけが両コアで回る。
+[[noreturn]] void scheduler_idle_loop(uint32_t self_tid);
+
 struct context_t {
   uint32_t r4, r5, r6, r7, r8, r9, r10, r11; // offset 0..28
   exception_frame_t *sp;                      // offset 32 (must stay 32)

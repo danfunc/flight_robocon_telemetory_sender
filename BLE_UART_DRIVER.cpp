@@ -11,10 +11,12 @@ extern "C" {
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <ble_tx_stream.hpp> // 優先度付き TX マルチストリーム (frame_t / push_msg)
 #include <export_method.hpp>
 #include <obj_api.hpp>
 #include <hardware/sync.h>   // save_and_disable_interrupts / restore_interrupts
 #include <object_headers/BLE_UART_DRIVER.hpp>
+#include <stream.hpp> // open / bind (register_tx_stream)
 #include <pico/cyw43_arch.h> // cyw43_arch_init / cyw43_arch_poll
 
 namespace shizu {
@@ -80,72 +82,63 @@ volatile uint32_t ble_dbg_evt = 0;  // HCI/SM イベント受信数
 static uint32_t rx_sink_obj_id = 0xFFFF;
 static uint32_t rx_sink_method_id = 0;
 
-// ---- TX リングバッファ -----------------------------------------------------
-// send_byte が行を組み立て、'\n' で 1 行まるごとリングへコミットする。
-// CAN_SEND_NOW で flush_tx が notify として吐き出す。
-//
-// ロック方針: producer (送信オブジェクトのスレッド) と consumer (poll
-// スレッドの flush_tx) が tx_head / tx_tail を触る。協調スケジューリングでは
-// 関数の途中で切り替わらないが、将来のプリエンプティブ化や IRQ に備えて
-// インデックス更新だけを save_and_disable_interrupts でガードする (btstack
-// 呼び出しはロック外)。
-// 8KB: CI 15ms × 2 発/CSN の排出 (~32.5kB/s) に対し、printf (USB CDC) 等で
-// スケジューラが数十 ms 詰まっても供給が途切れない深さ (2048 だと ~60ms 分で
-// blast 飽和供給時に浅すぎた)。
-static constexpr uint32_t TX_RING_SIZE = 8192; // 2 の冪
-static constexpr uint32_t TX_RING_MASK = TX_RING_SIZE - 1;
-static uint8_t tx_ring[TX_RING_SIZE];
-static volatile uint32_t tx_head = 0; // 書き込み位置 (producer)
-static volatile uint32_t tx_tail = 0; // 読み出し位置 (consumer)
+// ---- TX 優先度付きマルチストリーム -----------------------------------------
+// 単一 FIFO バイトリングを廃し、Shizuku ストリームを N 本、優先度順に排出する
+// (詳細は ble_tx_stream.hpp)。各 producer が frame_t の SPSC ストリームを所有し、
+// register_tx_stream で登録する。CAN_SEND_NOW ごとに flush_tx が空でない最高優先度
+// ストリームから notify する。SPSC の wr/rd は協調原子性 + __dmb で扱う (btstack
+// 呼び出しはロック外)。これにより ping 応答(ctrl)がバルクテレメトリを追い越せる。
+namespace bt = shizu::ble_tx;
 
-static inline uint32_t tx_count() { return (tx_head - tx_tail) & TX_RING_MASK; }
-static inline bool tx_empty() { return tx_head == tx_tail; }
-// 使用可能容量 (満杯判定のため 1 バイト空ける)。
-static inline uint32_t tx_free() { return TX_RING_SIZE - 1 - tx_count(); }
+// 1 CAN_SEND_NOW で連続排出する bulk PDU の上限。コントローラへ渡した PDU は FIFO
+// なので、bulk を無制限に連射すると後着の ctrl フレームが次 CI 以降へ押される。
+// bulk をイベントあたり数発に締めることで後着 ctrl の待ちを ~1 CI に抑える (実測で調整)。
+#ifndef BLE_TX_BULK_PDUS_PER_EVENT
+#define BLE_TX_BULK_PDUS_PER_EVENT 4
+#endif
 
-// ---- 行ステージング --------------------------------------------------------
-// '\n' が来るまでここに溜め、行が確定したら原子的にリングへ移す。リングに
-// 入りきらない行は「丸ごと」捨てる (部分行を絶対に出さない = 表示が崩れない)。
-// バッチ・バイナリフレーム (TELEMETRY_SENDER) は最悪スタッフィングで ~900B に
-// なりうる。540 だと溢れて行ごと破棄され 1 バッチ丸ごと失う。リング(2048)に収まる
-// 範囲で 1024 まで拡張する (>512 のフレームは複数 notify に跨るが、クライアントは
-// 0x0A まで連結して復元するので問題ない)。
-static constexpr uint32_t TX_LINE_MAX = 1024;
-static uint8_t line_buf[TX_LINE_MAX];
-static uint32_t line_len = 0;
-static bool line_overflow = false; // 行が TX_LINE_MAX を超えた
-static uint32_t dropped_lines = 0; // 容量不足で捨てた行数 (デバッグ用)
+// BLE_UART 自身の内部行 (RSSI / status / 互換 send_byte・send_buf) 用のローカル
+// ストリーム。外部 producer (TELEMETRY 等) は自分のストリームを register_tx_stream で
+// 登録する。全ストリーム LOSSLESS = 満杯で「メッセージ丸ごと破棄」(部分フレームを
+// 絶対に出さない → MORE フレーミングが壊れない)。
+static shizu::stream::storage<bt::frame_t, 16, shizu::stream::LOSSLESS> g_tx_sys;
 
-// 確定した 1 行をロック下でリングへコミット。空きが無ければ丸ごと破棄。
-static void tx_commit_line() {
-  uint32_t s = save_and_disable_interrupts();
-  if (!line_overflow && tx_free() >= line_len) {
-    for (uint32_t i = 0; i < line_len; ++i) {
-      tx_ring[tx_head] = line_buf[i];
-      tx_head = (tx_head + 1) & TX_RING_MASK;
-    }
-  } else {
-    dropped_lines++;
+// 排出対象ストリーム表 (priority 降順)。ローカル sys + register_tx_stream の外部登録。
+struct tx_src_t {
+  bt::handle_t h;
+  uint32_t prio;
+};
+static tx_src_t tx_srcs[8];
+static uint32_t tx_src_n = 0;
+// メッセージ途中のソース index。MORE 中はここを保持し、CAN_SEND_NOW を跨いでも同一
+// ストリームを継続排出する (他ストリームの割り込み禁止 = host のバイトパーサ保護)。
+static int tx_cur_src = -1;
+static uint32_t dropped_msgs = 0; // 容量不足で丸ごと捨てたメッセージ数 (デバッグ用)
+
+// priority 降順に挿入 (要素数は小さいので線形)。
+static void tx_src_insert(bt::handle_t h, uint32_t prio) {
+  if (tx_src_n >= (sizeof(tx_srcs) / sizeof(tx_srcs[0])))
+    return;
+  uint32_t i = tx_src_n++;
+  while (i > 0 && tx_srcs[i - 1].prio < prio) {
+    tx_srcs[i] = tx_srcs[i - 1];
+    --i;
   }
-  restore_interrupts(s);
-  line_len = 0;
-  line_overflow = false;
+  tx_srcs[i] = {h, prio};
 }
 
-// 内部生成の 1 行 (例: "RSSI=-55\n") をロック下でリングへ原子的に積む。
-// send_byte の行ステージング (line_buf) とは独立で、空きが無ければ丸ごと破棄。
+// 登録ストリームが全て空か (poll ループの can_send 補填判定用)。
+static bool tx_all_empty() {
+  for (uint32_t i = 0; i < tx_src_n; ++i)
+    if (!tx_srcs[i].h.empty())
+      return false;
+  return true;
+}
+
+// 内部生成の 1 行 (例: "RSSI=-55\n") を sys ストリームへ (丸ごと破棄型)。
 static void tx_emit_line(const char *s) {
-  uint32_t len = (uint32_t)strlen(s);
-  uint32_t st = save_and_disable_interrupts();
-  if (tx_free() >= len) {
-    for (uint32_t i = 0; i < len; ++i) {
-      tx_ring[tx_head] = (uint8_t)s[i];
-      tx_head = (tx_head + 1) & TX_RING_MASK;
-    }
-  } else {
-    dropped_lines++;
-  }
-  restore_interrupts(st);
+  if (!bt::push_msg(g_tx_sys.hdl(), (const uint8_t *)s, (uint32_t)strlen(s)))
+    dropped_msgs++;
 }
 
 // ---- 広告データ ------------------------------------------------------------
@@ -219,56 +212,54 @@ static void flush_tx() {
     return;
   if (!cmd_authorized)
     return;
-  if (tx_empty())
-    return;
 
-  uint16_t mtu = att_server_get_mtu(con_handle);
-  uint16_t max_payload = (mtu > 3) ? (mtu - 3) : 20; // ATT_NOTIFY = MTU-3
-
-  // MTU をなるべく使い切る (現構成は HCI_ACL_PAYLOAD_SIZE=251 → ATT MTU 247、
-  // notify ペイロード 244B = ちょうど 1 LL PDU。これ以上 = LL 251B 超の ACL
-  // 分割で CYW43 が固まる既知バグがあるため、btstack_config.h 側で意図的に
-  // 制限している。★この 1 notify ≤244B / 1 ACL = 1 LL PDU は厳守★)。
-  uint8_t chunk[512];
-  if (max_payload > sizeof(chunk))
-    max_payload = sizeof(chunk);
-
-  // クレジットが尽きる (att_server_notify が BUFFERS_FULL) か、リングが空に
-  // なるまで notification を連射する。
-  while (!tx_empty()) {
-    // ロック下で「覗くだけ」(tail は進めない)。成功してから消費する方式にし、
-    // エラー時の tail 巻き戻し (producer と競合しうる) を排除する。
-    uint16_t n = 0;
-    {
-      uint32_t s = save_and_disable_interrupts();
-      uint32_t t = tx_tail;
-      while (n < max_payload && t != tx_head) {
-        chunk[n++] = tx_ring[t];
-        t = (t + 1) & TX_RING_MASK;
+  // 1 frame ≤244B = ちょうど 1 LL PDU (producer 側で分割済み。★CYW43 wedge 回避の
+  // 不可侵規則★)。クレジットが尽きる (att_server_notify が BUFFERS_FULL) か送るものが
+  // 無くなるまで連射しつつ、以下 3 つを守る:
+  //   ・優先度: メッセージ境界では空でない最高優先度ストリームを選ぶ。
+  //   ・MORE/切替禁止: メッセージ途中 (tx_cur_src>=0) は同一ストリームを継続。
+  //   ・in-flight 上限: bulk は 1 イベント数発でメッセージ境界打ち切り (後着 ctrl 保護)。
+  uint32_t bulk_pdus = 0;
+  while (true) {
+    int src = tx_cur_src;
+    if (src < 0) { // メッセージ境界: 最高優先度の非空を選ぶ (priority 降順ソート済み)
+      for (uint32_t i = 0; i < tx_src_n; ++i) {
+        if (!tx_srcs[i].h.empty()) {
+          src = (int)i;
+          break;
+        }
       }
-      restore_interrupts(s);
+      if (src < 0)
+        break; // 全ストリーム空
     }
-    if (n == 0)
-      break;
-
-    // btstack 呼び出しはロック外で行う。
+    // 覗くだけ (rd は進めない)。notify 成功後に drop() で消費確定 = credit 切れで
+    // 送れなかったフレームを失わない。
+    bt::frame_t f;
+    if (!tx_srcs[src].h.peek(&f)) {
+      tx_cur_src = -1; // 競合で空になった (通常起きない) → 選び直し
+      continue;
+    }
+    const uint16_t n = f.len & bt::LEN_MASK;
+    const bool more = (f.len & bt::MORE) != 0;
     int err = att_server_notify(
         con_handle,
         ATT_CHARACTERISTIC_6E400003_B5A3_F393_E0A9_E50E24DCCA9E_01_VALUE_HANDLE,
-        chunk, n);
+        f.data, n);
     if (err != 0)
-      break; // クレジット切れ (等)。tail は進めていないので次の機会に再送。
-
-    // 送信成功した分だけ tail を進めて消費を確定する。
-    uint32_t s = save_and_disable_interrupts();
-    tx_tail = (tx_tail + n) & TX_RING_MASK;
-    restore_interrupts(s);
+      break; // クレジット切れ。drop していないので次機会に再送 (tx_cur_src 保持)。
+    tx_srcs[src].h.drop();
     ++tx_stat_pkts;
     tx_stat_bytes += n;
+    tx_cur_src = more ? src : -1; // MORE 中は同一ソース継続、完了で境界へ
+    // in-flight 上限: bulk はメッセージ境界でのみ打ち切る (メッセージ分割はしない)。
+    if (tx_srcs[src].prio <= bt::PRIO_BULK) {
+      if (++bulk_pdus >= BLE_TX_BULK_PDUS_PER_EVENT && !more)
+        break;
+    }
   }
 
   // まだ残っていれば次の送信機会を要求。
-  if (!tx_empty()) {
+  if (!tx_all_empty()) {
     can_send_requested = true;
     att_server_request_can_send_now_event(con_handle);
   }
@@ -304,7 +295,7 @@ static int att_write_callback(hci_con_handle_t connection_handle,
     con_handle = connection_handle;
     printf("[BLE_UART] notify %s\n",
            tx_notify_enabled ? "enabled" : "disabled");
-    if (tx_notify_enabled && !tx_empty() && !can_send_requested) {
+    if (tx_notify_enabled && !tx_all_empty() && !can_send_requested) {
       can_send_requested = true;
       att_server_request_can_send_now_event(con_handle);
     }
@@ -656,23 +647,18 @@ static void sm_packet_handler(uint8_t packet_type, uint16_t channel,
 // ===========================================================================
 //  エクスポートするメソッド
 // ===========================================================================
-// 1 バイトを行ステージングへ積む。'\n' で 1 行確定 → リングへコミット。
-// send_byte / send_buf 共通の本体。協調スケジューリングでは 1 行分の連続呼び出しの
-// 途中でスレッドが切り替わらないので、line_buf は実質その行専有になる。
-static void tx_stage_byte(uint8_t b) {
-  if (line_len < TX_LINE_MAX)
-    line_buf[line_len++] = b;
-  else
-    line_overflow = true; // 長すぎる行はコミット時に丸ごと破棄する
+// 互換用の send_byte 行ステージング。'\n' で 1 メッセージ確定 → sys ストリームへ。
+// (現行の飛行構成では TELEMETRY が自前ストリームを使うためこの経路は不使用。
+//  HELLO_WORLD ベンチ等の旧 send_byte 呼び出し元のためだけに残す。)
+static uint8_t compat_line[512];
+static uint32_t compat_len = 0;
 
-  if (b == (uint8_t)'\n') {
-    tx_commit_line();
-    // 通知が有効で送信要求がまだなら、次の送信機会を確保。
-    if (con_handle != HCI_CON_HANDLE_INVALID && tx_notify_enabled &&
-        !can_send_requested) {
-      can_send_requested = true;
-      att_server_request_can_send_now_event(con_handle);
-    }
+// notify が有効で要求未発なら次の送信機会を確保 (send_byte/send_buf 用)。
+static void request_send_if_needed() {
+  if (con_handle != HCI_CON_HANDLE_INVALID && tx_notify_enabled &&
+      !can_send_requested) {
+    can_send_requested = true;
+    att_server_request_can_send_now_event(con_handle);
   }
 }
 
@@ -682,10 +668,18 @@ static void method_send_byte(uint32_t _caller_obj_id,
   (void)_caller_obj_id;
   (void)_caller_thread_id;
   (void)_arg1;
-  tx_stage_byte((uint8_t)(byte & 0xFF));
+  uint8_t b = (uint8_t)(byte & 0xFF);
+  if (compat_len < sizeof(compat_line))
+    compat_line[compat_len++] = b;
+  if (b == (uint8_t)'\n') {
+    if (!bt::push_msg(g_tx_sys.hdl(), compat_line, compat_len))
+      dropped_msgs++;
+    compat_len = 0;
+    request_send_if_needed();
+  }
 }
 
-// arg0 = ble_tx_buf_t* 。バッファをまとめて積む(1 バイトずつ call_method しない)。
+// arg0 = ble_tx_buf_t* 。バッファをまとめて 1 メッセージとして sys ストリームへ積む。
 static void method_send_buf(uint32_t _caller_obj_id, uint32_t _caller_thread_id,
                             uint32_t ptr, uint32_t _arg1) {
   (void)_caller_obj_id;
@@ -696,12 +690,13 @@ static void method_send_buf(uint32_t _caller_obj_id, uint32_t _caller_thread_id,
   const ble_tx_buf_t *b = (const ble_tx_buf_t *)(uintptr_t)ptr;
   if (b->data == nullptr)
     return;
-  for (uint32_t i = 0; i < b->len; ++i)
-    tx_stage_byte(b->data[i]);
+  if (!bt::push_msg(g_tx_sys.hdl(), b->data, b->len))
+    dropped_msgs++;
+  request_send_if_needed();
 }
 
-// arg0 = uint32_t* out。TX リングの空きバイト数を書き込む (ブラスト等の
-// 供給側が「入る分だけ生成する」ためのバックプレッシャ問い合わせ)。
+// arg0 = uint32_t* out。sys ストリームの空きバイト数 (writable_slots × 244) を書く。
+// TELEMETRY のバルク backpressure は自前の bulk ストリームを直接見るのでここは使わない。
 static void method_get_tx_free(uint32_t _caller_obj_id,
                                uint32_t _caller_thread_id, uint32_t out_ptr,
                                uint32_t _arg1) {
@@ -710,7 +705,28 @@ static void method_get_tx_free(uint32_t _caller_obj_id,
   (void)_arg1;
   if (out_ptr == 0)
     return;
-  *(uint32_t *)(uintptr_t)out_ptr = tx_free();
+  *(uint32_t *)(uintptr_t)out_ptr = g_tx_sys.hdl().writable_slots() * bt::FRAME_MAX;
+}
+
+// arg0 = (stream_id << 16) | priority。外部 producer の TX ストリームを排出表へ登録。
+static void method_register_tx_stream(uint32_t _caller_obj_id,
+                                      uint32_t _caller_thread_id, uint32_t arg,
+                                      uint32_t _arg1) {
+  (void)_caller_obj_id;
+  (void)_caller_thread_id;
+  (void)_arg1;
+  uint32_t id = arg >> 16;
+  uint32_t prio = arg & 0xFFFFu;
+  bt::handle_t h = shizu::stream::open<bt::frame_t>(id);
+  if (!h.valid()) {
+    printf("[BLE_UART] register_tx_stream: id=%lu not found\n",
+           (unsigned long)id);
+    return;
+  }
+  shizu::stream::bind(id, shizu::stream::role::CONSUMER);
+  tx_src_insert(h, prio);
+  printf("[BLE_UART] tx stream registered: id=%lu prio=%lu\n",
+         (unsigned long)id, (unsigned long)prio);
 }
 
 static void method_set_rx_sink(uint32_t _caller_obj_id,
@@ -814,6 +830,12 @@ void BLE_UART_DRIVER::init() {
   export_method<method_send_buf>(BLE_UART_DRIVER::METHOD_IDs::send_buf);
   export_method<method_set_rx_sink>(BLE_UART_DRIVER::METHOD_IDs::set_rx_sink);
   export_method<method_get_tx_free>(BLE_UART_DRIVER::METHOD_IDs::get_tx_free);
+  export_method<method_register_tx_stream>(
+      BLE_UART_DRIVER::METHOD_IDs::register_tx_stream);
+
+  // BLE_UART 自身の内部行 (RSSI/status/互換 send) 用の sys ストリームを排出表へ。
+  // 外部ストリーム (TELEMETRY の bulk/ctrl) は register_tx_stream で後から加わる。
+  tx_src_insert(g_tx_sys.hdl(), bt::PRIO_SYS);
 
   // 2) BT スタック起動 (CYW43 チップ + btstack 全層 + 広告設定 + 電源 ON)
   bt_stack_bringup();
@@ -881,9 +903,10 @@ void BLE_UART_DRIVER::init() {
       }
     }
 
-    // notify が有効でリングに残りがあるのに要求が出ていなければ補填。
+    // notify が有効でストリームに残りがあるのに要求が出ていなければ補填 (producer の
+    // push は SVC を通らないので、この poll がアイドル→非空の cold start を拾う)。
     if (con_handle != HCI_CON_HANDLE_INVALID && tx_notify_enabled &&
-        !tx_empty() && !can_send_requested) {
+        !tx_all_empty() && !can_send_requested) {
       can_send_requested = true;
       att_server_request_can_send_now_event(con_handle);
     }

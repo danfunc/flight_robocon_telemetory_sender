@@ -115,6 +115,22 @@ static bool sched_pick_next(uint32_t self, uint32_t core, uint64_t now) {
   return false;
 }
 
+// 両コア共通のスケジューラ idle ループ (このファイルは既に namespace shizu 内)。
+// core0=thread0 / core1=idle スレッドが自分の tid で呼び、以後この 1 実装だけが両コアで
+// 回る (core1 専用 idle は廃止)。使用率会計: sched_pick_next が実務へ渡して戻ってきた
+// 経過を cpu_busy_us へ足す (guest は grant 期限/yield で、baton は相手の yield で戻る)。
+// スピンした分は足さない → 使用率 = Δcpu_busy_us/Δwall。
+[[noreturn]] void scheduler_idle_loop(uint32_t self) {
+  const uint32_t core = get_core_num();
+  while (1) {
+    uint64_t t0 = time_us_64();
+    if (sched_pick_next(self, core, t0))
+      cpu_busy_us[core] += time_us_64() - t0; // スケジューラが実務へ渡した時間
+    else
+      tight_loop_contents(); // 誰も runnable でない = idle (busy に足さない)
+  }
+}
+
 // カーネルオブジェクトの SVC ハンドラ。一般オブジェクトが発行した obj_api の
 // svc 0x00 はカーネル (svc_cpp_handler の else 枝) からここへトランポリンされる。
 //   r0..r3 = 呼び出し元が渡した引数 (r0 = obj_api::svc_num)
@@ -381,10 +397,10 @@ void kernel_object_main() {
   // 次の runnable スレッドへ切替え、誰も居なければ (全員 sleep 中/未生成) スピンする。
   // 最初の一手で IO_CONTROLLER(thr1) へ入り、以後は各スレッドの yield/sleep と協調して
   // 回る。sleep 中 (wake_at>now) のスレッドはスキップされる。
-  while (1) {
-    if (!sched_pick_next(0, get_core_num(), time_us_64()))
-      tight_loop_contents();
-  }
+  // スレッド 0 (カーネルオブジェクト) は以降このコアの共通スケジューラ idle ループへ。
+  // core1 の idle スレッドも同じ scheduler_idle_loop を回すので実装は 1 本 (core1 専用
+  // idle 廃止)。使用率はこのループの busy 会計から両コア一様に出る。
+  shizu::scheduler_idle_loop(0);
 
   while (1) {
     const uint32_t current_id = 0;

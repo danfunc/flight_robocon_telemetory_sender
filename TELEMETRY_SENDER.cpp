@@ -10,6 +10,7 @@
 //  へ置き換えたもの。受信側は HELLO_WORLD と同じ rx_sink
 //  機構でコマンドを受ける。
 // ===========================================================================
+#include <ble_tx_stream.hpp> // 優先度付き TX ストリーム (bulk/ctrl)
 #include <call_method.hpp>
 #include <cstdint>
 #include <cstdio>
@@ -17,6 +18,7 @@
 #include <export_method.hpp>
 #include <obj_api.hpp>
 #include <object_headers/BLE_UART_DRIVER.hpp>
+#include <stream.hpp>
 #include <object_headers/BME280_DRIVER.hpp>
 #include <object_headers/BNO055_DRIVER.hpp>
 #include <object_headers/FLIGHT_CONTROLLER.hpp>
@@ -66,23 +68,36 @@ enum Elev { EL_NEUTRAL = 0, EL_UP = 1, EL_DOWN = 2 };
 // ===========================================================================
 //  BLE 送信ヘルパー
 // ===========================================================================
+// TX ストリーム (owner=TELEMETRY)。bulk=通常テレメトリ(低優先)、ctrl=ping/stats
+// 応答(高優先)。全 LOSSLESS = 満杯で「メッセージ丸ごと破棄 + ドロップカウンタ」。
+// BLE_UART が register_tx_stream 経由で consumer として優先度排出する。
+static stream::storage<ble_tx::frame_t, 32, stream::LOSSLESS> g_tx_bulk;
+static stream::storage<ble_tx::frame_t, 8, stream::LOSSLESS> g_tx_ctrl;
+static uint32_t tx_drop_bulk = 0, tx_drop_ctrl = 0;
+
+// 通常テレメトリ (バルク)。SVC を通らず push するだけ (BLE_UART poll が排出)。
 static void ble_send(const char *s, int len) {
   if (len <= 0)
     return;
-  // バッファのアドレス+長さを 1 個のポインタで渡して一括送信(1 バイトずつ
-  // call_method する代わり)。記述子 b はこの同期呼び出しの間だけ有効ならよい。
-  ble_tx_buf_t b = {(const uint8_t *)s, (uint32_t)len};
-  call_method(object_ids::BLE_UART_DRIVER, BLE_UART_DRIVER::METHOD_IDs::send_buf,
-              (uint32_t)(uintptr_t)&b);
+  auto h = g_tx_bulk.hdl();
+  if (!ble_tx::push_msg(h, (const uint8_t *)s, (uint32_t)len))
+    tx_drop_bulk++;
 }
 
-// BLE TX リングの空きバイト数を問い合わせる (ブラストのバックプレッシャ用)。
+// 制御応答 (ping/stats)。ctrl ストリーム = 最優先。bulk を追い越して先に排出される。
+static void ble_send_prio(const char *s, int len) {
+  if (len <= 0)
+    return;
+  auto h = g_tx_ctrl.hdl();
+  if (!ble_tx::push_msg(h, (const uint8_t *)s, (uint32_t)len))
+    tx_drop_ctrl++;
+}
+
+// bulk ストリームの空きバイト数 (ブラストのバックプレッシャ用)。自前ストリームを
+// 直接見る (旧: BLE_UART へ call_method して get_tx_free)。
 static uint32_t ble_tx_free() {
-  uint32_t v = 0;
-  call_method(object_ids::BLE_UART_DRIVER,
-              BLE_UART_DRIVER::METHOD_IDs::get_tx_free,
-              (uint32_t)(uintptr_t)&v);
-  return v;
+  auto h = g_tx_bulk.hdl();
+  return h.writable_slots() * ble_tx::FRAME_MAX;
 }
 
 // スループット試験中はセンサのサンプリングを止め、I2C/融合に食われる時間を帯域へ
@@ -192,9 +207,9 @@ static void handle_line() {
     }
     break;
   }
-  case 'P': { // ping エコー
-    ble_send(rxline, (int)rxlen);
-    ble_send("\r\n", 2);
+  case 'P': { // ping エコー (制御応答 → 優先ストリーム。bulk を追い越して即返す)
+    ble_send_prio(rxline, (int)rxlen);
+    ble_send_prio("\r\n", 2);
     break;
   }
   case 'R': { // 送信周期変更: "R<ms>" (10..1000ms)
@@ -237,11 +252,12 @@ static void handle_line() {
     printf("[TELEMETRY] blast start %lu s\n", (unsigned long)secs);
     break;
   }
-  case 'S': { // 統計返信
-    char tmp[48];
-    int n =
-        snprintf(tmp, sizeof(tmp), "STATS rx=%lu\r\n", (unsigned long)rx_total);
-    ble_send(tmp, n);
+  case 'S': { // 統計返信 (制御応答 → 優先ストリーム)
+    char tmp[64];
+    int n = snprintf(tmp, sizeof(tmp), "STATS rx=%lu drop=%lu/%lu\r\n",
+                     (unsigned long)rx_total, (unsigned long)tx_drop_ctrl,
+                     (unsigned long)tx_drop_bulk);
+    ble_send_prio(tmp, n);
     break;
   }
   case 'F': { // 送信フォーマット: F1=バイナリ(既定), F0=CSV テキスト
@@ -477,7 +493,9 @@ static_assert(sizeof(batch_sample_t) == 54, "batch_sample_t must be 54 bytes");
 // 1 パケットで収まるサイズ) までが安全圏 (btstack_config.h の
 // HCI_ACL_PAYLOAD_SIZE 参照。512B notify は切断/再接続で BT コアが固まる既知
 // バグを踏む)。17+4*54+2=235B ≤ 244B で、スタッフィング少なめなら 1 フレーム
-// = 1 notify に乗る。最悪 2 倍スタッフでも 2*235+2=472 < TX_LINE_MAX(1024)。
+// = 1 notify に乗る。最悪 2 倍スタッフの 2*235+2=472B は push_msg が 244B 境界で
+// 2 フレーム (MORE 連結) に分割し、consumer が連続排出するので host 側で 1 メッセージ
+// に復元される。
 static constexpr int BATCH_MAX = 4;
 // バッチを送出する最大間隔。これを超えたら満杯でなくても flush する。
 static constexpr uint64_t BATCH_FLUSH_US = 50000; // 50ms
@@ -680,6 +698,20 @@ void TELEMETRY_SENDER::main() {
                   TELEMETRY_SENDER::METHOD_IDs::rx_byte;
   call_method(object_ids::BLE_UART_DRIVER,
               BLE_UART_DRIVER::METHOD_IDs::set_rx_sink, sink);
+
+  // TX ストリーム (bulk/ctrl) を作成・PRODUCER bind し、BLE_UART の優先度付き排出表へ
+  // 登録する。BLE_UART は先に async_call 済み (methods export 済み) なので、この
+  // call_method 順で register が届く (set_rx_sink と同じ順序保証)。
+  stream::create(ble_tx::STREAM_BULK, &g_tx_bulk.desc);
+  stream::create(ble_tx::STREAM_CTRL, &g_tx_ctrl.desc);
+  stream::bind(ble_tx::STREAM_BULK, stream::role::PRODUCER);
+  stream::bind(ble_tx::STREAM_CTRL, stream::role::PRODUCER);
+  call_method(object_ids::BLE_UART_DRIVER,
+              BLE_UART_DRIVER::METHOD_IDs::register_tx_stream,
+              (ble_tx::STREAM_BULK << 16) | ble_tx::PRIO_BULK);
+  call_method(object_ids::BLE_UART_DRIVER,
+              BLE_UART_DRIVER::METHOD_IDs::register_tx_stream,
+              (ble_tx::STREAM_CTRL << 16) | ble_tx::PRIO_CTRL);
 
   // センサ/較正の push を受け取るハンドラを公開し、各ドライバへ sink を登録する
   // (以後 read_latest のポーリングは行わず、push されたサンプルで融合する)。

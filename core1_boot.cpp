@@ -34,8 +34,10 @@ namespace {
 constexpr uint32_t CORE1_IDLE_TID = 100;
 
 // idle: init_core1 が core1 の初期スレッドとして走らせる。起動直後の 1 回の yield で
-// READY な SENSOR_IO (affinity=core1) を claim させる。SENSOR_IO は以後 yield しない
-// ので、以降 core1 は SENSOR_IO 専有になる (idle は二度と走らない bootstrap)。
+// READY な SENSOR_IO (affinity=core1) を claim させる。SENSOR_IO はベアメタルで svc を
+// 使わない (以後 yield しない) ので、以降 core1 は SENSOR_IO 専有になる (idle は二度と
+// 走らない bootstrap)。共通 scheduler_idle_loop は core1 では回さない — SENSOR_IO が
+// スケジューラへ戻らないため。使用率は SENSOR_IO ループが cpu_busy_us[1] へ直接書く。
 [[noreturn]] void core1_idle_main() {
   while (true) {
     obj_api::yield();
@@ -94,7 +96,7 @@ void core1_kernel_launch() {
   idle.state = thread_t::state_t::RUNNING;
   cpu_manager::current_thread_id[1] = CORE1_IDLE_TID; // friend アクセス
 
-  // PSP へ切替え、Thread モードで PSP を使う (SPSEL=1) → idle ループへ。
+  // PSP へ切替え、Thread モードで PSP を使う (SPSEL=1) → 共通スケジューラ idle ループへ。
   uintptr_t CONTROL_MASK = 1u << 1;
   __asm volatile("MSR PSP,%[psp];"
                  "MSR CONTROL,%[ctl];"

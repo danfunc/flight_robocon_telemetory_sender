@@ -25,6 +25,7 @@
 #include <cstring>
 #include <hardware/timer.h> // timer_hw (now_us の直接レジスタ読み)
 #include <i2c_bus.hpp>
+#include <kernel.hpp> // cpu_busy_us (svc を使わず直接書く使用率計測)
 #include <pico/multicore.h>
 #include <pico/platform.h> // __not_in_flash_func
 #include <pico/time.h>
@@ -439,9 +440,16 @@ bool __not_in_flash_func(handle_calib_sideband)() {
   bool prev_paused_bno = false, prev_paused_bme = false;
 
   while (true) {
+    // 使用率計測: このイテレーションで実 I/O 作業 (センサ読み/較正/status) をしたか。
+    // したイテレーションの経過を core1 の busy として計上する (作業無し = grid 締切
+    // 待ちの高速ポーリング = idle)。この TU は svc 禁止なので cpu_busy_us へ直接書く。
+    const uint64_t t_iter = now_us();
+    bool did_work = false;
     handle_cmds();
-    if (handle_calib_sideband())
+    if (handle_calib_sideband()) {
       next_bno = now_us(); // モード切替 (~100ms) 後はグリッド取り直し
+      did_work = true;
+    }
 
     // 再開時はグリッドを現在へ取り直す (溜まった締切の連射を防ぐ)。
     if (prev_paused_bno && !g_paused_bno)
@@ -454,6 +462,7 @@ bool __not_in_flash_func(handle_calib_sideband)() {
     // ---- BNO055: 100Hz 絶対グリッド (NDOF フュージョン出力の上限) ----
     now = now_us();
     if (g_bno_ok && !g_paused_bno && (int64_t)(now - next_bno) >= 0) {
+      did_work = true;
       int16_t r9[9];
       uint32_t t = (uint32_t)now;
       uint8_t flags = ((int64_t)(now - next_bno) > 2000) ? FLAG_OFF_GRID : 0;
@@ -503,6 +512,7 @@ bool __not_in_flash_func(handle_calib_sideband)() {
     // ---- BME280: ~21Hz (気圧 x16 oversampling の変換時間が律速) ----
     now = now_us();
     if (g_bme_ok && !g_paused_bme && (int64_t)(now - next_bme) >= 0) {
+      did_work = true;
       uint32_t pa;
       int32_t cc;
       if (bme_read(&pa, &cc)) {
@@ -551,6 +561,7 @@ bool __not_in_flash_func(handle_calib_sideband)() {
     // ---- STATUS: 1Hz (calib byte はここでだけ読む: 1B 独立トランザクション) ----
     now = now_us();
     if ((int64_t)(now - next_status) >= 0) {
+      did_work = true;
       // 失敗が続いている間は calib 読みも省く (無駄なタイムアウトを足さない)。
       if (g_bno_ok && !g_paused_bno && fail_streak < 5) {
         uint8_t c;
@@ -585,7 +596,12 @@ bool __not_in_flash_func(handle_calib_sideband)() {
       if ((int64_t)(now - next_status) > 0)
         next_status = now + 1000000;
     }
-    // 締切ポーリングのタイトループ (core1 は I/O 専有なので 100% 回してよい)。
+    // 締切ポーリングのタイトループ (core1 は I/O 専有なので 100% 回してよい。この TU の
+    // 絶対制約により sleep/yield=svc は使わない — 待ちは busy-poll のまま)。
+    // 使用率: 作業したイテレーションの経過を busy に足す (grid 締切待ちの高速空回りは
+    // 足さない)。scheduler が回らない core1 でも svc 無しで使用率を得る。
+    if (did_work)
+      cpu_busy_us[1] += now_us() - t_iter;
   }
 }
 

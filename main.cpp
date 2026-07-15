@@ -82,6 +82,26 @@ static bool beacon_cb(repeating_timer_t *) {
   printf("[BEACON] thr=%lu obj=%lu pc=%08lx lr=%08lx ble_poll=%lu evt=%lu\n",
          (unsigned long)running_thread, (unsigned long)running_obj, f[6], f[5],
          (unsigned long)shizu::ble_dbg_poll, (unsigned long)shizu::ble_dbg_evt);
+
+  // per-core CPU 使用率 = Δcpu_busy_us/Δwall (この 5s 窓)。cpu_busy_us は各コアの共通
+  // scheduler_idle_loop が「スケジューラが実務へ渡して戻ってきた時間」を足したもの。
+  static uint64_t prev_busy[2] = {0, 0};
+  static uint64_t prev_t = 0;
+  uint64_t now64 = time_us_64();
+  if (prev_t != 0) {
+    uint64_t wall = now64 - prev_t;
+    for (int c = 0; c < 2; ++c) {
+      uint64_t busy = shizu::cpu_busy_us[c];
+      uint64_t d_busy = busy - prev_busy[c];
+      if (d_busy > wall)
+        d_busy = wall; // クランプ (境界のズレ対策)
+      uint32_t util_x10 = wall ? (uint32_t)(1000ull * d_busy / wall) : 0;
+      printf("[CPU] core%d util=%lu.%lu%%\n", c, (unsigned long)(util_x10 / 10),
+             (unsigned long)(util_x10 % 10));
+      prev_busy[c] = busy;
+    }
+  }
+  prev_t = now64;
   return true;
 }
 
