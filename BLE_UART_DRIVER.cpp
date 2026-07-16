@@ -90,6 +90,13 @@ static uint32_t rx_sink_method_id = 0;
 // 呼び出しはロック外)。これにより ping 応答(ctrl)がバルクテレメトリを追い越せる。
 namespace bt = shizu::ble_tx;
 
+namespace ble_tx { // ctrl レイテンシ計装の実体 (このファイルは namespace shizu 内。
+                   // 宣言は ble_tx_stream.hpp)
+volatile uint64_t ctrl_enq_us = 0;
+volatile uint32_t ctrl_lat_last_us = 0;
+volatile uint32_t ctrl_lat_max_us = 0;
+} // namespace ble_tx
+
 // 1 CAN_SEND_NOW で連続排出する bulk PDU の上限。コントローラへ渡した PDU は FIFO
 // なので、bulk を無制限に連射すると後着の ctrl フレームが次 CI 以降へ押される。
 // bulk をイベントあたり数発に締めることで後着 ctrl の待ちを ~1 CI に抑える (実測で調整)。
@@ -250,6 +257,15 @@ static void flush_tx() {
     tx_srcs[src].h.drop();
     ++tx_stat_pkts;
     tx_stat_bytes += n;
+    // ctrl レイテンシ計装: ctrl 優先度のフレームを notify に載せた時点で
+    // 「push からの device 内滞在時間」を確定する (ping >100ms の切り分け用)。
+    if (tx_srcs[src].prio >= bt::PRIO_CTRL && bt::ctrl_enq_us != 0) {
+      uint32_t lat = (uint32_t)(time_us_64() - bt::ctrl_enq_us);
+      bt::ctrl_enq_us = 0;
+      bt::ctrl_lat_last_us = lat;
+      if (lat > bt::ctrl_lat_max_us)
+        bt::ctrl_lat_max_us = lat;
+    }
     tx_cur_src = more ? src : -1; // MORE 中は同一ソース継続、完了で境界へ
     // in-flight 上限: bulk はメッセージ境界でのみ打ち切る (メッセージ分割はしない)。
     if (tx_srcs[src].prio <= bt::PRIO_BULK) {
@@ -876,6 +892,14 @@ void BLE_UART_DRIVER::init() {
         tx_stat_pkts = 0;
         tx_stat_csn = 0;
         tx_stat_bytes = 0;
+      }
+      // ctrl (ping 応答等) の device 内滞在時間。RTT>100ms の切り分け: この値が
+      // 小さい (≲CI=15ms) のに GUI の RTT が跳ねるなら犯人は host 側で確定。
+      if (bt::ctrl_lat_max_us != 0) {
+        printf("[BLE_UART] ctrl_lat 1s: last=%luus max=%luus\n",
+               (unsigned long)bt::ctrl_lat_last_us,
+               (unsigned long)bt::ctrl_lat_max_us);
+        bt::ctrl_lat_max_us = 0;
       }
       next_tx_stat = make_timeout_time_ms(1000);
     }

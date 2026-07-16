@@ -25,6 +25,7 @@ enum struct object_ids : uint32_t {
   STREAM_TEST=21,       // ストリーム自己テスト: producer/consumer スレッド対の所属先。
   SENSOR_IO=22,         // core1 ピン留めのセンサ I/O スレッド (旧 core1_io ベアメタル)。
   GRANT_TEST=23,        // 時限実行権移譲 (run_for) 自己テスト: driver/worker 群の所属先。
+  SMP_STRESS=24,        // 2 コア SVC ピンポンストレス: worker/reporter 群の所属先。
 };
 
 #endif // SHIZU_OBJECT_ID_HPP

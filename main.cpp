@@ -5,6 +5,7 @@
 #include <hardware/exception.h>
 #include <hardware/gpio.h>
 #include <core_ring.hpp> // core1_io_launch (センサ I/O の core1 分離)
+#include <panic_ring.hpp> // panic の noinit RAM リング (boot/beacon で印字)
 #include <pico/stdio.h>
 #include <pico/stdlib.h>
 #include <pico/time.h>
@@ -68,6 +69,10 @@ namespace shizu {
 extern volatile uint32_t ble_dbg_poll, ble_dbg_evt;
 }
 static bool beacon_cb(repeating_timer_t *) {
+  // panic リング監視: どちらかのコアが panic していたらメッセージを印字する
+  // (panic した core1 自身は stdio に書けないが、core0 のこの IRQ は生きている)。
+  shizu::panic_ring_poll_report();
+
   uint32_t running_thread = 0xFFFFFFFF, running_obj = 0xFFFFFFFF;
   for (uint32_t i = 0; i < 128; ++i) {
     if (shizu::thread_table[i].state == shizu::thread_t::state_t::RUNNING) {
@@ -109,6 +114,8 @@ int main(int argc, char const *argv[]) {
   stdio_init_all();
   exception_set_exclusive_handler(HARDFAULT_EXCEPTION, hardfault_handler);
   sleep_ms(2000);
+  // 前回実行の panic 残骸 (noinit RAM はリセットを跨ぐ) があれば印字してクリア。
+  shizu::panic_ring_boot_report();
   // 生存ビーコン開始 (5s 周期、タイマ IRQ 駆動なのでスレッドが固まっても出続ける)。
   static repeating_timer_t beacon_timer;
   add_repeating_timer_ms(-5000, beacon_cb, nullptr, &beacon_timer);

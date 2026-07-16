@@ -1,18 +1,20 @@
 // ===========================================================================
-//  core1_io — core1 ベアメタル センサ I/O ループ (設計書 §5, step2: NDOF のまま)
+//  core1_io — core1 センサ I/O ループ (Shizuku 協調スレッド化済み)
 // ===========================================================================
-//  I2C バスと BNO055/BME280 を core1 が専有し、生の整数サンプルをコア間リング
-//  (include/core_ring.hpp) へ押す。core0 の Shizuku スケジューラは I2C の停滞に
-//  一切影響されなくなる。
+//  I2C バスと BNO055/BME280 を core1 が優先的に使い、生の整数サンプルをコア間
+//  リング (include/core_ring.hpp) へ押す。core0 の Shizuku スケジューラは I2C の
+//  停滞に影響されない。仕事の無い間は次のセンサ締切まで sleep して core1 の共通
+//  スケジューラ (scheduler_idle_loop) へ CPU を返す (旧: ベアメタル busy-poll 専有)。
 //
-//  【この TU の絶対制約】
-//  ・Shizuku API (svc / obj_api / yield) と printf を使わない。異常はカウンタで
-//    数えて 1Hz の STATUS レコードに載せる。
+//  【この TU の制約】
+//  ・printf を使わない。異常はカウンタで数えて 1Hz の STATUS レコードに載せる。
 //  ・float を一切使わない (整数のみ)。生 int16 LSB のままリングへ push し、
-//    /16, /100 の float 換算は core0 側で行う。これにより core1 の CPACR/FPU
-//    問題 (per-core 初期化の有無) を丸ごと回避する。ビルド後に objdump で
-//    v*.f32 が 0 本であることを確認すること。
-//  ・待ちは busy_wait/グリッド比較のみ (yield は存在しない)。
+//    /16, /100 の float 換算は core0 側で行う。ビルド後に objdump で v*.f32 が
+//    0 本であることを確認すること。
+//  ・Shizuku API は obj_api::sleep_us のみ許可 (SVC 直接処理系 = 2 コア安全)。
+//    method_map/memory_map (std::map) に触る API (call_method/EXPORT 等) は
+//    フラット表化まで core1 から呼ばない。I2C バースト中は sleep しない
+//    (トランザクションは常に完走させてから CPU を返す)。
 //
 //  現行 BNO055_DRIVER.cpp から移植した整数ロジック:
 //    - 0xFFFF 破損 ch の据え置き (held_raw) + 1 回読み直し
@@ -25,7 +27,8 @@
 #include <cstring>
 #include <hardware/timer.h> // timer_hw (now_us の直接レジスタ読み)
 #include <i2c_bus.hpp>
-#include <kernel.hpp> // cpu_busy_us (svc を使わず直接書く使用率計測)
+#include <kernel.hpp>
+#include <obj_api.hpp> // sleep_us (仕事無し時に core1 の共通スケジューラへ CPU を返す)
 #include <pico/multicore.h>
 #include <pico/platform.h> // __not_in_flash_func
 #include <pico/time.h>
@@ -440,10 +443,8 @@ bool __not_in_flash_func(handle_calib_sideband)() {
   bool prev_paused_bno = false, prev_paused_bme = false;
 
   while (true) {
-    // 使用率計測: このイテレーションで実 I/O 作業 (センサ読み/較正/status) をしたか。
-    // したイテレーションの経過を core1 の busy として計上する (作業無し = grid 締切
-    // 待ちの高速ポーリング = idle)。この TU は svc 禁止なので cpu_busy_us へ直接書く。
-    const uint64_t t_iter = now_us();
+    // このイテレーションで実 I/O 作業 (センサ読み/較正/status) をしたか。
+    // しなければ末尾で次の締切まで sleep してスケジューラへ CPU を返す。
     bool did_work = false;
     handle_cmds();
     if (handle_calib_sideband()) {
@@ -596,12 +597,26 @@ bool __not_in_flash_func(handle_calib_sideband)() {
       if ((int64_t)(now - next_status) > 0)
         next_status = now + 1000000;
     }
-    // 締切ポーリングのタイトループ (core1 は I/O 専有なので 100% 回してよい。この TU の
-    // 絶対制約により sleep/yield=svc は使わない — 待ちは busy-poll のまま)。
-    // 使用率: 作業したイテレーションの経過を busy に足す (grid 締切待ちの高速空回りは
-    // 足さない)。scheduler が回らない core1 でも svc 無しで使用率を得る。
-    if (did_work)
-      cpu_busy_us[1] += now_us() - t_iter;
+    // 仕事無し = grid 締切待ち。次の適用可能な締切まで sleep して core1 の共通
+    // スケジューラへ CPU を返す (使用率はスケジューラの busy 会計から出る)。
+    // 上限 1ms はコマンド応答性の安全網。I2C バースト中はここへ来ない (did_work=true)
+    // ので、トランザクションが sleep で切られることはない。sleep_us は SVC 直接処理
+    // 系のみ触る 2 コア安全経路 (トランポリン→SLEEP_US→バトン。std::map/malloc 不使用)。
+    if (!did_work) {
+      const uint64_t now2 = now_us();
+      uint64_t wake = now2 + 1000;
+      if (g_bno_ok && !g_paused_bno && (int64_t)(next_bno - now2) > 0 &&
+          next_bno < wake)
+        wake = next_bno;
+      if (g_bme_ok && !g_paused_bme && (int64_t)(next_bme - now2) > 0 &&
+          next_bme < wake)
+        wake = next_bme;
+      if ((int64_t)(next_status - now2) > 0 && next_status < wake)
+        wake = next_status;
+      const int64_t dt = (int64_t)(wake - now2);
+      if (dt > 0)
+        obj_api::sleep_us((uint32_t)dt);
+    }
   }
 }
 

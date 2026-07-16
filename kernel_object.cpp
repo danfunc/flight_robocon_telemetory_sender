@@ -2,7 +2,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <kernel_object.hpp>
-#include <map>
 #include <obj_api.hpp>
 #include <object_headers/IO_CONTROLLER.hpp>
 #include <object_id.hpp>
@@ -50,8 +49,33 @@ struct method_descriptor_t {
   uint32_t method_id;
 };
 
-std::map<uint32_t, std::map<uint32_t, method_descriptor_t>> method_map;
-std::map<uint32_t, std::map<uint32_t, uint32_t>> memory_map;
+// ---- md / obj-memory の固定フラット表 (旧: std::map) -----------------------
+// std::map は挿入で malloc し木をリバランスする。SVC ハンドラ (トランポリン先) は
+// スレッドモードとはいえ、(i) 2 コア同時進入でヒープ/木を壊し得る、(ii) PendSV
+// プリエンプトに対して非再入、(iii) malloc mutex の owner がコア番号でスレッドを
+// 区別しない — の 3 点で SMP 化と両立しない (Fable レビュー)。object 空間が [128]
+// 固定なのだから表も固定配列に焼き、SVC 経路から malloc を根絶する。
+// スロット幅 16 は現行アプリの使用数 (md/メモリとも数個) の 4 倍マージン。
+// ゼロ初期化 = 旧 map の operator[] デフォルト {0} と同じ既定値挙動。
+constexpr uint32_t MD_SLOTS = 16;  // オブジェクトごとの method descriptor 数
+constexpr uint32_t MEM_SLOTS = 16; // オブジェクトごとの共有メモリ語数
+static method_descriptor_t md_table[128][MD_SLOTS];
+static uint32_t obj_mem[128][MEM_SLOTS];
+// 範囲外アクセスは黙って捨てず数える (STATS 等で異常を検知できるように)。
+static uint32_t g_flat_oob = 0;
+
+static inline bool md_ok(uint32_t obj, uint32_t slot) {
+  if (obj < 128 && slot < MD_SLOTS)
+    return true;
+  ++g_flat_oob;
+  return false;
+}
+static inline bool mem_ok(uint32_t obj, uint32_t slot) {
+  if (obj < 128 && slot < MEM_SLOTS)
+    return true;
+  ++g_flat_oob;
+  return false;
+}
 
 // ---- ストリーム登録表 (制御プレーン) ---------------------------------------
 // 固定配列 (SVC パスは脱 malloc 方針。std::map は使わない)。SMP では
@@ -135,7 +159,7 @@ static bool sched_pick_next(uint32_t self, uint32_t core, uint64_t now) {
 // svc 0x00 はカーネル (svc_cpp_handler の else 枝) からここへトランポリンされる。
 //   r0..r3 = 呼び出し元が渡した引数 (r0 = obj_api::svc_num)
 //   r5     = 呼び出し元オブジェクト ID,  r6 = 呼び出し元スレッド ID
-// メモリ API (SET/GET_OBJ_MEMORY) は memory_map[呼び出し元 obj][slot] に格納するため、
+// メモリ API (SET/GET_OBJ_MEMORY) は obj_mem[呼び出し元 obj][slot] に格納するため、
 // オブジェクトごとに名前空間が分かれる (他オブジェクトのメモリは直接読めない)。
 // よってオブジェクト間のデータ受け渡しは「メソッド呼び出し + ポインタ渡し」で行う。
 uint32_t kernel_obj_svc_handler(uint32_t r0, uint32_t r1, uint32_t r2,
@@ -149,7 +173,8 @@ uint32_t kernel_obj_svc_handler(uint32_t r0, uint32_t r1, uint32_t r2,
     svc<(uint32_t)shizu::kernel_object_svc_num::METHOD_EXIT>(0, 0, 0, 0, 0);
   }
   if (r4 == 255) {
-    method_map[r0][r1] = {r2, r3}; // 要改修
+    if (md_ok(r0, r1))
+      md_table[r0][r1] = {r2, r3}; // 要改修
     svc<(uint32_t)shizu::kernel_object_svc_num::METHOD_EXIT>(0, 0, 0, 0, 0);
   }
 
@@ -250,13 +275,14 @@ uint32_t kernel_obj_svc_handler(uint32_t r0, uint32_t r1, uint32_t r2,
     break;
   }
   case shizu::obj_api::svc_num::CALL_METHOD_VIA_MD: {
-    ::svc<(uint32_t)shizu::kernel_object_svc_num::METHOD_CALL>(
-        method_map[r1][r2].object_id, method_map[r1][r2].method_id, r3, 0);
+    if (md_ok(r1, r2))
+      ::svc<(uint32_t)shizu::kernel_object_svc_num::METHOD_CALL>(
+          md_table[r1][r2].object_id, md_table[r1][r2].method_id, r3, 0);
     break;
   }
   case shizu::obj_api::svc_num::SET_OBJECT_MD: {
-
-    method_map[r1][r2] = {r3, 0}; // 要改修
+    if (md_ok(r1, r2))
+      md_table[r1][r2] = {r3, 0}; // 要改修
     break;
   }
   case shizu::obj_api::svc_num::GET_CURRENT_OBJ_ID: {
@@ -264,12 +290,13 @@ uint32_t kernel_obj_svc_handler(uint32_t r0, uint32_t r1, uint32_t r2,
     break;
   }
   case shizu::obj_api::svc_num::SET_OBJ_MEMORY: {
-    memory_map[r5][r1] = r2;
+    if (mem_ok(r5, r1))
+      obj_mem[r5][r1] = r2;
     break;
   }
   case shizu::obj_api::svc_num::GET_OBJ_MEMORY: {
-    svc<(uint32_t)shizu::kernel_object_svc_num::METHOD_EXIT>(memory_map[r5][r1],
-                                                             0, 0, 0, 0);
+    svc<(uint32_t)shizu::kernel_object_svc_num::METHOD_EXIT>(
+        mem_ok(r5, r1) ? obj_mem[r5][r1] : 0, 0, 0, 0, 0);
     break;
   }
   // ---- ストリーム制御プレーン (include/stream.hpp)
@@ -369,8 +396,6 @@ __attribute__((naked, aligned(4))) void wrapper() {
 }
 
 void kernel_object_main() {
-  method_map = {};
-  memory_map = {};
   svc<(uint32_t)shizu::kernel_object_svc_num::SET_SVC_HANDLER>(
       (uint32_t)(&shizu::wrapper<kernel_obj_svc_handler>), 0, 0, 0, 0);
   // オブジェクト起動 = create_object(id) + async_call(id, main)。thread 番号は
@@ -392,6 +417,10 @@ void kernel_object_main() {
 #if SHIZU_GRANT_SELFTEST
   // 時限実行権移譲 (run_for/GRANT_CPU) の end-to-end 自己テスト。
   shizu::grant_selftest_launch();
+#endif
+#if SHIZU_SMP_STRESS
+  // カーネル SVC 経路の 2 コア同時進入ストレス (SLEEP/SWITCH ピンポン + 跨コア移動)。
+  shizu::smp_stress_launch();
 #endif
   // スレッド 0 (カーネルオブジェクト) は以降 round-robin のアイドル/スケジューラ心拍。
   // 次の runnable スレッドへ切替え、誰も居なければ (全員 sleep 中/未生成) スピンする。

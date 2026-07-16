@@ -2,19 +2,24 @@
 //  core1_boot — core1 を Shizuku カーネルとして起動し、センサ I/O を SENSOR_IO
 //               スレッド (core1 ピン留め) として走らせる
 // ===========================================================================
-//  init_core1 が core1 を idle スレッドとして立ち上げ、idle が起動直後の 1 回の
-//  yield で SENSOR_IO (affinity=core1) を claim する。SENSOR_IO (= 旧 core1_io の
-//  センサ I/O ループ) は以後 yield しないので core1 を専有する。旧ベアメタル core1_io
-//  と等価だが、Shizuku のスケジューラ/claim を通って core1 に載る点だけが違う。
-//  既存スレッドは全て affinity=core0 なので core1 は触らない (AMP をアフィニティで実現)。
+//  init_core1 が core1 を idle スレッド (カーネルオブジェクトのスレッド) として
+//  立ち上げ、core0 の thread0 と同じ共通 scheduler_idle_loop を回す。SENSOR_IO
+//  (affinity=core1) は仕事の無い間、次のセンサ締切まで sleep してこのスケジューラへ
+//  CPU を返す協調スレッド (旧: ベアメタル専有ループ)。センサ優先はそのままに、
+//  余剰時間を将来 core1 affinity の他スレッドへ貸せる形 (AMP → 優先的占有)。
 //
 //  【要点】
-//  ・SENSOR_IO は yield/SVC を呼ばないので、YIELD/claim の共有経路 (method_map /
-//    memory_map / stream_table) に一切触れず、core0 と競合しない。stream への push は
-//    SVC を通らないライブラリなので core1 から直接叩ける。
+//  ・idle は必ず object 0 (カーネルオブジェクト) のスレッドにする。scheduler_idle_loop
+//    は SWITCH_THREAD/GRANT_CPU を生 svc で発行するため、一般オブジェクトのスレッド
+//    から呼ぶとトランポリンへ誤ルーティングされて panic する (init_core1 内コメント)。
+//  ・SENSOR_IO の sleep/yield は SVC トランポリン経由 = カーネル SVC 経路を core1 も
+//    通る。SVC 直接処理 (SWITCH/SLEEP/claim) は per-core 状態 + CAS で 2 コア安全。
+//    method_map/memory_map (std::map) に触る API は core1 からは呼ばないこと (フラット
+//    表化までの暫定規律)。
 //  ・RP2350 は core1 も core0 の RAM ベクタテーブルを共有する (pico_multicore が
 //    scb_hw->vtor を core1 へ渡す) ので、SVC ハンドラの再登録は不要 (再登録すると
-//    exclusive ハンドラ二重登録で panic する)。FPU (CPACR) だけ保険で立てる。
+//    exclusive ハンドラ二重登録で panic する)。FPU (CPACR) と例外優先度 (SHPR, banked)
+//    は per-core なので init_core1 で設定する。
 // ===========================================================================
 #include <core_ring.hpp> // sensor_io_main (SENSOR_IO スレッド entry)
 #include <cstdint>
@@ -33,18 +38,6 @@ namespace {
 // 予約する。async_call の自動割当 (1 から昇順) と衝突しない範囲 (実働スレッド << 100)。
 constexpr uint32_t CORE1_IDLE_TID = 100;
 
-// idle: init_core1 が core1 の初期スレッドとして走らせる。起動直後の 1 回の yield で
-// READY な SENSOR_IO (affinity=core1) を claim させる。SENSOR_IO はベアメタルで svc を
-// 使わない (以後 yield しない) ので、以降 core1 は SENSOR_IO 専有になる (idle は二度と
-// 走らない bootstrap)。共通 scheduler_idle_loop は core1 では回さない — SENSOR_IO が
-// スケジューラへ戻らないため。使用率は SENSOR_IO ループが cpu_busy_us[1] へ直接書く。
-[[noreturn]] void core1_idle_main() {
-  while (true) {
-    obj_api::yield();
-    tight_loop_contents();
-  }
-}
-
 } // namespace
 
 // core0 (kernel_object_main) から呼ぶ。SENSOR_IO オブジェクト + センサ I/O スレッドを
@@ -60,9 +53,9 @@ void core1_kernel_launch() {
   uint32_t tid = FOR_KERNEL_OBJECT::async_call((uint32_t)object_ids::SENSOR_IO,
                                                (method_t)sensor_io_main);
   thread_table[tid].affinity = AFFINITY_CORE1;
-  // SENSOR_IO は設計上 yield しない core1 専有スレッド = バトン組 (budget 無制限)。
-  // budget 付きにすると 3ms ごとに無意味な期限切れ/再 host が起き、1kHz センサ I/O の
-  // タイミングを乱すだけで守るものが無い (core1 には他に走るスレッドが居ない)。
+  // SENSOR_IO は core1 の優先テナント = バトン組 (budget 無制限)。仕事は I2C 読みの
+  // バースト (≤~2.4ms) で自発的に sleep へ戻る設計なので期限強制は不要。budget 付きに
+  // すると I2C バースト途中の期限切れ/再 host が起きるだけで守るものが無い。
   thread_table[tid].grant_budget_us = 0;
   multicore_launch_core1(init_core1);
 }
@@ -83,7 +76,14 @@ void core1_kernel_launch() {
 
   void *psp = (void *)(((uint32_t)malloc(4096) + 4096) & ~0xFu);
   thread_t &idle = thread_table[CORE1_IDLE_TID];
-  idle.object_id = (uint32_t)object_ids::SENSOR_IO; // SENSOR_IO の bootstrap スレッド
+  // idle は必ず「カーネルオブジェクト (id=0) のスレッド」にする。scheduler_idle_loop は
+  // SWITCH_THREAD/GRANT_CPU を生 svc で発行するため、一般オブジェクトから呼ぶと
+  // トランポリンへ誤ルーティングされ、r0(=切替先 tid) が obj_api::svc_num として誤解釈
+  // される (実障害: tid2=CREATE_OBJECT → create_object(0) → 「object already
+  // initialized」panic → core1 死亡)。core0 の thread0 と同じ条件に揃えるのが本質。
+  idle.object_id = (uint32_t)object_ids::KERNEL_OBJECT;
+  object_table[(uint32_t)object_ids::KERNEL_OBJECT].thread_table.insert(
+      CORE1_IDLE_TID);
   idle.thread_id = CORE1_IDLE_TID;
   idle.context = new context_t();
   idle.context->sp = (exception_frame_t *)psp; // 初回 yield で実 PSP に上書きされる種
@@ -104,7 +104,10 @@ void core1_kernel_launch() {
                  :
                  : [psp] "r"(psp), [ctl] "r"(CONTROL_MASK)
                  : "memory");
-  core1_idle_main();
+  // core0 の thread0 と同じ共通実装。初回 sched_pick_next で READY な SENSOR_IO
+  // (affinity=core1) をバトンで拾い、SENSOR_IO が idle 時に sleep で戻るたびに回る。
+  // 使用率 (cpu_busy_us[1]) もこのループの会計から出る。
+  scheduler_idle_loop(CORE1_IDLE_TID);
 }
 
 } // namespace shizu

@@ -43,6 +43,15 @@ constexpr uint32_t PRIO_BULK = 10;  // 通常テレメトリ
 
 using handle_t = stream::handle<frame_t>;
 
+// ---- ctrl レイテンシ計装 (ping >100ms の device/host 切り分け用) ------------
+// producer (TELEMETRY の ble_send_prio) が ctrl フレームを push した時刻を stamp し、
+// consumer (BLE_UART の flush_tx) が ctrl フレームを notify に載せた時点で
+// 「device 内滞在時間」を計算する。BLE_UART が 1s の tx 統計行に last/max を出す。
+// device 滞在が数十 ms 未満なのに GUI の RTT が 100ms 超なら、犯人は host 側で確定。
+extern volatile uint64_t ctrl_enq_us;      // 最後に ctrl へ push した時刻 (0=なし)
+extern volatile uint32_t ctrl_lat_last_us; // 直近の滞在時間
+extern volatile uint32_t ctrl_lat_max_us;  // 1s 窓の最大 (印字時にリセット)
+
 // メッセージ (任意長バイト列) を ≤244B フレームに分割して push する。全フラグメントの
 // 空きが無ければ 1 個も push せず false を返す (部分メッセージを絶対に出さない =
 // lossless 丸ごと破棄)。producer は単一かつ協調原子 (書き込み中 yield しない) なので、

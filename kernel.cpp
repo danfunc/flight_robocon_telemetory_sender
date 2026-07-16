@@ -74,7 +74,10 @@
 #include <hardware/regs/m33.h>          // M33_ICSR_PENDSVSET_BITS
 #include <hardware/structs/scb.h>       // scb_hw->icsr (PendSV pend)
 #include <hardware/structs/systick.h>   // systick_hw (banked per-core)
+#include <cstdarg>
+#include <hardware/sync.h> // __dmb (panic スロットの publish 順序)
 #include <kernel.hpp>
+#include <panic_ring.hpp>
 #include <pico/stdlib.h>
 #include <shizu.hpp>
 
@@ -141,6 +144,66 @@ grant_stack_t grant_stacks[2] = {};
 
 // per-core CPU 使用率計測 (スケジューラが実務へ渡した時間の累積)。宣言は kernel.hpp。
 volatile uint64_t cpu_busy_us[2] = {0, 0};
+
+// ---------------------------------------------------------------------------
+//  panic リング (panic_ring.hpp) — noinit RAM なのでリセットを跨いで残る
+// ---------------------------------------------------------------------------
+panic_slot_t __uninitialized_ram(panic_slots)[2];
+
+static void panic_slot_print(const panic_slot_t &s, const char *tag) {
+  printf("[PANIC-RING] %s core%lu exc=%lu thr=%lu t=%llums: %.*s\n", tag,
+         (unsigned long)s.core, (unsigned long)s.exception,
+         (unsigned long)s.thread_id, (unsigned long long)(s.time_us / 1000),
+         (int)sizeof(s.msg), s.msg);
+}
+
+void panic_ring_boot_report() {
+  for (int c = 0; c < 2; ++c) {
+    if (panic_slots[c].magic == PANIC_MAGIC)
+      panic_slot_print(panic_slots[c], "(前回実行の残骸)");
+    panic_slots[c].magic = 0;
+    panic_slots[c].seq = 0;
+  }
+}
+
+void panic_ring_poll_report() {
+  static uint32_t reported_seq[2] = {0, 0};
+  for (int c = 0; c < 2; ++c) {
+    if (panic_slots[c].magic == PANIC_MAGIC &&
+        panic_slots[c].seq != reported_seq[c]) {
+      reported_seq[c] = panic_slots[c].seq;
+      panic_slot_print(panic_slots[c], "LIVE");
+    }
+  }
+}
+
+} // namespace shizu (一時的に閉じる: shizu_panic は C リンケージのグローバル)
+
+// panic() の差し替え先 (CMakeLists: PICO_PANIC_FUNCTION=shizu_panic)。
+// ロック/stdio を一切使わず自コアのスロットへ記録して戻る (戻った先で SDK の
+// bkpt ループ → HardFault ダンプは従来どおり)。vsnprintf は pico_printf の
+// 実装でロック・malloc を使わない。
+extern "C" void shizu_panic(const char *fmt, ...) {
+  const uint32_t core = get_core_num();
+  shizu::panic_slot_t &s = shizu::panic_slots[core];
+  s.core = core;
+  s.exception = __get_current_exception();
+  s.thread_id = shizu::cpu_manager::current_thread_id[core];
+  s.time_us = time_us_64();
+  if (fmt) {
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(s.msg, sizeof(s.msg), fmt, args);
+    va_end(args);
+  } else {
+    s.msg[0] = '\0';
+  }
+  s.seq = s.seq + 1;
+  __dmb();
+  s.magic = shizu::PANIC_MAGIC; // 最後に有効化 (途中クラッシュで半端を残さない)
+}
+
+namespace shizu {
 
 // clk_sys のサイクル/µs。cpu_manager::init で実クロックから 1 回キャッシュする
 // (両コア同一クロック)。150 MHz 既定値は init 前の保険。

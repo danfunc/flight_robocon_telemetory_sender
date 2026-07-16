@@ -21,7 +21,14 @@
 // 時限実行権移譲 (run_for/GRANT_CPU) の自己テスト トグル: 1 = GRANT_TEST オブジェクトの
 // スレッド群で EXPIRED/YIELDED/ネスト/長期限 (SysTick チャンク継ぎ) を実動確認する。
 #ifndef SHIZU_GRANT_SELFTEST
-#define SHIZU_GRANT_SELFTEST 1
+#define SHIZU_GRANT_SELFTEST 0
+#endif
+
+// SMP ストレス トグル: 1 = SMP_STRESS オブジェクトの worker 群 (core0×2 / core1×2 /
+// 両コア移動×1) が SLEEP/SWITCH の SVC を両コアから同時多発させ、カーネル SVC 経路の
+// 2 コア安全性を数分単位で炙る。reporter がカウンタを 2s ごとに印字 (全て前進 = 健全)。
+#ifndef SHIZU_SMP_STRESS
+#define SHIZU_SMP_STRESS 0
 #endif
 
 // スケジューラが budget 付きスレッドへ与える時限の既定値 [µs]。
@@ -43,6 +50,7 @@ void exit(uint32_t return_code);
 void core1_kernel_launch();      // core0 から core1 を起動する (core1_boot.cpp)
 void stream_selftest_launch();   // ストリーム自己テストの起動 (stream_selftest.cpp)
 void grant_selftest_launch();    // 時限移譲自己テストの起動 (grant_selftest.cpp)
+void smp_stress_launch();        // 2 コア SVC ストレスの起動 (smp_stress.cpp)
 // per-core の例外優先度設定 (SVC 最優先 > SysTick > PendSV 最低)。SHPR は banked な
 // ので core0 は cpu_manager::init、core1 は init_core1 がそれぞれ呼ぶ。
 void init_exception_priorities();
@@ -80,6 +88,7 @@ shizu::context_t *get_current_context();
 void svc_cpp_handler(shizu::context_t *context);
 void pendsv_cpp_handler(shizu::context_t *context);
 void systick_grant_handler(); // grant 期限の監視 (tickless ワンショット)
+void shizu_panic(const char *fmt, ...); // panic() の差し替え先 (panic_ring.hpp)
 }
 
 namespace shizu {
@@ -98,6 +107,7 @@ class cpu_manager {
   friend void ::svc_cpp_handler(shizu::context_t *context);
   friend void ::pendsv_cpp_handler(shizu::context_t *context);
   friend void shizu::grant_pop_to_grantor(uint32_t core, grant_end reason);
+  friend void ::shizu_panic(const char *fmt, ...); // panic 記録に thread id を載せる
 };
 
 struct object_t {

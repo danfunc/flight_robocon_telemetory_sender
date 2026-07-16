@@ -91,6 +91,8 @@ static void ble_send_prio(const char *s, int len) {
   auto h = g_tx_ctrl.hdl();
   if (!ble_tx::push_msg(h, (const uint8_t *)s, (uint32_t)len))
     tx_drop_ctrl++;
+  else
+    ble_tx::ctrl_enq_us = time_us_64(); // device 内滞在時間の計測開始 (flush が確定)
 }
 
 // bulk ストリームの空きバイト数 (ブラストのバックプレッシャ用)。自前ストリームを

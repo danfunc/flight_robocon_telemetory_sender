@@ -35,7 +35,7 @@ set(CMAKE_CXX_STANDARD 20)
 include($ENV{PICO_SDK_PATH}/external/pico_sdk_import.cmake)
 project(shizupico C CXX ASM)
 pico_sdk_init()
-add_executable(main main.cpp kernel.cpp kernel_object.cpp svc_asm_handler.S obj_api.cpp core1_boot.cpp stream_selftest.cpp grant_selftest.cpp)
+add_executable(main main.cpp kernel.cpp kernel_object.cpp svc_asm_handler.S obj_api.cpp core1_boot.cpp stream_selftest.cpp grant_selftest.cpp smp_stress.cpp)
 target_sources(main PRIVATE IO_CONTROLLER.cpp WS2812_DRIVER.cpp BLE_UART_DRIVER.cpp HELLO_WORLD.cpp BME280_DRIVER.cpp BNO055_DRIVER.cpp TELEMETRY_SENDER.cpp FLIGHT_CONTROLLER.cpp core1_io.cpp)
 target_link_libraries(main pico_stdlib pico_stdio pico_multicore hardware_exception hardware_irq hardware_pwm hardware_gpio hardware_pio hardware_i2c pico_btstack_classic pico_btstack_ble pico_cyw43_arch_poll pico_btstack_cyw43 pico_lwip_nosys)
 target_include_directories(main PRIVATE include)
@@ -47,5 +47,9 @@ pico_enable_stdio_usb(main 1)
 # softfp: 呼び出し規約は soft のまま (pico-sdk/libm と ABI 互換)、FP 命令は有効。
 # これで __ARM_FP が定義され、svc_asm_handler.S の S16-S31 退避ブロックが有効になる。
 target_compile_options(main PUBLIC -mfloat-abi=softfp -Wall)
+# panic() を stdio 経由の SDK 実装から shizu_panic (kernel.cpp) へ差し替える。
+# ロックを取らず per-core の noinit RAM リングへ記録 → core1/例外文脈の panic でも
+# メッセージが失われない (boot 時とビーコンが印字する)。include/panic_ring.hpp 参照。
+target_compile_definitions(main PRIVATE PICO_PANIC_FUNCTION=shizu_panic)
 
 
