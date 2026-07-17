@@ -31,6 +31,15 @@
 #define SHIZU_SMP_STRESS 0
 #endif
 
+// MPU Step0 (W^X) トグル: 1 = 両コアで MPU を有効化し、(i) XIP flash 全窓 = RO+X、
+// (ii) ヒープ先頭 (__end__) 〜 SRAM 終端 = RW+XN を張る。スタック/ヒープからのコード
+// 実行と flash への誤ストアを即 fault にする (HANDOFF §6 Step0 の残り半分)。
+// PRIVDEFENA=1 なので region 外 (静的データ / ペリフェラル / SIO) は従来どおり
+// default map で無傷。実機で問題が出たら 0 で丸ごと外せる。
+#ifndef SHIZU_MPU_WX
+#define SHIZU_MPU_WX 1
+#endif
+
 // スケジューラが budget 付きスレッドへ与える時限の既定値 [µs]。
 // 意味論は quantum でなく「凍結ウォッチドッグ」: 全ドライバは正常時これより十分
 // 短い周期で yield する (最長の正当ホールドは I2C 100kHz 26B 読み ≈2.4ms) ので、
@@ -54,6 +63,9 @@ void smp_stress_launch();        // 2 コア SVC ストレスの起動 (smp_stre
 // per-core の例外優先度設定 (SVC 最優先 > SysTick > PendSV 最低)。SHPR は banked な
 // ので core0 は cpu_manager::init、core1 は init_core1 がそれぞれ呼ぶ。
 void init_exception_priorities();
+// MPU Step0 (W^X) を自コアで有効化する (SHIZU_MPU_WX=0 なら no-op)。MPU レジスタは
+// per-core banked なので core0 は cpu_manager::init、core1 は init_core1 が呼ぶ。
+void mpu_init_this_core();
 enum struct grant_end : uint32_t; // 前方宣言 (定義は下の grant セクション)
 // grant を 1 段 pop して grantor へ復帰させる (kernel.cpp 内部: PendSV=EXPIRED /
 // SWITCH_THREAD インターセプト=YIELDED の共通経路)。
@@ -151,6 +163,16 @@ enum struct switch_error : uint32_t {
   NOT_READY,    // 対象が READY でない / claim 競り負け (他コアが先に取った)
   BAD_AFFINITY, // 対象がこのコアで走ることを許されていない
 };
+// METHOD_CALL (メソッド呼び出しプリミティブ) の型付きエラー。error_t<call_error> で
+// 受ける。従来は未 export メソッドへの呼び出しで panic 停止していたが、affinity で
+// オブジェクトのコアを動かすと「スレッド番号昇順の初回実行順」による export 順の暗黙
+// 保証が崩れるため、エラー返却に変更した — 呼び出し元は yield して再試行できる。
+enum struct call_error : uint32_t {
+  OK = 0,            // 呼び出し成功 (r1 にメソッド戻り値)
+  BAD_OBJECT,        // obj/method 番号が範囲外、または対象オブジェクト未生成
+  UNDECLARED_METHOD, // 対象メソッドが未 export (export_method 前に呼んだ)
+};
+
 // affinity ビットマスク。bit0=core0, bit1=core1。thread_table_init の既定は CORE0
 // (core1 が既存スレッドを勝手に claim しないよう安全側に倒す = AMP。core1 で走らせる
 //  スレッドだけ明示的に CORE1 を立てる)。
@@ -214,6 +236,13 @@ struct context_t {
   // svc_asm_handler.S の .equ CTX_EXC_RETURN(36)/CTX_FP(40) と一致させること。
   uint32_t exc_return; // offset 36
   uint32_t fp[16];     // offset 40 (S16-S31)
+  // psplim: このスレッドの PSP 下限 (= スタック底のアドレス)。PSP がここを下回ると
+  // v8-M が UsageFault (→ HardFault にエスカレート) を上げ、スタックオーバーフロー
+  // (メモリ破壊の最大手) を黙って壊す前に即検出する。スレッド生成時に 1 回だけ設定し、
+  // CTX_RESTORE が切替のたびに MSR PSPLIM で復元する (スレッド寿命の間は不変なので
+  // CTX_SAVE では触らない)。0 = 制限なし (未設定スレッドの安全既定)。
+  // svc_asm_handler.S の .equ CTX_PSPLIM(104) と一致させること。
+  uint32_t psplim; // offset 104
 };
 
 struct exception_frame_t {

@@ -75,6 +75,8 @@ enum struct error : uint32_t {
   ALREADY_BOUND, // その role は既にバインド済み (SPSC で2人目)
   NOT_BOUND,     // bind 前に wait/notify した
   WRONG_ROLE,    // producer 用操作を consumer が呼んだ等
+  MISMATCH,      // connect: rec_size が一致しない 2 本は繋げない
+  NO_DMA,        // connect: 空き DMA チャネルが無い
 };
 
 enum struct role : uint32_t { PRODUCER = 0, CONSUMER = 1 };
@@ -272,6 +274,18 @@ template <typename REC> inline handle<REC> open(uint32_t id) {
 inline error_t<error> bind(uint32_t id, role rl) {
   auto r = obj_api::svc(obj_api::svc_num::BIND_STREAM, id,
                         static_cast<uintptr_t>(rl), 0);
+  return error_t<error>{static_cast<error>(r.value)};
+}
+
+// src の consumer 端と dst の producer 端をカーネルの DMA ポンプで直結する。
+// 以後 src へ push されたレコードは「オブジェクトによるコピー無し」で dst へ流れる
+// (従来: 中間オブジェクトが pop → push でコピーしていた段が丸ごと消える)。
+// 前提: 両ストリーム create 済み / rec_size 一致 / src の consumer 席と dst の
+// producer 席が未バインド (接続がその席を占有し、以後オブジェクトは bind できない)。
+// DMA チャネルは接続ごとにカーネルが 1 本 claim する (オブジェクトへは渡さない)。
+// dst へは空きにしか書かない (溢れは src 側に滞留 → src が lossy なら最古が落ちる)。
+inline error_t<error> connect(uint32_t src_id, uint32_t dst_id) {
+  auto r = obj_api::svc(obj_api::svc_num::CONNECT_STREAM, src_id, dst_id, 0);
   return error_t<error>{static_cast<error>(r.value)};
 }
 

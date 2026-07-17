@@ -72,6 +72,8 @@
 #include <hardware/exception.h>
 #include <hardware/irq.h>
 #include <hardware/regs/m33.h>          // M33_ICSR_PENDSVSET_BITS
+#include <hardware/regs/addressmap.h>   // XIP_BASE/XIP_END/SRAM_END (MPU region)
+#include <hardware/structs/mpu.h>       // mpu_hw (banked per-core)
 #include <hardware/structs/scb.h>       // scb_hw->icsr (PendSV pend)
 #include <hardware/structs/systick.h>   // systick_hw (banked per-core)
 #include <cstdarg>
@@ -88,6 +90,8 @@ static_assert(offsetof(shizu::context_t, exc_return) == 36,
               "context_t layout mismatch: exc_return offset (asm CTX_EXC_RETURN)");
 static_assert(offsetof(shizu::context_t, fp) == 40,
               "context_t layout mismatch: fp offset (asm CTX_FP)");
+static_assert(offsetof(shizu::context_t, psplim) == 104,
+              "context_t layout mismatch: psplim offset (asm CTX_PSPLIM)");
 // claim は (uint32_t*)&thread.state を __atomic で叩くので 4B 幅を保証する。
 static_assert(sizeof(shizu::thread_t::state_t) == 4,
               "thread state must be a 32-bit word for __atomic claim CAS");
@@ -267,6 +271,59 @@ void init_exception_priorities() {
   exception_set_priority(PENDSV_EXCEPTION, PICO_LOWEST_IRQ_PRIORITY);
 }
 
+// ---------------------------------------------------------------------------
+//  MPU Step0: W^X (HANDOFF §6 の段 0 の残り半分。PSPLIM とセット)
+// ---------------------------------------------------------------------------
+//  目的はバグ封じ込め: (i) スタック/ヒープ上に化けた関数ポインタ経由で「データを
+//  実行」する事故を XN で即 fault に、(ii) flash (XIP 窓) への誤ストアを RO で即
+//  fault にする。PMSAv8 は有効 region の overlap 禁止なので「広い RW に穴あけ」は
+//  できない — RAM 常駐コード (.data 内 time_critical) を避けるため region はヒープ
+//  先頭 (__end__) から張る。scratch_x/y (コア MSP スタック) はコード無し (map で
+//  確認済み) なので SRAM 終端まで丸ごと XN に含める。
+//  PRIVDEFENA=1: region 外 (静的データ / ペリフェラル / SIO / USB RAM) は特権
+//  default map のまま = 現行コードは無傷。全スレッド特権のまま (nPRIV 分離は
+//  Step1)。DMA は MPU を素通りする (バスマスタ) — DMA 設定をカーネル専有に保つ
+//  方針とセットで成立する保護であることに注意。
+//  MemManage は個別有効化せず HardFault へエスカレートさせる (PSPLIM と同じ扱い、
+//  main.cpp の hardfault_handler がダンプを出す)。
+#if SHIZU_MPU_WX
+extern "C" char __end__[]; // リンカ: 静的データ終端 = ヒープ先頭
+namespace {
+// v8-M MPU region を 1 本張る。base/limit は 32B 粒度 (inclusive limit)。
+// ap: RBAR.AP (0b01=RW 全特権, 0b11=RO 全特権)。xn: 1=実行禁止。
+// attridx: MAIR0 の属性スロット番号。
+void mpu_set_region(uint32_t idx, uint32_t base, uint32_t limit_incl,
+                    uint32_t ap, uint32_t xn, uint32_t attridx) {
+  mpu_hw->rnr = idx;
+  mpu_hw->rbar = (base & ~0x1Fu) | (ap << 1) | xn;
+  mpu_hw->rlar = (limit_incl & ~0x1Fu) | (attridx << 1) | 1u;
+}
+} // namespace
+void mpu_init_this_core() {
+  // MAIR: attr0 = Normal WB read/write-allocate (XIP キャッシュ経路の妥当な属性)、
+  //       attr1 = Normal non-cacheable (SRAM。M33 に D キャッシュは無い)。
+  mpu_hw->mair[0] = 0xFFu | (0x44u << 8);
+  // region0: XIP flash 全窓 = RO + X。実行と読みは今まで通り、ストアは即 fault。
+  // (flash_range_program は QMI/ROM 経由で XIP 窓へストアしないので併用可能。)
+  mpu_set_region(0, XIP_BASE, XIP_END - 32u, 0b11, 0, 0);
+  // region1: ヒープ先頭〜SRAM 終端 = RW + XN。全スレッドスタック (malloc 産) と
+  // ヒープ、scratch_x/y の MSP スタックからのコード実行を禁じる。
+  const uint32_t heap = ((uint32_t)__end__ + 31u) & ~31u;
+  mpu_set_region(1, heap, SRAM_END - 32u, 0b01, 1, 1);
+  // 残り region は明示無効化 (ブートローダ等の残骸を引き継がない保険)。
+  for (uint32_t i = 2; i < 8; ++i) {
+    mpu_hw->rnr = i;
+    mpu_hw->rlar = 0;
+  }
+  // PRIVDEFENA | ENABLE。HFNMIENA=0 (HardFault ハンドラは MPU 制約なしで走らせる)。
+  mpu_hw->ctrl = M33_MPU_CTRL_PRIVDEFENA_BITS | M33_MPU_CTRL_ENABLE_BITS;
+  __dsb();
+  __isb();
+}
+#else
+void mpu_init_this_core() {}
+#endif
+
 void cpu_manager::init() {
   exception_set_exclusive_handler(SVCALL_EXCEPTION, svc_asm_handler);
   // grant 期限強制の土台。RAM ベクタテーブルは両コア共有なので登録はここ (core0)
@@ -275,6 +332,7 @@ void cpu_manager::init() {
   exception_set_exclusive_handler(SYSTICK_EXCEPTION, systick_grant_handler);
   g_cycles_per_us = clock_get_hz(clk_sys) / 1000000u;
   init_exception_priorities();
+  mpu_init_this_core(); // MPU は per-core banked。core1 は init_core1 が呼ぶ
 }
 
 void thread_t::ready_to_run() {
@@ -315,10 +373,13 @@ void create_thread(uint32_t obj_num, uint32_t thread_num, method_t entry,
     // BLE/CYW43 (btstack) の送信・暗号化パスは深く、2KB ではオーバーフローして
     // HardFault する。1 スレッドあたり 8KB へ拡張 (RP2350 は RAM に余裕あり)。
     constexpr uint32_t THREAD_STACK_SIZE = 8192;
+    uint32_t stack_base = (uint32_t)malloc(THREAD_STACK_SIZE);
     thread_table[thread_num].context->sp =
-        (exception_frame_t *)(((uint32_t)malloc(THREAD_STACK_SIZE) +
-                               THREAD_STACK_SIZE - sizeof(exception_frame_t)) &
+        (exception_frame_t *)((stack_base + THREAD_STACK_SIZE -
+                               sizeof(exception_frame_t)) &
                               ~((uint32_t)0xfL));
+    // PSPLIM = スタック底 (8B アライン上げ)。PSP がここを下回ると即フォルト。
+    thread_table[thread_num].context->psplim = (stack_base + 7u) & ~7u;
     thread_table[thread_num].context->sp->pc = (uint32_t)entry;
     thread_table[thread_num].context->sp->lr =
         (uint32_t)shizu::FOR_KERNEL_OBJECT::exit_method;
@@ -497,14 +558,24 @@ void svc_cpp_handler(shizu::context_t *context) {
       // 同一スレッド上を走る (= 保護されたサブルーチン呼び出し)。
       // printf("call to %lx,%lx\n", arg0, arg1);
       // 呼び先が未 export (nullptr) のまま飛ぶと pc=0 → 戻りで trap に落ち、
-      // 原因の特定が困難になる。ここで検出して呼び出し元/先を明示して止める。
-      // (典型例: スレッド番号の昇順で先に走ったオブジェクトが、まだ main が
-      //  走っていないオブジェクトのメソッドを呼んだ場合)
-      if (shizu::object_table[arg0].method_table[arg1] == nullptr) {
-        panic("METHOD_CALL to unexported method\n"
-              " caller obj: %lu\n callee obj: %lu\n method: %lu\n",
-              (unsigned long)current_thread.object_id, (unsigned long)arg0,
-              (unsigned long)arg1);
+      // 原因の特定が困難になる。従来はここで panic 停止していたが、affinity で
+      // オブジェクトのコアを動かすと「スレッド番号昇順の初回実行順」による export
+      // 順の暗黙保証が崩れる (典型例: 先に走ったオブジェクトが、まだ main が走って
+      // いないオブジェクトのメソッドを呼ぶ)。pc は張り替えず call_error を r0 で
+      // 呼び出し元へ返し、呼び出し元が yield → 再試行できるようにする。
+      {
+        shizu::call_error ce = shizu::call_error::OK;
+        if (arg0 >= 128 || arg1 >= 128 ||
+            shizu::object_table[arg0].state ==
+                shizu::object_t::state_t::UNINITIALIZED)
+          ce = shizu::call_error::BAD_OBJECT;
+        else if (shizu::object_table[arg0].method_table[arg1] == nullptr)
+          ce = shizu::call_error::UNDECLARED_METHOD;
+        if (ce != shizu::call_error::OK) {
+          stack_frame->r0 = (uint32_t)ce; // この svc をその場でエラー復帰させる
+          stack_frame->r1 = 0;
+          break;
+        }
       }
       // NOTE(FPU): stack_frame は 8 語の basic exception_frame_t を*その場で*
       // コピーする。拡張(FP)フレームでもこの構造体はハードウェアスタック上の
@@ -541,7 +612,8 @@ void svc_cpp_handler(shizu::context_t *context) {
     }
     case shizu::kernel_object_svc_num::METHOD_EXIT: {
       // call_stack を (arg1+1) 段 pop して元のフレーム/オブジェクト ID を復元する。
-      // 復元したフレームの r1 に arg0 (メソッド戻り値) を載せて呼び出し元へ返す。
+      // 復元したフレームの r1 に arg0 (メソッド戻り値)、r0 に arg2 (エラーコード、
+      // 0 = 成功 — 既存呼び出し元は arg2=0 なのでワイヤ互換) を載せて返す。
       shizu::method_call_stack_t call_stack_top;
       for (size_t i = 0; i < arg1 + 1; i++) {
         if (current_thread.call_stack.empty()) {
@@ -557,7 +629,7 @@ void svc_cpp_handler(shizu::context_t *context) {
         stack_frame = call_stack_top.context.sp;
         *stack_frame = call_stack_top.stack_frame;
         current_thread.object_id = call_stack_top.caller_object_id;
-        stack_frame->r0 = 0;
+        stack_frame->r0 = arg2;
         stack_frame->r1 = arg0;
       }
 

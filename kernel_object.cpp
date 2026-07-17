@@ -1,6 +1,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <hardware/dma.h> // ストリーム接続ポンプ (DMA 設定はカーネル専有)
 #include <kernel_object.hpp>
 #include <obj_api.hpp>
 #include <object_headers/IO_CONTROLLER.hpp>
@@ -63,6 +64,9 @@ static method_descriptor_t md_table[128][MD_SLOTS];
 static uint32_t obj_mem[128][MEM_SLOTS];
 // 範囲外アクセスは黙って捨てず数える (STATS 等で異常を検知できるように)。
 static uint32_t g_flat_oob = 0;
+// METHOD_CALL のエラー (UNDECLARED_METHOD/BAD_OBJECT) 累計。core1 は printf 禁止
+// なのでカウンタが唯一の計装 (core0 呼び出しは printf も出す)。
+static uint32_t g_call_errors = 0;
 
 static inline bool md_ok(uint32_t obj, uint32_t slot) {
   if (obj < 128 && slot < MD_SLOTS)
@@ -89,6 +93,137 @@ struct stream_reg_t {
   uint32_t consumer_obj;       // NO_OBJ = 未バインド
 };
 static stream_reg_t stream_table[stream::MAX_STREAMS];
+
+// ---- ストリーム接続 (CONNECT_STREAM) + カーネル DMA ポンプ ------------------
+// 「src へ push されたレコードを、中間オブジェクトのコピー無しで dst へ流す」。
+// 接続は src の consumer 席と dst の producer 席を占有し (SPSC 維持)、以後は
+// core0 の scheduler idle ループが回す stream_pump_core0 が、src の連続可読
+// チャンク × dst の連続可書チャンクの min を 1 DMA 転送として発行する。
+// DMA 設定はカーネル専有 (HANDOFF §6: DMA は MPU を素通りするため、チャネルを
+// オブジェクトに渡さない)。ポンプは非ブロッキング: 発行したら次の周回で完了を
+// 見て index を publish する。dst へは空きにしか書かない (接続ポンプは dst を
+// lossless 扱い — 溢れは src 側に滞留し、src が lossy なら src 側で最古が落ちる)。
+struct stream_conn_t {
+  volatile uint32_t active; // 0=空き。設定完了後に release-store で 1 (公開)
+  uint32_t src_id, dst_id;
+  int dma_ch;        // claim 済みチャネル (接続ごとに 1 本)
+  uint32_t inflight; // DMA 転送中のレコード数 (0=idle)
+  uint32_t rd_snap;  // 転送開始時の src.rd (完了時に publish する基準)
+  uint32_t wr_snap;  // 転送開始時の dst.wr
+  uint32_t moved;    // 累計転送レコード (計装)
+  uint32_t lost;     // src lossy 追い越しで捨てたレコード (計装)
+};
+constexpr uint32_t MAX_STREAM_CONNS = 4;
+static stream_conn_t stream_conns[MAX_STREAM_CONNS];
+// 接続がバインド席に座るときの仮想オブジェクト ID (実オブジェクトと衝突しない)。
+constexpr uint32_t CONN_OBJ = 0xFFFFFFFEu;
+
+// CONNECT_STREAM の本体 (トランポリン先スレッドモードで走る。dma_claim は
+// malloc しない hw_claim なので SVC パス脱 malloc 方針と両立)。
+static stream::error connect_streams(uint32_t src_id, uint32_t dst_id) {
+  using stream::error;
+  if (src_id >= stream::MAX_STREAMS || dst_id >= stream::MAX_STREAMS ||
+      src_id == dst_id || stream_table[src_id].desc == nullptr ||
+      stream_table[dst_id].desc == nullptr)
+    return error::BAD_ID;
+  stream::stream_desc_t *s = stream_table[src_id].desc;
+  stream::stream_desc_t *d = stream_table[dst_id].desc;
+  if (s->rec_size != d->rec_size)
+    return error::MISMATCH; // レコード型が違うものは繋げない
+  // 接続は src の consumer / dst の producer の席を取る (SPSC を保つ)。
+  if (stream_table[src_id].consumer_obj != NO_OBJ ||
+      stream_table[dst_id].producer_obj != NO_OBJ)
+    return error::ALREADY_BOUND;
+  uint32_t slot = MAX_STREAM_CONNS;
+  for (uint32_t i = 0; i < MAX_STREAM_CONNS; ++i)
+    if (stream_conns[i].active == 0) {
+      slot = i;
+      break;
+    }
+  if (slot == MAX_STREAM_CONNS)
+    return error::NO_SLOT;
+  int ch = dma_claim_unused_channel(false);
+  if (ch < 0)
+    return error::NO_DMA;
+  stream_table[src_id].consumer_obj = CONN_OBJ;
+  stream_table[dst_id].producer_obj = CONN_OBJ;
+  stream_conn_t &c = stream_conns[slot];
+  c.src_id = src_id;
+  c.dst_id = dst_id;
+  c.dma_ch = ch;
+  c.inflight = 0;
+  c.moved = c.lost = 0;
+  // 公開は最後 (ポンプは core0 idle ループ = 別コアから見得るので release で)。
+  __atomic_store_n(&c.active, 1u, __ATOMIC_RELEASE);
+  return error::OK;
+}
+
+// core0 の scheduler_idle_loop から毎周回呼ばれる非ブロッキングポンプ。
+// 接続 0 本なら acquire ロード×4 で即戻る。single-caller (core0 idle のみ) なので
+// conn の inflight/snap はロック不要。producer/consumer 側とは SPSC の wr/rd 規約
+// (単調増加 + __dmb) だけで同期する — ポンプは src の唯一 consumer / dst の唯一
+// producer として振る舞う。
+static void stream_pump_core0() {
+  for (uint32_t i = 0; i < MAX_STREAM_CONNS; ++i) {
+    if (!__atomic_load_n(&stream_conns[i].active, __ATOMIC_ACQUIRE))
+      continue;
+    stream_conn_t &c = stream_conns[i];
+    stream::stream_desc_t *s = stream_table[c.src_id].desc;
+    stream::stream_desc_t *d = stream_table[c.dst_id].desc;
+    if (c.inflight) {
+      if (dma_channel_is_busy(c.dma_ch))
+        continue; // 転送中 → 次の周回で
+      __dmb();    // DMA 完了の観測 → payload 可視 → index publish の順序
+      // src が lossy の場合、DMA 読み中に producer が一周していたらチャンクは
+      // torn の可能性がある (handle::pop と同じ論理)。dst へ publish せず捨てて
+      // resync する (dst には書いてあるが wr を進めない = 存在しない扱い)。
+      if (!(s->flags & stream::LOSSLESS) &&
+          (uint32_t)(s->wr - c.rd_snap) >= s->capacity) {
+        uint32_t nr = s->wr - s->capacity + stream::RESYNC_MARGIN;
+        c.lost += nr - c.rd_snap;
+        s->rd = nr;
+      } else {
+        s->rd = c.rd_snap + c.inflight;
+        d->wr = c.wr_snap + c.inflight; // ここで初めて consumer から見える
+        c.moved += c.inflight;
+      }
+      c.inflight = 0;
+    }
+    // 次チャンク = min(src 可読, dst 空き, src 連続域, dst 連続域)。
+    const uint32_t rd = s->rd, wr = s->wr;
+    uint32_t n = wr - rd;
+    if (n == 0)
+      continue;
+    const uint32_t dwr = d->wr;
+    const uint32_t space = d->capacity - (dwr - d->rd);
+    if (space == 0)
+      continue; // dst 満杯: src 側に滞留させる (dst へは空きにしか書かない)
+    if (n > space)
+      n = space;
+    const uint32_t src_run = s->capacity - (rd % s->capacity);
+    const uint32_t dst_run = d->capacity - (dwr % d->capacity);
+    if (n > src_run)
+      n = src_run;
+    if (n > dst_run)
+      n = dst_run;
+    uint8_t *src_p = (uint8_t *)s->base + (rd % s->capacity) * s->rec_size;
+    uint8_t *dst_p = (uint8_t *)d->base + (dwr % d->capacity) * d->rec_size;
+    const uint32_t bytes = n * s->rec_size;
+    c.rd_snap = rd;
+    c.wr_snap = dwr;
+    c.inflight = n;
+    dma_channel_config cfg = dma_channel_get_default_config(c.dma_ch);
+    // 4B アラインが揃うなら 32bit 転送、そうでなければ 8bit (どちらでも正しい)。
+    const bool word_ok =
+        ((((uintptr_t)src_p | (uintptr_t)dst_p | bytes) & 3u) == 0);
+    channel_config_set_transfer_data_size(&cfg,
+                                          word_ok ? DMA_SIZE_32 : DMA_SIZE_8);
+    channel_config_set_read_increment(&cfg, true);
+    channel_config_set_write_increment(&cfg, true);
+    dma_channel_configure(c.dma_ch, &cfg, dst_p, src_p,
+                          word_ok ? bytes / 4 : bytes, true);
+  }
+}
 
 // スケジューラ中核 (budget 付き round-robin)。「今走らせてよい」スレッド = affinity
 // 一致 && READY && wake_at<=now を探し、budget に応じて 2 通りで CPU を渡す:
@@ -147,6 +282,10 @@ static bool sched_pick_next(uint32_t self, uint32_t core, uint64_t now) {
 [[noreturn]] void scheduler_idle_loop(uint32_t self) {
   const uint32_t core = get_core_num();
   while (1) {
+    // ストリーム接続の DMA ポンプ (core0 のみ = single-caller でロック不要)。
+    // 非ブロッキング: 発行済み転送の完了確認と次チャンクの発行だけして戻る。
+    if (core == 0)
+      stream_pump_core0();
     uint64_t t0 = time_us_64();
     if (sched_pick_next(self, core, t0))
       cpu_busy_us[core] += time_us_64() - t0; // スケジューラが実務へ渡した時間
@@ -270,14 +409,51 @@ uint32_t kernel_obj_svc_handler(uint32_t r0, uint32_t r1, uint32_t r2,
       shizu::thread_table[r1].grant_budget_us = r2;
     break;
   }
+  case shizu::obj_api::svc_num::SET_AFFINITY: {
+    // r1=tid, r2=マスク (bit0=core0/bit1=core1)。u32 一語の advisory 書き込みで、
+    // 確定は claim (try_claim) の CAS 側 — 反映は対象が次に READY になって
+    // scheduler が claim するときから (走行中スライスは回収しない)。空マスクは
+    // 誰も claim できない迷子スレッドを作るので弾く。範囲外/不正ビットも無視
+    // (SET_THREAD_BUDGET と同じ「黙って無視」規律)。
+    if (r1 < 128 && (r2 & shizu::AFFINITY_ALL) != 0 &&
+        (r2 & ~shizu::AFFINITY_ALL) == 0)
+      shizu::thread_table[r1].affinity = r2;
+    break;
+  }
   case shizu::obj_api::svc_num::CALL_METHOD: {
-    ::svc<(uint32_t)shizu::kernel_object_svc_num::METHOD_CALL>(r1, r2, r3, 0);
+    // METHOD_CALL 成功時はメソッドが METHOD_EXIT した後にここへ戻る (r0=0,
+    // r1=メソッド戻り値)。失敗 (未 export = UNDECLARED_METHOD / 未生成 =
+    // BAD_OBJECT) は pc 張り替え無しで即戻る (r0=call_error)。どちらも
+    // METHOD_EXIT の arg2 (エラー) / arg0 (値) に載せ替えて呼び出し元へ透過する
+    // — 呼び出し元は r0 の call_error を見て yield → 再試行できる (affinity で
+    // コアを移すと初回実行順による export 保証が無いため panic ではなくエラー)。
+    result_t<uint32_t> r =
+        ::svc<(uint32_t)shizu::kernel_object_svc_num::METHOD_CALL>(r1, r2, r3,
+                                                                   0);
+    if ((uint32_t)r.result != 0) {
+      ++g_call_errors;
+      if (get_core_num() == 0) // core1 は printf 禁止 (計装はカウンタのみ)
+        printf("[CALL] err=%lu caller_obj=%lu callee_obj=%lu method=%lu\n",
+               (unsigned long)r.result, (unsigned long)r5, (unsigned long)r1,
+               (unsigned long)r2);
+    }
+    svc<(uint32_t)shizu::kernel_object_svc_num::METHOD_EXIT>(
+        r.value, 0, (uint32_t)r.result, 0, 0);
     break;
   }
   case shizu::obj_api::svc_num::CALL_METHOD_VIA_MD: {
-    if (md_ok(r1, r2))
-      ::svc<(uint32_t)shizu::kernel_object_svc_num::METHOD_CALL>(
-          md_table[r1][r2].object_id, md_table[r1][r2].method_id, r3, 0);
+    if (!md_ok(r1, r2)) {
+      svc<(uint32_t)shizu::kernel_object_svc_num::METHOD_EXIT>(
+          0, 0, (uint32_t)shizu::call_error::BAD_OBJECT, 0, 0);
+      break;
+    }
+    result_t<uint32_t> r =
+        ::svc<(uint32_t)shizu::kernel_object_svc_num::METHOD_CALL>(
+            md_table[r1][r2].object_id, md_table[r1][r2].method_id, r3, 0);
+    if ((uint32_t)r.result != 0)
+      ++g_call_errors;
+    svc<(uint32_t)shizu::kernel_object_svc_num::METHOD_EXIT>(
+        r.value, 0, (uint32_t)r.result, 0, 0);
     break;
   }
   case shizu::obj_api::svc_num::SET_OBJECT_MD: {
@@ -356,6 +532,15 @@ uint32_t kernel_obj_svc_handler(uint32_t r0, uint32_t r1, uint32_t r2,
         stream_table[id].consumer_obj = caller;
       }
     }
+    svc<(uint32_t)shizu::kernel_object_svc_num::METHOD_EXIT>((uint32_t)err, 0,
+                                                             0, 0, 0);
+    break;
+  }
+  case shizu::obj_api::svc_num::CONNECT_STREAM: {
+    // r1=src id, r2=dst id。src の consumer 端と dst の producer 端をカーネルの
+    // DMA ポンプで直結する。以後 src へ push されたレコードはオブジェクトの
+    // コピー無しで dst へ流れる。戻り r1=stream::error (他の stream SVC と同規約)。
+    stream::error err = connect_streams(r1, r2);
     svc<(uint32_t)shizu::kernel_object_svc_num::METHOD_EXIT>((uint32_t)err, 0,
                                                              0, 0, 0);
     break;

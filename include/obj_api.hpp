@@ -32,6 +32,9 @@ enum struct svc_num : uint32_t {
   ASYNC_CALL = 19,     // r1=obj_id, r2=entry, r3=arg。空き tid に spawn → r1(戻)=tid
   RUN_FOR = 20, // r1=tid, r2=µs。時限実行権移譲 → r1(戻)=(error<<16)|reason
   SET_THREAD_BUDGET = 21, // r1=tid, r2=µs。scheduler の host 時限 (0=無制限バトン)
+  SET_AFFINITY = 22, // r1=tid, r2=affinity マスク (bit0=core0/bit1=core1)。次の yield で移動
+  CONNECT_STREAM = 23, // r1=src id, r2=dst id。src の consumer 端と dst の producer 端を
+                       // カーネル専有 DMA ポンプで直結 → r1(戻)=stream::error
 };
 
 template <typename T>
@@ -122,6 +125,16 @@ struct run_for_result_t {
 // スライスできないスレッドだけ 0 を指定する。既定は SHIZU_DEFAULT_GRANT_BUDGET_US。
 [[maybe_unused]] static void set_thread_budget(uint32_t tid, uint32_t us) {
   svc(svc_num::SET_THREAD_BUDGET, tid, us, 0);
+}
+
+// スレッド tid の走行許可コアを変更する (AFFINITY_CORE0/CORE1/ALL のビットマスク)。
+// 反映は advisory: 走行中のスライスは回収せず、対象が次に READY になって scheduler が
+// claim を試みるときから効く (= 次の yield/sleep 以降でコアが移る)。範囲外 tid /
+// 空マスクは黙って無視 (SET_THREAD_BUDGET と同じ規律)。
+// 注意: コアを移すと「スレッド番号昇順の初回実行順」による export 順の保証が崩れる
+// ので、call_method の UNDECLARED_METHOD エラーを見て yield → 再試行すること。
+[[maybe_unused]] static void set_affinity(uint32_t tid, uint32_t mask) {
+  svc(svc_num::SET_AFFINITY, tid, mask, 0);
 }
 
 __always_inline static void yield_until(bool (*condition)()) {

@@ -12,6 +12,7 @@
 //   40    : fp[16] (S16-S31 退避域)
 .equ CTX_EXC_RETURN, 36
 .equ CTX_FP,         40
+.equ CTX_PSPLIM,     104  // kernel.hpp context_t::psplim と一致
 
 // ---------------------------------------------------------------------------
 // CTX_SAVE — 現在スレッドの context_t へ {r4-r11, PSP, EXC_RETURN, 遅延 S16-S31}
@@ -66,6 +67,12 @@
     msr  PSP,r2
 
     ldr  r3,[r0]                 // r3 = ctx->exc_return (r0 は base+36)
+
+    // スタック上限を復元 (スレッドごと不変なので restore のみ。PSP がここを下回ると
+    // UsageFault→HardFault でスタックオーバーフローを即検出)。r0 = base+36 なので
+    // psplim(base+104) は +68。r1 は上で PSP 復元に使い終わっていて空き。
+    ldr  r1,[r0, #(CTX_PSPLIM - CTX_EXC_RETURN)]
+    msr  PSPLIM, r1
 
 #if defined(__ARM_FP)
     // 復帰対象が拡張(FP)フレームなら S16-S31 を復元する。

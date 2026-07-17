@@ -74,7 +74,12 @@ void core1_kernel_launch() {
   // (再登録は exclusive 二重登録 panic するのでしない — 上記コメント参照)。
   init_exception_priorities();
 
-  void *psp = (void *)(((uint32_t)malloc(4096) + 4096) & ~0xFu);
+  // MPU (W^X) は per-core banked なので core1 でも張る (core0 は cpu_manager::init)。
+  mpu_init_this_core();
+
+  uint32_t idle_base = (uint32_t)malloc(4096);
+  void *psp = (void *)((idle_base + 4096) & ~0xFu);
+  uint32_t psplim = (idle_base + 7u) & ~7u; // スタック底 (PSPLIM)
   thread_t &idle = thread_table[CORE1_IDLE_TID];
   // idle は必ず「カーネルオブジェクト (id=0) のスレッド」にする。scheduler_idle_loop は
   // SWITCH_THREAD/GRANT_CPU を生 svc で発行するため、一般オブジェクトから呼ぶと
@@ -88,6 +93,7 @@ void core1_kernel_launch() {
   idle.context = new context_t();
   idle.context->sp = (exception_frame_t *)psp; // 初回 yield で実 PSP に上書きされる種
   idle.context->exc_return = 0xFFFFFFFD;        // 基本フレーム/PSP へ復帰
+  idle.context->psplim = psplim;               // スタックオーバーフロー検出
   idle.call_stack.frames = (method_call_stack_t *)malloc(
       sizeof(method_call_stack_t) * call_stack_t::MAX_DEPTH);
   idle.call_stack.depth = 0;
@@ -98,11 +104,12 @@ void core1_kernel_launch() {
 
   // PSP へ切替え、Thread モードで PSP を使う (SPSEL=1) → 共通スケジューラ idle ループへ。
   uintptr_t CONTROL_MASK = 1u << 1;
-  __asm volatile("MSR PSP,%[psp];"
+  __asm volatile("MSR PSPLIM,%[psplim];"
+                 "MSR PSP,%[psp];"
                  "MSR CONTROL,%[ctl];"
                  "isb;"
                  :
-                 : [psp] "r"(psp), [ctl] "r"(CONTROL_MASK)
+                 : [psp] "r"(psp), [psplim] "r"(psplim), [ctl] "r"(CONTROL_MASK)
                  : "memory");
   // core0 の thread0 と同じ共通実装。初回 sched_pick_next で READY な SENSOR_IO
   // (affinity=core1) をバトンで拾い、SENSOR_IO が idle 時に sleep で戻るたびに回る。
