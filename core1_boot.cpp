@@ -90,12 +90,14 @@ void core1_kernel_launch() {
   object_table[(uint32_t)object_ids::KERNEL_OBJECT].thread_table.insert(
       CORE1_IDLE_TID);
   idle.thread_id = CORE1_IDLE_TID;
-  idle.context = new context_t();
+  // context_t / call_stack フレームはカーネル専用プールから (malloc しない。
+  // kernel.hpp 冒頭コメント参照)。
+  idle.context = kernel_context_for(CORE1_IDLE_TID);
   idle.context->sp = (exception_frame_t *)psp; // 初回 yield で実 PSP に上書きされる種
   idle.context->exc_return = 0xFFFFFFFD;        // 基本フレーム/PSP へ復帰
   idle.context->psplim = psplim;               // スタックオーバーフロー検出
-  idle.call_stack.frames = (method_call_stack_t *)malloc(
-      sizeof(method_call_stack_t) * call_stack_t::MAX_DEPTH);
+  idle.context->control = CONTROL_PRIV_PSP; // カーネルオブジェクト (id=0) は常に特権
+  idle.call_stack.frames = kernel_arena_alloc_call_stack();
   idle.call_stack.depth = 0;
   idle.affinity = AFFINITY_CORE1;
   idle.grant_budget_us = 0; // core1 idle もバトン組 (thread0 と同じ理由)

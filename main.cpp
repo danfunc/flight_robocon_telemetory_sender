@@ -65,9 +65,23 @@ void hardfault_handler() {
 // ハング) と切り分けられる。
 // poll/evt は BLE_UART_DRIVER の生存カウンタ: poll が進まない=BLE スレッド停止、
 // poll は進むが evt が進まない=HCI イベント経路 (CYW43↔host) の停止、と読む。
+#if SHIZU_NO_BLE
+// Pico 2 (無印) テストビルド: BLE_UART_DRIVER がリンクされないため、ビーコンが読む
+// カウンタと ble_tx の計装変数 (TELEMETRY の ble_send_prio が stamp する) をここで
+// 実体化する (常に 0 = BLE 非搭載の意)。
+namespace shizu {
+volatile uint32_t ble_dbg_poll = 0, ble_dbg_evt = 0;
+namespace ble_tx {
+volatile uint64_t ctrl_enq_us = 0;
+volatile uint32_t ctrl_lat_last_us = 0;
+volatile uint32_t ctrl_lat_max_us = 0;
+} // namespace ble_tx
+}
+#else
 namespace shizu {
 extern volatile uint32_t ble_dbg_poll, ble_dbg_evt;
 }
+#endif
 static bool beacon_cb(repeating_timer_t *) {
   // panic リング監視: どちらかのコアが panic していたらメッセージを印字する
   // (panic した core1 自身は stdio に書けないが、core0 のこの IRQ は生きている)。

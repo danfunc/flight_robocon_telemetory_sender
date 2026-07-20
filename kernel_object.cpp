@@ -1,4 +1,7 @@
 
+#include <concepts> // std::invocable (wrapper<T> の requires 節)。旧 kernel.hpp の
+                    // <set> 経由の推移的インクルードに頼っていたため、std::set →
+                    // 固定ビットマップ化で消えた分をここで明示する。
 #include <cstdio>
 #include <cstdlib>
 #include <hardware/dma.h> // ストリーム接続ポンプ (DMA 設定はカーネル専有)
@@ -317,7 +320,14 @@ uint32_t kernel_obj_svc_handler(uint32_t r0, uint32_t r1, uint32_t r2,
     svc<(uint32_t)shizu::kernel_object_svc_num::METHOD_EXIT>(0, 0, 0, 0, 0);
   }
 
-  shizu::obj_api::svc_num svc_num = (shizu::obj_api::svc_num)r0;
+  // API 番号のハイブリッド解釈: svc 命令の即値 (トランポリンが r4 に載せて渡す) が
+  // 非 0 ならそれが API 番号 (呼び出し元は obj_api::svci<N>。引数は従来同様 r1..r3、
+  // r0 は将来の第 4 引数用に予約)。0 なら旧来どおり r0 が API 番号 (YIELD=0 と動的
+  // 番号の呼び出し用に温存)。番号が静的に決まる呼び出しは svci が正: 即値は
+  // カーネルが pc から読むので、レジスタ 1 本の節約 + 呼び出し元の偽装余地の縮小。
+  // ※ r4==100/255 の臨時ハックは上で先に処理済み (obj_api 番号域 <100 と非衝突)。
+  shizu::obj_api::svc_num svc_num =
+      (shizu::obj_api::svc_num)(r4 != 0 ? r4 : r0);
   switch (svc_num) {
   case shizu::obj_api::svc_num::CREATE_OBJECT: {
     shizu::FOR_KERNEL_OBJECT::create_object(r1, r2, (shizu::method_t)r3);
@@ -333,9 +343,13 @@ uint32_t kernel_obj_svc_handler(uint32_t r0, uint32_t r1, uint32_t r2,
     break;
   }
   case shizu::obj_api::svc_num::ASYNC_CALL: {
-    // r1=obj_id, r2=entry, r3=arg。空き tid を自動確保して spawn。戻り r1=tid。
-    uint32_t tid =
-        shizu::FOR_KERNEL_OBJECT::async_call(r1, (shizu::method_t)r2, r3);
+    // r1 パック: [6:0]=obj_id, [9:8]=affinity マスク (0=既定 core0), [10]=budget0
+    // (1=バトン組として生成)。r2=entry, r3=arg。戻り r1=tid。
+    // affinity/budget は create_thread が READY 公開前に確定するので、別コア行き
+    // スレッドでも「作ってから set_*」の隙間レースが無い (BLE on core1 の前提)。
+    uint32_t tid = shizu::FOR_KERNEL_OBJECT::async_call(
+        r1 & 0x7Fu, (shizu::method_t)r2, r3, (r1 >> 8) & 0x3u,
+        (r1 & (1u << 10)) ? 0u : shizu::BUDGET_KEEP);
     svc<(uint32_t)shizu::kernel_object_svc_num::METHOD_EXIT>(tid, 0, 0, 0, 0);
     break;
   }
@@ -418,6 +432,16 @@ uint32_t kernel_obj_svc_handler(uint32_t r0, uint32_t r1, uint32_t r2,
     if (r1 < 128 && (r2 & shizu::AFFINITY_ALL) != 0 &&
         (r2 & ~shizu::AFFINITY_ALL) == 0)
       shizu::thread_table[r1].affinity = r2;
+    break;
+  }
+  case shizu::obj_api::svc_num::SET_OBJECT_UNPRIVILEGED: {
+    // r1=obj_id。MPU Step1 プロトタイプ。呼び出し元は必ずこの (privileged な)
+    // カーネルオブジェクト経由 = このオブジェクト自身が unprivileged でも self-elevate
+    // にはならない (書き込みはトランポリンで一時的に privileged 化された状態で行う)。
+    // 対象の create_object 直後・その objid での最初の create_thread より前に呼ぶこと
+    // (create_thread が context->control をこの時点の値から確定するため)。
+    if (r1 < 128)
+      shizu::object_table[r1].unprivileged = true;
     break;
   }
   case shizu::obj_api::svc_num::CALL_METHOD: {

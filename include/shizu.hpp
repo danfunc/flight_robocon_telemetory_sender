@@ -12,14 +12,17 @@ namespace shizu {
   uint32_t entry_PSPLIM = (stack_base + 7u) & ~7u; // スタック底 (PSPLIM)
   object_table[0].thread_table.insert(0);
   object_table[0].state = object_t::state_t::KERNEL_OBJECT;
-  thread_table[0].context = new context_t();
+  // context_t / call_stack フレームはカーネル専用プールから (malloc しない。
+  // create_thread と同じプール — kernel.hpp 冒頭コメント参照)。
+  thread_table[0].context = kernel_context_for(0);
   thread_table[0].context->sp = (shizu::exception_frame_t *)entry_PSP;
   thread_table[0].context->psplim = entry_PSPLIM;
   // スレッド 0 も基本フレーム/PSP へ復帰する前提で EXC_RETURN を種付けする。
   thread_table[0].context->exc_return = 0xFFFFFFFD;
-  // カーネルオブジェクトの呼び出しスタックも create 時に 1 回だけ確保 (SVC パス脱 malloc)。
-  thread_table[0].call_stack.frames = (method_call_stack_t *)malloc(
-      sizeof(method_call_stack_t) * call_stack_t::MAX_DEPTH);
+  // カーネルオブジェクト (id=0) は常に特権。以後この値がスレッド切替のたびに
+  // CTX_RESTORE から適用される (MPU Step1 プロトタイプ)。
+  thread_table[0].context->control = CONTROL_PRIV_PSP;
+  thread_table[0].call_stack.frames = kernel_arena_alloc_call_stack();
   thread_table[0].call_stack.depth = 0;
   // thread0 (カーネルオブジェクトの idle/スケジューラ心拍) はバトン組 = budget 無制限。
   // guest として host されると自分の GRANT_CPU がネスト扱いになるため必ず 0。

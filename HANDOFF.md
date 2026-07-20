@@ -3,7 +3,12 @@
 最終更新: 2026-07-17。このセッションで実装した内容・現在地・ロードマップ・ビルド/検証手順・
 未決定の一方向ドアをまとめる。コード内の詳細コメントと `memory/` の設計メモも併読のこと。
 
-## 0.5 2026-07-17 追加分 (ビルド済み・実機未検証)
+## 0.5 2026-07-17 追加分
+
+**実機検証状況 (2026-07-19)**: 素のビルド (BLE 込み) で panic-ring 沈黙 + BLE フルパス
+(ペアリング/暗号化/notify/RX) 動作を確認 → **PSPLIM + MPU W^X は実機合格**。core0
+util 52.7% (接続中の既知値) / core1 util 0% (センサ未接続の既知正常) も従来どおり。
+未検証: [CONNTEST] (SHIZU_STREAM_SELFTEST=1) と set_affinity のコア移動。
 
 | 機能 | 実体 | 要点 |
 |---|---|---|
@@ -16,6 +21,85 @@
 **実機で次にやる検証**: (1) 素のビルドで panic-ring 沈黙 + BLE 動作 (= PSPLIM + MPU W^X 合格)、
 (2) `SHIZU_STREAM_SELFTEST=1` で `[CONNTEST] bad=0` (= DMA ポンプ合格)、(3) どれかのアプリ
 スレッドを `set_affinity(tid, AFFINITY_ALL)` でコア移動 (BLE は core0 固定のまま)。
+
+## 0.6 2026-07-20 追加分
+
+**実機検証 (2026-07-20)**: BLE on core1 **合格** — core0 util 52%→**6.0%** / core1 54.7%、
+tx 統計 (26 pkts/s)・RSSI・接続維持・panic-ring 沈黙すべて従来どおり。core0 は飛行制御
+向けにほぼ空いた。svc 即値ハイブリッド ABI も同ビルドで実動 (全 SVC 経路が通っている)。
+
+| 機能 | 実体 | 要点 |
+|---|---|---|
+| **BLE ドライバの core1 化 (実験)** | kernel.hpp `SHIZU_BLE_ON_CORE1` (既定 1)、IO_CONTROLLER.cpp | cyw43/btstack/async_context の縛りは「**init を実行したコアからのみ**」なので、init〜poll ループ全体を core1 ピン留めスレッドに載せて整合させる (CYW43 の GPIO IRQ / async_context owner も core1 に付く)。戻すには 0 |
+| **生成時 affinity/budget + READY 最終公開** | kernel.cpp `create_thread`/`async_call`、obj_api `async_call(obj, entry, arg, affinity, budget0)` | 「作ってから set_affinity/set_thread_budget」は呼び出し元が grant 期限でプリエンプトされた隙に既定 affinity のまま claim される隙間がある (BLE だと **cyw43_arch_init が core0 で始まる事故**)。affinity/budget を READY 公開前に確定し、READY は release store で最後に publish (旧実装は初期化冒頭で READY にしていた — 他コア affinity では途中初期化 claim になる潜在バグを同時に修正)。ASYNC_CALL ABI: r1=[6:0]obj / [9:8]affinity / [10]budget0 |
+| **tx_srcs 排出表のクロスコア安全化** | BLE_UART_DRIVER.cpp | register_tx_stream は呼び出し元コア (TELEMETRY=core0) で走り core1 の poll 走査と並行するため、挿入ソート→ **append + `__dmb` + tx_src_n publish** に変更 (index 不変)。排出側は毎回 argmax で優先度選択 (≤8 要素) |
+| **svc 即値ディスパッチ (ハイブリッド ABI)** | kernel_object.cpp 冒頭 dispatch、obj_api `svci<N>(a1,a2,a3)` | svc 命令の**即値が非 0 ならそれが API 番号** (トランポリンは元々即値を r4 で渡していた)、0 なら旧来どおり r0 (YIELD=0 と動的番号用に温存)。番号は静的に決まるので新規コードは `svci` が正。引数は従来同様 r1..r3 (r0 は将来の第 4 引数用に予約)。ヘッダ内の呼び出し (obj_api/stream/call_method/export_method) は変換済み、ドライバ内の runtime 呼び出しは旧方式のまま共存可 |
+
+**既知のクロスコアリスク (BLE on core1 実験の許容事項)**: RX sink 配送 — BLE スレッド
+(core1) が受信バイトを call_method で TELEMETRY のハンドラに配送すると、その処理は
+core1 上で走り、core0 の TELEMETRY 本体スレッドと内部状態 (コマンド行バッファ /
+time-sync オフセット) を共有する。低頻度 (ping/コマンド) なので実験としては許容。
+恒久化するなら RX もストリーム化して TELEMETRY 側で pop する形に直すこと。
+
+**実機検証**: フラッシュして (i) [BLE_UART] が従来どおり接続・pairing・tx 統計を刻む、
+(ii) [CPU] の **core0 util が ~52% → 大幅減 / core1 util が増える** (cyw43 poll の移動)、
+(iii) panic-ring 沈黙、(iv) ping RTT / ctrl_lat が悪化しない、を確認。ダメなら
+`SHIZU_BLE_ON_CORE1=0` で即戻せる。
+
+## 0.7 2026-07-20 追加分その2: MPU Step1 の地均し + プロトタイプ
+
+**実機検証結果 (2026-07-20): HW-FAIL。** トグル ON でフラッシュ後、ブート途中
+(BNO055 の set_sample_sink/set_calib_sink 登録直後あたり) に HardFault
+(`exc_lr=ffffffed psp=2005AB98 msp=20081FC8`) を確認。panic-ring は経由せず
+(本物の HardFault)、hardfault_handler のダンプ 1 行目は出せている (完全な core
+lockup ではない) が、r0-r3/pc の後続ダンプは今回未取得。**「このカーネル史上初の
+CONTROL.nPRIV 切替」のリスクが的中**した形。既定ビルド (トグル OFF) へ即復旧し、
+core0 util=5.7%/core1 util=52.7% (BLE-on-core1 併用) で正常動作を再確認済み。
+詳細・容疑箇所・次回リトライの前提 (SWD デバッガ必須) は
+[[step1-unprivileged-flight-controller]] (memory) 参照。**トグルは既定 0 のまま
+リポジトリにコミット**しておくこと。
+
+前セッションの Fable 相談 (非特権分離の設計見解) を受けて、HANDOFF §6 の「着手前に決める
+べき一方向ドア」を潰す作業。3 ビルド (既定/pico2/トグル ON) とも警告ゼロでビルド確認済み。
+
+| 機能 | 実体 | 要点 |
+|---|---|---|
+| **前提1: std::set 根絶** | kernel.hpp `thread_bitmap_t` | object_t::thread_table (所属スレッド集合) が書き込み専用 (insert/clear のみ、どこからも列挙されない) の std::set だったため、SVC トランポリン経由の thread mode で毎回 malloc していた。「std::map 根絶」で狙った対象と同種の見落とし。固定 128bit ビットマップに置換 (malloc ゼロ)。API 形は insert/clear を維持 (呼び出し側は無改造)。将来の MemManage→kill/再起動が「このオブジェクトの全スレッド」を引く用途を想定して test() も用意 |
+| **前提2: カーネルデータのヒープ分離** | kernel.cpp `g_context_pool[128]` (直引き) + `g_kernel_arena` (call_stack フレーム用 bump allocator, malloc フォールバック付き)、`kernel_context_for()`/`kernel_arena_alloc_call_stack()` | context_t / call_stack フレームは今まで malloc (汎用ヒープ、__end__ 以降 = MPU W^X region1 の対象) から確保していた。**カーネル簿記が「不特権オブジェクトに渡す region」と同じ土俵にあった**のが Step1 の真の障害 (region の穴あけは PMSAv8 で不可)。静的プール/.bss アリーナへ移すだけで、リンカ配置変更なしに「カーネルデータは __end__ より前 = 不特権へ渡す region に最初から含まれない」を得る。アリーナは 32 スレッド分 (≈76KB) を静的確保し、想定超過時のみ malloc フォールバック (panic させない安全側)。実測: `__end__` が 91.7KB 後退、残りヒープ ≈226KB (十分な余裕) |
+| **Step1 プロトタイプ: FLIGHT_CONTROLLER unprivileged 化** | kernel.hpp `SHIZU_STEP1_UNPRIV_FLIGHT_CONTROLLER` (既定 **0**)、`object_t::unprivileged`、obj_api `SET_OBJECT_UNPRIVILEGED`/`set_object_unprivileged()`、context_t.control フィールド | 「特権は current-object の属性」を実装。svc_cpp_handler の METHOD_CALL / トランポリン (一般オブジェクト→カーネルオブジェクト) が object 遷移のたびに `context->control` を書き換え、METHOD_EXIT は call_stack スナップショット (= 遷移前の値。push は書き換えより前) の丸ごと復元で自動的に戻る (明示コード不要)。svc_asm_handler.S の CTX_RESTORE が例外復帰のたびに MRS+BIC+ORR+MSR の read-modify-write で nPRIV ビットだけを適用 (SPSEL/FPCA は温存、遅延 FPU 文脈を壊さない)。FLIGHT_CONTROLLER を選んだ理由: 他オブジェクトを呼ばない「葉」オブジェクト (呼ばれる専門)。既存の region1 (W^X heap, AP=RW+unpriv許可) がそのまま使えるため、**このプロトタイプは特権遷移機構の実地検証が目的で、オブジェクト間の隔離はまだ提供しない**点に注意 (隔離は Step2 の per-subsystem region) |
+
+**既知のリスク (実機で観察すべき点)**:
+- pico-sdk の `save_and_disable_interrupts` (PRIMASK 経由の CPSID) は ARMv8-M で
+  unprivileged 実行時に **NOP 化される** (フォールトせず、割り込み禁止だけがサイレントに
+  効かなくなる)。FLIGHT_CONTROLLER の printf 呼び出し (main/disarm/arm) はこのリスクを
+  踏むため `SHIZU_STEP1_UNPRIV_FLIGHT_CONTROLLER` トグル ON では呼ばないようガードした。
+  handle_state/handle_read_control/handle_set_command 本体 (memcpy + float 演算のみ) は
+  この経路を通らない。
+- MemManage は個別有効化していない (HardFault へエスカレート、既存 hardfault_handler が
+  ダンプ)。「MemManage→オブジェクト kill/再起動」の回復ポリシーは未実装 — このプロトタイプの
+  スコープ外 (HANDOFF §6 Step1 本体の課題として残す)。
+
+**実機検証は上記の通り HW-FAIL で完了 (2026-07-20)**。再挑戦する場合は SWD デバッガ
+(picoprobe 等) でブレーク/レジスタ確認できる状態を先に用意すること — シリアルの
+HardFault ダンプだけでは nPRIV 遷移バグの特定に情報が足りないと分かった。
+
+### Pico 2 (無印) 一時テストビルド (2026-07-19: pico2_w 故障中の代替)
+
+RP2350 チップは pico2_w と同一なので、上記 (1)(2)(3) の検証は BLE 経路を除きそのまま
+できる。BLE (cyw43/btstack/BLE_UART_DRIVER) をビルドから外す:
+
+```
+cmake -S . -B build_pico2 -DSHIZU_PICO2_TEST=1
+cmake --build build_pico2        # → build_pico2/main.uf2 (通常の build/ とは別)
+```
+
+- `SHIZU_NO_BLE=1` が定義され、IO_CONTROLLER は BLE_UART を起動しない
+  (`[IO] SHIZU_NO_BLE build` を印字)。ble_dbg/ctrl_lat 計装は main.cpp のスタブが実体化。
+- TELEMETRY はそのまま走る: BLE_UART への call_method は `BAD_OBJECT` で無害に返り
+  (METHOD_CALL 型付きエラー化の恩恵)、TX ストリームは LOSSLESS 満杯 → 丸ごと破棄で
+  詰まらない。センサ融合・[BEACON]/[CPU] 計装・selftest 群は全て生きる。
+- ついで修正: connect selftest のストリーム ID を 1/2 → 30/31 へ (ble_tx の
+  STREAM_BULK/CTRL=1/2 と衝突していた)。
 
 ---
 

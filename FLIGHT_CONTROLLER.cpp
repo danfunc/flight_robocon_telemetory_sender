@@ -11,17 +11,21 @@
 //     線形補間で表す。値は同定前のプレースホルダ (下記 K_PITCH/K_YAW)。
 //
 //  2) 運動モデル (設計根拠; ここでは制御則の前提として明記)
-//     ピッチ: theta_ddot = k_pitch(u_thr)*elev + M_UNSTABLE*theta
+//     ピッチ: theta_ddot = k_pitch(u_thr)*elev + M_ALPHA*theta
 //                          - c_p*theta_dot + m_prop*u_thr
-//       ・M_UNSTABLE>0 … 空力中心が重心前方の静的不安定 (放置で急ピッチアップ)
+//       ・M_ALPHA … 静安定余裕の符号付き係数。現行機体は空力中心が重心後方に
+//         是正済みで M_ALPHA<0 (復元モーメント = 静安定)。
+//         (履歴: 初期機体は空力中心が重心前方で M_ALPHA>0 の静的不安定 —
+//          放置で急ピッチアップ — であり、本制御則はその能動安定化を前提に
+//          設計された。改修後も構造は変えていない。)
 //       ・m_prop*u_thr … 後流がエレベータを直撃するスロットル起因のピッチ外乱
 //     ヨー:   psi_ddot   = k_yaw(u_thr)*rud - c_y*psi_dot
 //     高度:   h_dot      ~= gamma*(u_thr - thr_trim)   (ピッチ一定下, backside)
 //
 //  3) 制御則 (軸別, スロットルでゲインスケジュール)
-//     ・ピッチ内側: 姿勢一定 PD(+I) で不安定を能動安定化。後流外乱を前置補償し、
-//       効き正規化 elev = v_p / k_pitch(u_thr) で throttle 依存を打ち消す
-//       (ループ利得を一定化 → 静的不安定でも極を左半面へ)。
+//     ・ピッチ内側: 姿勢一定 PD(+I)。現行機体は静安定なので役割は姿勢保持と
+//       外乱抑圧。後流外乱を前置補償し、効き正規化 elev = v_p / k_pitch(u_thr)
+//       で throttle 依存を打ち消す (ループ利得を一定化)。
 //     ・ヨー: 方位保持 PD、rud = v_y / k_yaw(u_thr)。
 //     ・高度外側: スロットル PI(+上下速度ダンピング)。この u_thr を上2軸の
 //       スケジュール変数に使い、機体固有の相互結合を陽に扱う。
@@ -52,7 +56,8 @@ static const float K_PITCH[KN] = {0.35f, 0.65f, 1.00f, 1.45f, 1.85f};
 static const float K_YAW[KN]   = {0.30f, 0.55f, 1.00f, 1.40f, 1.70f};
 
 // ---- 制御ゲイン [プレースホルダ, 要チューニング] ---------------------------
-// ピッチ内側 (姿勢一定 + 不安定安定化)。安定条件 KP_PITCH > M_UNSTABLE 相当。
+// ピッチ内側 (姿勢一定)。機体静安定化 (M_ALPHA<0) により旧安定条件
+// 「KP_PITCH > M_ALPHA 相当」は拘束でなくなった — ゲインは応答整形だけで決めてよい。
 static constexpr float KP_PITCH = 2.0f;      // [elev-authority / deg]
 static constexpr float KD_PITCH = 0.4f;      // [elev-authority / (deg/s)]
 static constexpr float KI_PITCH = 0.3f;      // [elev-authority / (deg*s)]
@@ -186,7 +191,7 @@ static void handle_state(uint32_t, uint32_t, uint32_t ptr, uint32_t) {
   float kp_eff = k_lookup(THR_BP, K_PITCH, KN, u_thr);
   float ky_eff = k_lookup(THR_BP, K_YAW, KN, u_thr);
 
-  // --- ピッチ内側ループ (姿勢一定, 不安定安定化) ---
+  // --- ピッチ内側ループ (姿勢一定) ---
   float th_rate = g_primed ? (s.pitch - g_pitch_prev) / dt : 0.f;
   g_pitch_prev = s.pitch;
   float e_p = g_pitch_ref - s.pitch;
@@ -233,14 +238,22 @@ static void handle_set_command(uint32_t, uint32_t, uint32_t ptr, uint32_t) {
   switch (c.kind) {
   case 0: // disarm
     g_armed = false;
+#if !SHIZU_STEP1_UNPRIV_FLIGHT_CONTROLLER
+    // unprivileged ビルドでは呼ばない: pico-sdk の stdio 内部が critical section で
+    // PRIMASK 経由の CPSID を使うことがあり、CPS 系命令は ARMv8-M で unprivileged
+    // 実行時に NOP 化される (フォールトせず割り込み禁止だけがサイレントに効かなく
+    // なる) — kernel.hpp SHIZU_STEP1_UNPRIV_FLIGHT_CONTROLLER のコメント参照。
     printf("[FLIGHT] disarm\n");
+#endif
     break;
   case 1: // arm (方位目標を再捕捉, 積分リセット)
     g_armed = true;
     g_heading_ref_set = false;
     g_pitch_i = 0.f;
     g_alt_i = 0.f;
+#if !SHIZU_STEP1_UNPRIV_FLIGHT_CONTROLLER
     printf("[FLIGHT] arm\n");
+#endif
     break;
   case 2: // alt_ref [m]
     g_alt_ref = c.value;
@@ -264,7 +277,9 @@ static void handle_set_command(uint32_t, uint32_t, uint32_t ptr, uint32_t) {
 //  オブジェクトエントリ
 // ===========================================================================
 void FLIGHT_CONTROLLER::main() {
+#if !SHIZU_STEP1_UNPRIV_FLIGHT_CONTROLLER
   printf("[FLIGHT] main\n");
+#endif
   // 制御はすべて on_state の push (TELEMETRY からの同期呼び出し) で駆動する。
   export_method<handle_state>(FLIGHT_CONTROLLER::METHOD_IDs::on_state);
   export_method<handle_read_control>(FLIGHT_CONTROLLER::METHOD_IDs::read_control);

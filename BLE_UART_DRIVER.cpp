@@ -110,28 +110,31 @@ volatile uint32_t ctrl_lat_max_us = 0;
 // 絶対に出さない → MORE フレーミングが壊れない)。
 static shizu::stream::storage<bt::frame_t, 16, shizu::stream::LOSSLESS> g_tx_sys;
 
-// 排出対象ストリーム表 (priority 降順)。ローカル sys + register_tx_stream の外部登録。
+// 排出対象ストリーム表 (未ソート・追記専用)。ローカル sys + register_tx_stream の
+// 外部登録。register_tx_stream は**呼び出し元スレッドのコア**で走る (BLE on core1 の
+// とき TELEMETRY=core0 から) ため、core1 の poll ループの走査と並行し得る。既存要素を
+// シフトしない (index 不変) + tx_src_n を最後に publish、で torn 読みを塞ぐ。優先度は
+// 排出側が毎回 argmax で選ぶ (要素数 ≤8 なので走査コストは無視できる)。
 struct tx_src_t {
   bt::handle_t h;
   uint32_t prio;
 };
 static tx_src_t tx_srcs[8];
-static uint32_t tx_src_n = 0;
+static volatile uint32_t tx_src_n = 0;
 // メッセージ途中のソース index。MORE 中はここを保持し、CAN_SEND_NOW を跨いでも同一
 // ストリームを継続排出する (他ストリームの割り込み禁止 = host のバイトパーサ保護)。
 static int tx_cur_src = -1;
 static uint32_t dropped_msgs = 0; // 容量不足で丸ごと捨てたメッセージ数 (デバッグ用)
 
-// priority 降順に挿入 (要素数は小さいので線形)。
+// 末尾に完全に書いてから tx_src_n を publish する (旧: 挿入ソート — 既存要素の
+// シフトが走査と並行すると torn handle 読みになるため廃止)。
 static void tx_src_insert(bt::handle_t h, uint32_t prio) {
-  if (tx_src_n >= (sizeof(tx_srcs) / sizeof(tx_srcs[0])))
+  const uint32_t n = tx_src_n;
+  if (n >= (sizeof(tx_srcs) / sizeof(tx_srcs[0])))
     return;
-  uint32_t i = tx_src_n++;
-  while (i > 0 && tx_srcs[i - 1].prio < prio) {
-    tx_srcs[i] = tx_srcs[i - 1];
-    --i;
-  }
-  tx_srcs[i] = {h, prio};
+  tx_srcs[n] = {h, prio};
+  __dmb(); // エントリ本体の書き込みを publish (tx_src_n) より先に完了させる
+  tx_src_n = n + 1;
 }
 
 // 登録ストリームが全て空か (poll ループの can_send 補填判定用)。
@@ -229,11 +232,13 @@ static void flush_tx() {
   uint32_t bulk_pdus = 0;
   while (true) {
     int src = tx_cur_src;
-    if (src < 0) { // メッセージ境界: 最高優先度の非空を選ぶ (priority 降順ソート済み)
-      for (uint32_t i = 0; i < tx_src_n; ++i) {
-        if (!tx_srcs[i].h.empty()) {
+    if (src < 0) { // メッセージ境界: 空でない最高優先度を選ぶ (表は未ソート → argmax)
+      uint32_t best_prio = 0;
+      const uint32_t n = tx_src_n;
+      for (uint32_t i = 0; i < n; ++i) {
+        if (!tx_srcs[i].h.empty() && (src < 0 || tx_srcs[i].prio > best_prio)) {
           src = (int)i;
-          break;
+          best_prio = tx_srcs[i].prio;
         }
       }
       if (src < 0)

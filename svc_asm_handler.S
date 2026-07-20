@@ -13,6 +13,7 @@
 .equ CTX_EXC_RETURN, 36
 .equ CTX_FP,         40
 .equ CTX_PSPLIM,     104  // kernel.hpp context_t::psplim と一致
+.equ CTX_CONTROL,    108  // kernel.hpp context_t::control と一致 (MPU Step1)
 
 // ---------------------------------------------------------------------------
 // CTX_SAVE — 現在スレッドの context_t へ {r4-r11, PSP, EXC_RETURN, 遅延 S16-S31}
@@ -73,6 +74,20 @@
     // psplim(base+104) は +68。r1 は上で PSP 復元に使い終わっていて空き。
     ldr  r1,[r0, #(CTX_PSPLIM - CTX_EXC_RETURN)]
     msr  PSPLIM, r1
+
+    // CONTROL.nPRIV を復元 (MPU Step1: オブジェクト境界ごとに svc_cpp_handler が
+    // ctx->control を書き換える。ここは適用するだけ)。bit0(nPRIV) だけを ctx->control
+    // の値へ差し替える read-modify-write — MRS で読んだ「現在の」CONTROL を土台にする
+    // ことで、bit1(SPSEL, 常に1で不変) と bit2(FPCA, ハードウェアが遅延 FPU 文脈で
+    // 管理) を絶対に壊さない。r0/r3 (context 先頭+36 / exc_return) は温存必須、
+    // r1/r2 はここまでで用済みなので自由に使う。
+    ldr  r1,[r0, #(CTX_CONTROL - CTX_EXC_RETURN)]
+    mrs  r2, CONTROL
+    bic  r2, r2, #1
+    and  r1, r1, #1
+    orr  r2, r2, r1
+    msr  CONTROL, r2
+    isb
 
 #if defined(__ARM_FP)
     // 復帰対象が拡張(FP)フレームなら S16-S31 を復元する。

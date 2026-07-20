@@ -3,7 +3,6 @@
 #define SHIZU_KERNEL_HPP
 #include <cstdint>
 #include <pico.h> // get_core_num (grant_active_this_core)
-#include <set>
 
 // デュアルコアトグル: 1 = core1 を Shizuku カーネルとして起動し、センサ I/O を
 // SENSOR_IO スレッド (core1 ピン留め) として走らせる。0 = 従来どおり core1 を
@@ -29,6 +28,44 @@
 // 2 コア安全性を数分単位で炙る。reporter がカウンタを 2s ごとに印字 (全て前進 = 健全)。
 #ifndef SHIZU_SMP_STRESS
 #define SHIZU_SMP_STRESS 0
+#endif
+
+// Pico 2 (無印) 一時テストビルド用トグル: 1 = BLE (cyw43/btstack/BLE_UART_DRIVER) を
+// ビルドから外す。CMake の -DSHIZU_PICO2_TEST=1 が定義する (手で立てるものではない)。
+// RP2350 チップは pico2_w と同一なので、カーネル検証 (PSPLIM/MPU/DMA/affinity) は等価。
+#ifndef SHIZU_NO_BLE
+#define SHIZU_NO_BLE 0
+#endif
+
+// BLE ドライバを core1 で走らせる実験トグル: 1 = BLE_UART_DRIVER スレッドを
+// AFFINITY_CORE1 + budget0 (バトン組) で生成する。cyw43/btstack/async_context の
+// コア縛りは「init を実行したコアと同じコアからしか触れない」なので、init〜poll
+// ループ全体が core1 ピン留めスレッドに載れば整合する (CYW43 の GPIO IRQ と
+// async_context の owner も core1 になる)。0 = 従来どおり core0。
+// 既知のクロスコア面: (i) tx_srcs 排出表への登録は core0 の TELEMETRY スレッドで
+// 走る → append+publish 化で対処済み。(ii) RX sink 配送 (BLE スレッドが core1 で
+// TELEMETRY のハンドラを実行) は TELEMETRY 内部状態と並行になる — 低頻度
+// (ping/コマンド行) の既知リスクとして許容 (実験トグルたる所以)。
+#ifndef SHIZU_BLE_ON_CORE1
+#define SHIZU_BLE_ON_CORE1 1
+#endif
+
+// MPU Step1 プロトタイプトグル (HANDOFF §6): 1 = FLIGHT_CONTROLLER を
+// unprivileged (CONTROL.nPRIV=1) で走らせる。既定 0 — W^X/BLE-on-core1 と違い
+// このカーネルで「不特権スレッドを実際に走らせる」のはこのセッションが初めてで、
+// CONTROL 遷移機構 (svc_cpp_handler の METHOD_CALL/トランポリン, svc_asm_handler.S
+// の CTX_RESTORE) 自体が実機未検証のため、デフォルト ON にしない。
+// 既知のリスク: FLIGHT_CONTROLLER::main の printf は pico-sdk 内部で
+// save_and_disable_interrupts (PRIMASK 経由の CPSID) を使うことがあり、CPS 系命令は
+// ARMv8-M では unprivileged 実行時に NOP 化される (フォールトはしないが、意図した
+// 割り込み禁止がサイレントに効かなくなる) — このトグル ON のビルドでは
+// FLIGHT_CONTROLLER.cpp 側で該当 printf を SHIZU_STEP1_UNPRIV_FLIGHT_CONTROLLER
+// でガードして呼ばないようにしてある。region1 (W^X heap) は unprivileged にも
+// RW を許可しているため、他オブジェクトのスタック/静的データへのアクセス自体は
+// フォールトしない (= このプロトタイプは「特権遷移機構の実地検証」が目的で、
+// オブジェクト間の隔離はまだ提供しない。隔離は Step2 の per-subsystem region)。
+#ifndef SHIZU_STEP1_UNPRIV_FLIGHT_CONTROLLER
+#define SHIZU_STEP1_UNPRIV_FLIGHT_CONTROLLER 0
 #endif
 
 // MPU Step0 (W^X) トグル: 1 = 両コアで MPU を有効化し、(i) XIP flash 全窓 = RO+X、
@@ -79,16 +116,26 @@ struct method_call_stack_t;
 
 extern object_t object_table[128];
 extern thread_t thread_table[128];
+// create_thread/async_call の budget_us 引数「thread_table_init の既定を維持」の
+// センチネル (0 は「無制限バトン」という正当値なので別値が要る)。
+constexpr uint32_t BUDGET_KEEP = 0xFFFFFFFFu;
+
 namespace FOR_KERNEL_OBJECT {
 void export_method(uint32_t obj_num, uint32_t method_num, method_t entry);
 void exit_method(uint32_t return_code);
 void create_object(uint32_t obj_num, uint32_t thread_num, method_t entry);
 void create_object(uint32_t obj_num); // オブジェクトのみ生成 (スレッド無し)
+// arg は entry の r0 に載る。affinity (0=既定 core0 を維持) と budget_us
+// (BUDGET_KEEP=既定を維持, 0=バトン組) は READY 公開**前**に確定する — 別コア行き
+// スレッドを「作ってから set_affinity」の隙間レース (途中初期化のまま他コアが
+// claim / 既定 core0 で走り出してから移動) なしに生成するための生成時オプション。
 void create_thread(uint32_t obj_num, uint32_t thread_num, method_t entry,
-                   uint32_t arg = 0); // arg は entry の r0 に載る
+                   uint32_t arg = 0, uint32_t affinity = 0,
+                   uint32_t budget_us = BUDGET_KEEP);
 // 空きスレッドスロット (1..127) を自動確保して entry を非同期起動する。戻り = 割り当てた
 // thread_id。オブジェクト起動 = create_object(id) + async_call(id, main) の 2 段で行う。
-uint32_t async_call(uint32_t obj_num, method_t entry, uint32_t arg = 0);
+uint32_t async_call(uint32_t obj_num, method_t entry, uint32_t arg = 0,
+                    uint32_t affinity = 0, uint32_t budget_us = BUDGET_KEEP);
 } // namespace FOR_KERNEL_OBJECT
 
 } // namespace shizu
@@ -122,11 +169,24 @@ class cpu_manager {
   friend void ::shizu_panic(const char *fmt, ...); // panic 記録に thread id を載せる
 };
 
+// object_t::thread_table の実体。所属スレッド集合は書き込み専用 (insert/clear のみ、
+// 現状どこからも列挙されない) — 元は std::set だったが、insert が SVC トランポリン
+// 経由の thread mode で毎回 malloc/木リバランスする「std::map 根絶」で狙った対象と
+// 同種の残存箇所だったため、固定 128bit ビットマップに置き換える (malloc ゼロ)。
+// 将来の MemManage→kill/再起動 (HANDOFF §6) が「このオブジェクトの全スレッド」を
+// 引くのに使う想定で API 形だけ std::set と揃えてある。
+struct thread_bitmap_t {
+  uint32_t bits[4] = {}; // 128 スレッド分 (4 x 32bit)
+  void clear() { bits[0] = bits[1] = bits[2] = bits[3] = 0; }
+  void insert(uint32_t tid) { bits[tid >> 5] |= (1u << (tid & 31)); }
+  bool test(uint32_t tid) const { return (bits[tid >> 5] >> (tid & 31)) & 1u; }
+};
+
 struct object_t {
   uint32_t id;
   uint32_t svc_handler_obj_id;
   uint32_t svc_handler_method_num;
-  std::set<uint32_t> thread_table;
+  thread_bitmap_t thread_table;
   method_t method_table[128];
   enum struct state_t {
     UNINITIALIZED = 0,
@@ -134,6 +194,14 @@ struct object_t {
     KERNEL_SPACE_OBJECT = 2,
 
   } state;
+  // MPU Step1 プロトタイプ (HANDOFF §6): true = このオブジェクトとして走行中は
+  // CONTROL.nPRIV=1 (unprivileged Thread mode)。既定 false = 従来どおり全オブジェクト
+  // 特権 (このセッションまでの挙動と完全互換)。svc_cpp_handler が METHOD_CALL /
+  // METHOD_EXIT / トランポリンでの object 遷移のたびに CONTROL を張り替える。
+  // SET_OBJECT_UNPRIVILEGED (obj_api::svc_num) で、対象オブジェクトのスレッドが
+  // 走り出す**前**に (create_object 直後・async_call 前に) 立てること — 生成時に
+  // context->control を確定するので、後から立てても既存スレッドには反映されない。
+  bool unprivileged = false;
 };
 
 enum struct kernel_object_svc_num : uint32_t {
@@ -179,6 +247,13 @@ enum struct call_error : uint32_t {
 constexpr uint32_t AFFINITY_CORE0 = 0b01;
 constexpr uint32_t AFFINITY_CORE1 = 0b10;
 constexpr uint32_t AFFINITY_ALL = 0b11;
+
+// CONTROL レジスタの既定値 (bit1=SPSEL=1 固定: 全スレッド PSP 使用、bit0=nPRIV)。
+// bit2(FPCA) はハードウェアが管理するので、この定数はキャッシュ専用 — 実際の
+// MSR CONTROL は svc_asm_handler.S の CTX_RESTORE が MRS で読んだ現在値の bit0 だけを
+// この値で置き換える read-modify-write を行う (FPCA/SPSEL を壊さない)。
+constexpr uint32_t CONTROL_PRIV_PSP = 0b10;   // nPRIV=0 (特権)
+constexpr uint32_t CONTROL_UNPRIV_PSP = 0b11; // nPRIV=1 (非特権, MPU Step1 プロトタイプ)
 
 // ---- 時限実行権移譲 (GRANT_CPU / run_for) ---------------------------------
 // GRANT_CPU の型付きエラー。先頭 3 値は switch_error と値を揃える (claim 共通ヘルパの
@@ -243,6 +318,16 @@ struct context_t {
   // CTX_SAVE では触らない)。0 = 制限なし (未設定スレッドの安全既定)。
   // svc_asm_handler.S の .equ CTX_PSPLIM(104) と一致させること。
   uint32_t psplim; // offset 104
+  // control: このスレッドが「現在のオブジェクト」として走るときの CONTROL レジスタ
+  // 値のキャッシュ (CONTROL_PRIV_PSP / CONTROL_UNPRIV_PSP)。svc_cpp_handler が
+  // METHOD_CALL (呼び先オブジェクトの値に更新) / トランポリン (カーネルオブジェクトの
+  // 値=常に PRIV に更新) のたびに書き換える。METHOD_EXIT は call_stack のスナップ
+  // ショット (= 呼び出し前の値。push は書き換えより前に取るので自動的に正しい) を
+  // context_t ごと丸ごと復元するので、戻り側は明示的な書き換え不要。CTX_RESTORE が
+  // 例外復帰のたびに (スレッド切替でも同一スレッド復帰でも) この値を適用する。
+  // create_thread がスレッド生成時にオブジェクトの unprivileged フラグから初期化する。
+  // svc_asm_handler.S の .equ CTX_CONTROL(108) と一致させること。
+  uint32_t control; // offset 108
 };
 
 struct exception_frame_t {
@@ -298,12 +383,25 @@ struct thread_t {
   context_t *context;
   uint32_t object_id;
   uint32_t thread_id;
-  void ready_to_run();
   call_stack_t call_stack;
 };
 
 void object_table_init();
 void thread_table_init();
+
+// ---- カーネル専用データ (kernel.cpp の静的プール、malloc 非使用) -------------
+// context_t は thread_id で直接引ける固定 128 スロットプール (存在する最大
+// thread_id が 128 未満なのは既に全体の不変条件)。call_stack フレームはスレッド数が
+// 実行時可変なのでカーネル専用アリーナ (bump allocator, malloc フォールバック付き)
+// から確保する。どちらも create_thread / 起動時ブートストラップ (thread0, core1
+// idle) の 3 箇所が共通で使う — 汎用ヒープ (malloc、スレッドスタックが住む場所) と
+// 物理的に分離することが目的: 汎用ヒープは .bss/.data の後 (__end__ 以降) にあり
+// MPU Step0 の W^X region1 [__end__, SRAM_END) の対象。カーネル専用プールは
+// __end__ より前の静的領域 (.bss) に置かれるため、Step1 で不特権オブジェクトへ
+// 渡す MPU region (heap 側だけ) には最初から含まれない — リンカ配置の変更なしに
+// 「カーネル簿記は不特権から触れない」を得られる (HANDOFF §6 の一方向ドアの解)。
+context_t *kernel_context_for(uint32_t thread_id);
+method_call_stack_t *kernel_arena_alloc_call_stack();
 
 } // namespace shizu
 #endif // SHIZU_KERNEL_HPP

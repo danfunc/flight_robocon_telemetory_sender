@@ -92,6 +92,8 @@ static_assert(offsetof(shizu::context_t, fp) == 40,
               "context_t layout mismatch: fp offset (asm CTX_FP)");
 static_assert(offsetof(shizu::context_t, psplim) == 104,
               "context_t layout mismatch: psplim offset (asm CTX_PSPLIM)");
+static_assert(offsetof(shizu::context_t, control) == 108,
+              "context_t layout mismatch: control offset (asm CTX_CONTROL)");
 // claim は (uint32_t*)&thread.state を __atomic で叩くので 4B 幅を保証する。
 static_assert(sizeof(shizu::thread_t::state_t) == 4,
               "thread state must be a 32-bit word for __atomic claim CAS");
@@ -104,6 +106,48 @@ void *get_psp();
 namespace shizu {
 object_t object_table[128];
 thread_t thread_table[128];
+
+// ---------------------------------------------------------------------------
+//  カーネル専用データプール (kernel.hpp 冒頭のコメント参照) — malloc ヒープ
+//  (__end__ 以降) と物理的に分離した .bss 常駐領域。MPU Step1 で不特権オブジェクトへ
+//  渡す region から自然に外れる (リンカ配置変更なし)。
+// ---------------------------------------------------------------------------
+// context_t: thread_id で直引きする固定 128 スロット。.bss ゼロ初期化 = 旧
+// `new context_t()` (POD の value-init = ゼロ初期化) と同じ既定値なので挙動不変。
+static context_t g_context_pool[128];
+
+context_t *kernel_context_for(uint32_t thread_id) {
+  return &g_context_pool[thread_id];
+}
+
+// call_stack フレーム用のカーネルアリーナ (bump allocator, 解放なし = 現行 malloc
+// 運用と同じ「スレッド寿命 = プロセス寿命、解放パス無し」の前提を継承)。実運用の
+// スレッド数 (本番構成で ~10、selftest 込みでも ~30 程度) に対して 32 スレッド分の
+// 余裕を静的確保し、超過時だけ malloc へフォールバックする (性能でなく安全側: 想定を
+// 超えた場合に panic させず、分離の恩恵をその分だけ諦めて動作を継続する)。
+constexpr uint32_t KERNEL_ARENA_THREAD_MARGIN = 32;
+constexpr uint32_t KERNEL_ARENA_BYTES =
+    KERNEL_ARENA_THREAD_MARGIN * call_stack_t::MAX_DEPTH *
+    sizeof(method_call_stack_t);
+alignas(8) static uint8_t g_kernel_arena[KERNEL_ARENA_BYTES];
+static uint32_t g_kernel_arena_used = 0;
+static uint32_t g_kernel_arena_fallback_n = 0; // malloc フォールバック回数 (計装)
+
+method_call_stack_t *kernel_arena_alloc_call_stack() {
+  constexpr uint32_t bytes = sizeof(method_call_stack_t) * call_stack_t::MAX_DEPTH;
+  if (g_kernel_arena_used + bytes <= KERNEL_ARENA_BYTES) {
+    void *p = &g_kernel_arena[g_kernel_arena_used];
+    g_kernel_arena_used += bytes;
+    return (method_call_stack_t *)p;
+  }
+  // 想定スレッド数を超過。malloc へフォールバック (この分だけ Step1 の分離対象から
+  // 漏れるが、致命的にはしない — g_kernel_arena_fallback_n で検知可能にしておく)。
+  ++g_kernel_arena_fallback_n;
+  printf("[KERNEL] arena exhausted (fallback #%lu) — bump "
+        "KERNEL_ARENA_THREAD_MARGIN if this repeats\n",
+        (unsigned long)g_kernel_arena_fallback_n);
+  return (method_call_stack_t *)malloc(bytes);
+}
 
 void object_table_init() {
   for (uint32_t i = 0; i < 128; i++) {
@@ -335,12 +379,16 @@ void cpu_manager::init() {
   mpu_init_this_core(); // MPU は per-core banked。core1 は init_core1 が呼ぶ
 }
 
-void thread_t::ready_to_run() {
-  this->context = new context_t();
-  this->state = state_t::READY;
-}
-
 cpu_manager::svc_handler_descriptor cpu_manager::svc_handler_info{nullptr, 0};
+
+// MPU Step1 プロトタイプ: obj_id が現在の「実行中オブジェクト」であるとき、
+// CONTROL レジスタが持つべき値 (nPRIV ビット) を object_table[obj_id].unprivileged
+// から導出する。svc_cpp_handler の METHOD_CALL/トランポリンと create_thread が使う
+// 唯一の導出点 (「特権は current-object の属性」という不変条件をここに集約する)。
+static inline uint32_t control_for_object(uint32_t obj_id) {
+  return object_table[obj_id].unprivileged ? CONTROL_UNPRIV_PSP
+                                           : CONTROL_PRIV_PSP;
+}
 
 namespace FOR_KERNEL_OBJECT {
 
@@ -354,10 +402,12 @@ void create_object(uint32_t obj_num) { shizu::create_object(obj_num); }
 
 // 空きスレッドスロット (1..127, 0 はカーネルオブジェクト予約) を自動確保して entry を
 // 非同期起動する。戻り = 割り当てた thread_id。
-uint32_t async_call(uint32_t obj_num, method_t entry, uint32_t arg) {
+uint32_t async_call(uint32_t obj_num, method_t entry, uint32_t arg,
+                    uint32_t affinity, uint32_t budget_us) {
   for (uint32_t t = 1; t < 128; ++t) {
     if (thread_table[t].state == thread_t::state_t::UNINITIALIZED) {
-      shizu::FOR_KERNEL_OBJECT::create_thread(obj_num, t, entry, arg);
+      shizu::FOR_KERNEL_OBJECT::create_thread(obj_num, t, entry, arg, affinity,
+                                              budget_us);
       return t;
     }
   }
@@ -366,39 +416,57 @@ uint32_t async_call(uint32_t obj_num, method_t entry, uint32_t arg) {
 }
 
 void create_thread(uint32_t obj_num, uint32_t thread_num, method_t entry,
-                   uint32_t arg) {
+                   uint32_t arg, uint32_t affinity, uint32_t budget_us) {
   if (thread_table[thread_num].state == thread_t::state_t::UNINITIALIZED) {
-    thread_table[thread_num].object_id = obj_num;
-    thread_table[thread_num].ready_to_run();
+    thread_t &t = thread_table[thread_num];
+    t.object_id = obj_num;
+    // context_t はカーネル専用の固定プールから (malloc しない。kernel.hpp 冒頭
+    // コメント参照)。.bss ゼロ初期化済みなので旧 `new context_t()` と初期値は等価。
+    t.context = kernel_context_for(thread_num);
     // BLE/CYW43 (btstack) の送信・暗号化パスは深く、2KB ではオーバーフローして
     // HardFault する。1 スレッドあたり 8KB へ拡張 (RP2350 は RAM に余裕あり)。
     constexpr uint32_t THREAD_STACK_SIZE = 8192;
     uint32_t stack_base = (uint32_t)malloc(THREAD_STACK_SIZE);
-    thread_table[thread_num].context->sp =
+    t.context->sp =
         (exception_frame_t *)((stack_base + THREAD_STACK_SIZE -
                                sizeof(exception_frame_t)) &
                               ~((uint32_t)0xfL));
     // PSPLIM = スタック底 (8B アライン上げ)。PSP がここを下回ると即フォルト。
-    thread_table[thread_num].context->psplim = (stack_base + 7u) & ~7u;
-    thread_table[thread_num].context->sp->pc = (uint32_t)entry;
-    thread_table[thread_num].context->sp->lr =
-        (uint32_t)shizu::FOR_KERNEL_OBJECT::exit_method;
-    thread_table[thread_num].context->sp->r0 = arg; // entry の第1引数
-    thread_table[thread_num].context->sp->r1 = 0;
-    thread_table[thread_num].context->sp->r2 = 0;
-    thread_table[thread_num].context->sp->r3 = 0;
-    thread_table[thread_num].context->sp->r12 = 0;
-    thread_table[thread_num].context->sp->xPSR = (1 << 24);
+    t.context->psplim = (stack_base + 7u) & ~7u;
+    t.context->sp->pc = (uint32_t)entry;
+    t.context->sp->lr = (uint32_t)shizu::FOR_KERNEL_OBJECT::exit_method;
+    t.context->sp->r0 = arg; // entry の第1引数
+    t.context->sp->r1 = 0;
+    t.context->sp->r2 = 0;
+    t.context->sp->r3 = 0;
+    t.context->sp->r12 = 0;
+    t.context->sp->xPSR = (1 << 24);
     // 新規スレッドは基本フレーム (FP 無効) の Thread/PSP へ復帰する。
     // 0 のままだと初回復帰で bx 0 → 即 HardFault。必ず明示的に種を入れる。
-    thread_table[thread_num].context->exc_return = 0xFFFFFFFD;
-    // 呼び出しスタックは create 時 (スレッドモード) に 1 回だけ確保する。以後 SVC
-    // 例外ハンドラ内 (METHOD_CALL / トランポリン) では malloc しない。
-    thread_table[thread_num].call_stack.frames =
-        (method_call_stack_t *)malloc(sizeof(method_call_stack_t) *
-                                      call_stack_t::MAX_DEPTH);
-    thread_table[thread_num].call_stack.depth = 0;
+    t.context->exc_return = 0xFFFFFFFD;
+    // MPU Step1 プロトタイプ: このスレッドの「現在オブジェクト」= 生成先 obj_num の
+    // 特権属性から CONTROL 初期値を確定する (既定は全オブジェクト特権なので不変)。
+    t.context->control = control_for_object(obj_num);
+    // 呼び出しスタックはカーネル専用アリーナから create 時 (スレッドモード) に
+    // 1 回だけ確保する。以後 SVC 例外ハンドラ内 (METHOD_CALL / トランポリン) では
+    // malloc しない (アリーナ超過時のみ内部でフォールバックする)。
+    t.call_stack.frames = kernel_arena_alloc_call_stack();
+    t.call_stack.depth = 0;
     object_table[obj_num].thread_table.insert(thread_num);
+    // 生成時オプション (0 / BUDGET_KEEP = thread_table_init の既定を維持)。
+    // READY 公開前に確定させることが本質: 別コア行き (affinity=CORE1 等) の
+    // スレッドが「既定 core0 のまま走り出してから移動」する隙間を作らない。
+    if (affinity != 0)
+      t.affinity = affinity & AFFINITY_ALL;
+    if (budget_us != BUDGET_KEEP)
+      t.grant_budget_us = budget_us;
+    // READY は最後に release で公開。claim 側 (try_claim の ACQUIRE CAS) が READY を
+    // 観測した時点で、上の初期化 (context/スタック/affinity/budget) が全て可視になる
+    // — 旧実装は初期化冒頭で READY にしており、他コア affinity だと途中初期化のまま
+    // claim され得た (これまで顕在化しなかったのは既定 affinity が生成コア=core0 で
+    // 生成中は core0 が busy だったため)。
+    __atomic_store_n((uint32_t *)&t.state, (uint32_t)thread_t::state_t::READY,
+                     __ATOMIC_RELEASE);
   } else {
     panic("this thread is already initialized\ncalling this system call for "
           "\n thread_id: %d\n object_id: %d\n",
@@ -607,6 +675,12 @@ void svc_cpp_handler(shizu::context_t *context) {
       stack_frame->r3 = arg3;
       stack_frame->r12 = r12;
       current_thread.object_id = arg0;
+      // MPU Step1 プロトタイプ: 呼び先オブジェクトの特権属性へ CONTROL を張り替える
+      // (この svc は例外ハンドラ内 = Handler mode なので MSR CONTROL は無条件で許可
+      // される。実際に効くのは次の例外復帰から)。呼び出し元の値は上で push した
+      // call_stack スナップショット (= 張り替え前の *context) に残っているので、
+      // METHOD_EXIT 側は明示コード無しでスナップショット復元だけで元に戻る。
+      context->control = shizu::control_for_object(arg0);
       // printf("pc: %lx\n", stack_frame->pc);
       break;
     }
@@ -757,6 +831,12 @@ void svc_cpp_handler(shizu::context_t *context) {
     stack_frame->lr = (uint32_t)shizu::FOR_KERNEL_OBJECT::exit_method;
     current_thread.object_id =
         shizu::cpu_manager::svc_handler_info.handling_object_id;
+    // MPU Step1: ハンドラ所有オブジェクト (通常カーネルオブジェクト=特権) の値へ。
+    // METHOD_CALL 分岐と同じ規約 — push は上で完了済みなので、戻り側 (EXIT_METHOD →
+    // METHOD_EXIT) は call_stack のスナップショット復元だけで元の呼び出し元の
+    // 特権に戻る (明示コード不要)。
+    context->control = shizu::control_for_object(
+        shizu::cpu_manager::svc_handler_info.handling_object_id);
     current_thread.context->r4 = (uint32_t)svc_num;
     current_thread.context->r5 = caller_obj_num;
     current_thread.context->r6 = caller_thread_id;

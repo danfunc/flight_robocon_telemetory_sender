@@ -257,23 +257,23 @@ template <typename REC, uint32_t CAPACITY, uint32_t FLAGS = LOSSY> struct storag
 // ===========================================================================
 // owner がディスクリプタをカーネルへ登録する。
 inline error_t<error> create(uint32_t id, stream_desc_t *d) {
-  auto r = obj_api::svc(obj_api::svc_num::CREATE_STREAM, id,
-                        reinterpret_cast<uintptr_t>(d), d->flags);
+  auto r = obj_api::svci<obj_api::svc_num::CREATE_STREAM>(
+      id, reinterpret_cast<uintptr_t>(d), d->flags);
   return error_t<error>{static_cast<error>(r.value)};
 }
 
 // consumer が id からディスクリプタを引く (単一アドレス空間なので extern 直参照も
 // 可だが、疎結合な discovery 用)。戻りが nullptr = 未登録。
 template <typename REC> inline handle<REC> open(uint32_t id) {
-  auto r = obj_api::svc(obj_api::svc_num::OPEN_STREAM, id, 0, 0);
+  auto r = obj_api::svci<obj_api::svc_num::OPEN_STREAM>(id);
   return handle<REC>(reinterpret_cast<stream_desc_t *>(r.value));
 }
 
 // 役割をバインドする。カーネルが単一 producer / 単一 consumer を強制する
 // (MP_PROD なら producer 多重を許す)。
 inline error_t<error> bind(uint32_t id, role rl) {
-  auto r = obj_api::svc(obj_api::svc_num::BIND_STREAM, id,
-                        static_cast<uintptr_t>(rl), 0);
+  auto r = obj_api::svci<obj_api::svc_num::BIND_STREAM>(
+      id, static_cast<uintptr_t>(rl));
   return error_t<error>{static_cast<error>(r.value)};
 }
 
@@ -285,19 +285,19 @@ inline error_t<error> bind(uint32_t id, role rl) {
 // DMA チャネルは接続ごとにカーネルが 1 本 claim する (オブジェクトへは渡さない)。
 // dst へは空きにしか書かない (溢れは src 側に滞留 → src が lossy なら最古が落ちる)。
 inline error_t<error> connect(uint32_t src_id, uint32_t dst_id) {
-  auto r = obj_api::svc(obj_api::svc_num::CONNECT_STREAM, src_id, dst_id, 0);
+  auto r = obj_api::svci<obj_api::svc_num::CONNECT_STREAM>(src_id, dst_id);
   return error_t<error>{static_cast<error>(r.value)};
 }
 
 // consumer: 空なら SUSPEND (カーネルが SVC 内で空を再検査してから寝る =
 // lost-wakeup 防止)。非空なら即戻る。実装は blocking-pop ステップで。
 inline void wait(uint32_t id) {
-  obj_api::svc(obj_api::svc_num::STREAM_WAIT, id, 0, 0);
+  obj_api::svci<obj_api::svc_num::STREAM_WAIT>(id);
 }
 
 // producer: push 後、waiter が居るときだけ呼ぶ稀パス (desc->waiter を見てから)。
 inline void notify(uint32_t id) {
-  obj_api::svc(obj_api::svc_num::STREAM_NOTIFY, id, 0, 0);
+  obj_api::svci<obj_api::svc_num::STREAM_NOTIFY>(id);
 }
 
 } // namespace stream

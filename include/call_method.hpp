@@ -13,19 +13,19 @@
 // export 順の保証が崩れるため、起動直後の呼び出しは is_err() を見て yield →
 // 再試行すること (従来はカーネルが panic 停止していた)。戻り値を無視する既存
 // 呼び出し元はそのままコンパイルできる (エラーは黙って捨てられる)。
-static error_t<shizu::call_error>
+[[maybe_unused]] static error_t<shizu::call_error>
 call_method(object_ids callee_obj_id, uint32_t callee_method_id,
             uint32_t arg0) {
-  auto r = shizu::obj_api::svc(shizu::obj_api::svc_num::CALL_METHOD,
-                               (uint32_t)callee_obj_id, callee_method_id, arg0);
+  auto r = shizu::obj_api::svci<shizu::obj_api::svc_num::CALL_METHOD>(
+      (uint32_t)callee_obj_id, callee_method_id, arg0);
   return error_t<shizu::call_error>{
       static_cast<shizu::call_error>((uint32_t)r.result)};
 }
 
-static error_t<shizu::call_error>
+[[maybe_unused]] static error_t<shizu::call_error>
 call_method_via_md(uint32_t md, uint32_t arg0, uint32_t arg1 = 0) {
-  auto r = shizu::obj_api::svc(shizu::obj_api::svc_num::CALL_METHOD_VIA_MD, md,
-                               arg0, arg1);
+  auto r = shizu::obj_api::svci<shizu::obj_api::svc_num::CALL_METHOD_VIA_MD>(
+      md, arg0, arg1);
   return error_t<shizu::call_error>{
       static_cast<shizu::call_error>((uint32_t)r.result)};
 };

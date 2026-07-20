@@ -32,16 +32,37 @@ set(PICO_BOARD pico2_w CACHE STRING "Board type")
 
 cmake_minimum_required(VERSION 3.20)
 set(CMAKE_CXX_STANDARD 20)
+
+# ---- 一時対応: Pico 2 (無印, CYW43 なし) でのカーネル検証ビルド ---------------
+# pico2_w が壊れている間の代替。RP2350 チップは同一なので PSPLIM / MPU W^X /
+# DMA ポンプ / affinity 移動の検証は等価にできる (BLE 経路だけ検証不能)。
+# 使い方 (通常の build/ とは別ディレクトリに):
+#   cmake -S . -B build_pico2 -DSHIZU_PICO2_TEST=1
+#   cmake --build build_pico2        # → build_pico2/main.uf2
+# BLE (cyw43/btstack/BLE_UART_DRIVER) はビルドから外れ、SHIZU_NO_BLE=1 が定義される。
+option(SHIZU_PICO2_TEST "Plain Pico 2 (no CYW43/BLE) temporary test build" OFF)
+if(SHIZU_PICO2_TEST)
+    set(PICO_BOARD pico2)
+endif()
+
 include($ENV{PICO_SDK_PATH}/external/pico_sdk_import.cmake)
 project(shizupico C CXX ASM)
 pico_sdk_init()
 add_executable(main main.cpp kernel.cpp kernel_object.cpp svc_asm_handler.S obj_api.cpp core1_boot.cpp stream_selftest.cpp grant_selftest.cpp smp_stress.cpp)
-target_sources(main PRIVATE IO_CONTROLLER.cpp WS2812_DRIVER.cpp BLE_UART_DRIVER.cpp HELLO_WORLD.cpp BME280_DRIVER.cpp BNO055_DRIVER.cpp TELEMETRY_SENDER.cpp FLIGHT_CONTROLLER.cpp core1_io.cpp)
-target_link_libraries(main pico_stdlib pico_stdio pico_multicore hardware_exception hardware_irq hardware_pwm hardware_gpio hardware_pio hardware_i2c hardware_dma pico_btstack_classic pico_btstack_ble pico_cyw43_arch_poll pico_btstack_cyw43 pico_lwip_nosys)
+target_sources(main PRIVATE IO_CONTROLLER.cpp WS2812_DRIVER.cpp HELLO_WORLD.cpp BME280_DRIVER.cpp BNO055_DRIVER.cpp TELEMETRY_SENDER.cpp FLIGHT_CONTROLLER.cpp core1_io.cpp)
+target_link_libraries(main pico_stdlib pico_stdio pico_multicore hardware_exception hardware_irq hardware_pwm hardware_gpio hardware_pio hardware_i2c hardware_dma)
+if(SHIZU_PICO2_TEST)
+    # BLE 無し: ドライバ本体を外し、コード側の #if ガード (IO_CONTROLLER / main の
+    # ble_dbg スタブ) を有効化する。
+    target_compile_definitions(main PRIVATE SHIZU_NO_BLE=1)
+else()
+    target_sources(main PRIVATE BLE_UART_DRIVER.cpp)
+    target_link_libraries(main pico_btstack_classic pico_btstack_ble pico_cyw43_arch_poll pico_btstack_cyw43 pico_lwip_nosys)
+    # ble_uart.gatt から ble_uart.h (profile_data / ハンドルマクロ) を生成する。
+    pico_btstack_make_gatt_header(main PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/ble_uart.gatt)
+endif()
 target_include_directories(main PRIVATE include)
 pico_generate_pio_header(main ${CMAKE_CURRENT_SOURCE_DIR}/ws2812.pio)
-# ble_uart.gatt から ble_uart.h (profile_data / ハンドルマクロ) を生成する。
-pico_btstack_make_gatt_header(main PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/ble_uart.gatt)
 pico_add_extra_outputs(main)
 pico_enable_stdio_usb(main 1)
 # softfp: 呼び出し規約は soft のまま (pico-sdk/libm と ABI 互換)、FP 命令は有効。

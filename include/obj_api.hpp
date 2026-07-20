@@ -35,6 +35,11 @@ enum struct svc_num : uint32_t {
   SET_AFFINITY = 22, // r1=tid, r2=affinity マスク (bit0=core0/bit1=core1)。次の yield で移動
   CONNECT_STREAM = 23, // r1=src id, r2=dst id。src の consumer 端と dst の producer 端を
                        // カーネル専有 DMA ポンプで直結 → r1(戻)=stream::error
+  SET_OBJECT_UNPRIVILEGED = 24, // r1=obj_id。MPU Step1 プロトタイプ: 以後このオブジェクト
+                                // は CONTROL.nPRIV=1 で走る。対象の create_object 直後・
+                                // async_call/create_thread **より前**に呼ぶこと (生成時に
+                                // context->control を確定するため、後から立てても既存
+                                // スレッドには反映されない)。
 };
 
 template <typename T>
@@ -85,21 +90,42 @@ static __always_inline result_t<uint32_t> svc(uintptr_t arg0, uintptr_t arg1,
   return {.result = (result_t<uint32_t>::state_t)return_code, .value = value};
 };
 
+// 即値ディスパッチ版 svc。svc 命令の即値そのものを API 番号にする (カーネルの
+// トランポリンは以前から即値を r4 で渡しており、ハンドラは「即値 != 0 なら即値、
+// 0 なら旧来の r0」で番号を解釈するハイブリッド)。システムコール番号は静的に
+// 決まるので、新規コードはこちらを使うこと。引数レイアウトは旧方式と同じ r1..r3
+// (r0 は将来の第 4 引数用に 0 で予約)。YIELD(=0) だけは即値 0 と区別できないため
+// 従来の runtime 版 svc() を使い続ける。
+template <svc_num N>
+  requires((uint32_t)N != 0 && (uint32_t)N <= 255)
+static __always_inline result_t<uint32_t>
+svci(uintptr_t arg1 = 0, uintptr_t arg2 = 0, uintptr_t arg3 = 0) {
+  return svc<(uintptr_t)N>(0, arg1, arg2, arg3);
+}
+
 static void yield() { svc(svc_num::YIELD, 0, 0, 0, 0); }
 
 // 締切 (now + us) まで自スレッドをスケジューラの round-robin から外す (sleep)。
 // busy-yield と違い、寝ている間は他スレッドが走り、CPU を無駄に舐めない。
-static void sleep_us(uint32_t us) { svc(svc_num::SLEEP_US, us, 0, 0, 0); }
+static void sleep_us(uint32_t us) { svci<svc_num::SLEEP_US>(us); }
 
 // オブジェクト起動の 2 段構え。create_object(id) でオブジェクトだけ作り、
 // async_call(id, entry) で空きスレッドを自動確保して entry を非同期起動する。
 // 従来の create_object(id, thread, entry) 3 引数の代替 (手動 thread 番号を廃止)。
 [[maybe_unused]] static result_t<uint32_t> create_object(uint32_t obj_id) {
-  return svc(svc_num::CREATE_OBJECT_ONLY, obj_id, 0, 0);
+  return svci<svc_num::CREATE_OBJECT_ONLY>(obj_id);
 }
+// affinity (AFFINITY_CORE0/CORE1/ALL、0=既定 core0) と budget0 (true=バトン組) は
+// 生成時に確定する — 「作ってから set_affinity/set_thread_budget」だと呼び出し元が
+// grant 期限でプリエンプトされた隙に、既定 affinity/budget のまま scheduler に
+// claim される隙間があるため、別コア行き・バトン組のスレッドはここで指定すること。
 [[maybe_unused]] static result_t<uint32_t>
-async_call(uint32_t obj_id, uintptr_t entry, uint32_t arg = 0) {
-  return svc(svc_num::ASYNC_CALL, obj_id, entry, arg); // value = 割り当て tid
+async_call(uint32_t obj_id, uintptr_t entry, uint32_t arg = 0,
+           uint32_t affinity = 0, bool budget0 = false) {
+  return svci<svc_num::ASYNC_CALL>(
+      (obj_id & 0x7Fu) | ((affinity & 0x3u) << 8) |
+          (budget0 ? (1u << 10) : 0u),
+      entry, arg); // value = 割り当て tid
 }
 
 // 時限実行権移譲: スレッド tid に最大 us µs だけ実行権を貸す (現行 SWITCH_THREAD の
@@ -114,7 +140,7 @@ struct run_for_result_t {
   constexpr bool is_ok() const { return error == grant_error::OK; }
 };
 [[maybe_unused]] static run_for_result_t run_for(uint32_t tid, uint32_t us) {
-  result_t<uint32_t> r = svc(svc_num::RUN_FOR, tid, us, 0);
+  result_t<uint32_t> r = svci<svc_num::RUN_FOR>(tid, us);
   const uint32_t packed = r.value; // (error<<16)|reason (kernel_obj_svc_handler)
   return {.error = (grant_error)(packed >> 16),
           .reason = (grant_end)(packed & 0xFFFFu)};
@@ -124,7 +150,7 @@ struct run_for_result_t {
 // (バトンパス、凍結ウォッチドッグの対象外)。BLE_UART のようにロック/タイミング都合で
 // スライスできないスレッドだけ 0 を指定する。既定は SHIZU_DEFAULT_GRANT_BUDGET_US。
 [[maybe_unused]] static void set_thread_budget(uint32_t tid, uint32_t us) {
-  svc(svc_num::SET_THREAD_BUDGET, tid, us, 0);
+  svci<svc_num::SET_THREAD_BUDGET>(tid, us);
 }
 
 // スレッド tid の走行許可コアを変更する (AFFINITY_CORE0/CORE1/ALL のビットマスク)。
@@ -134,7 +160,13 @@ struct run_for_result_t {
 // 注意: コアを移すと「スレッド番号昇順の初回実行順」による export 順の保証が崩れる
 // ので、call_method の UNDECLARED_METHOD エラーを見て yield → 再試行すること。
 [[maybe_unused]] static void set_affinity(uint32_t tid, uint32_t mask) {
-  svc(svc_num::SET_AFFINITY, tid, mask, 0);
+  svci<svc_num::SET_AFFINITY>(tid, mask);
+}
+
+// MPU Step1 プロトタイプ: obj_id を以後 unprivileged (CONTROL.nPRIV=1) で走らせる。
+// create_object の直後・その objid で async_call/create_thread する前に呼ぶこと。
+[[maybe_unused]] static void set_object_unprivileged(uint32_t obj_id) {
+  svci<svc_num::SET_OBJECT_UNPRIVILEGED>(obj_id);
 }
 
 __always_inline static void yield_until(bool (*condition)()) {

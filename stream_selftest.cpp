@@ -25,8 +25,10 @@ struct test_rec_t {
 };
 constexpr uint32_t TEST_STREAM_ID = 0;
 // connect (DMA ポンプ) テスト用: SRC → [カーネル DMA] → DST の 2 本。
-constexpr uint32_t CONN_SRC_ID = 1;
-constexpr uint32_t CONN_DST_ID = 2;
+// ID は上位帯 (30/31) を使う — 1/2 は ble_tx::STREAM_BULK/CTRL (TELEMETRY が常時
+// create する) と衝突するため。
+constexpr uint32_t CONN_SRC_ID = 30;
+constexpr uint32_t CONN_DST_ID = 31;
 
 // 共有メモリ (既定 lossy)。producer(owner) と consumer が同一実体を参照する。
 st::storage<test_rec_t, 64> g_test_stream;
