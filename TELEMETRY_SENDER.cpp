@@ -1,20 +1,27 @@
 // ===========================================================================
 //  TELEMETRY_SENDER — センサ融合 + BLE テレメトリ送信オブジェクト
 // ===========================================================================
-//  BME280_DRIVER / BNO055_DRIVER (Shizuku オブジェクト) を read_latest
-//  メソッドで 購読し、相補フィルタで高度/上下速度を融合、altitude_fusion_wifi.c
-//  の状態判定と 高度保持 PID を移植して 1 行 CSV にまとめ、BLE_UART_DRIVER
-//  経由で母艦へ送る。
+//  BME280_DRIVER / BNO055_DRIVER (Shizuku オブジェクト) のサンプルをストリーム
+//  (ID_BNO_SAMPLE / ID_BME_SAMPLE) で購読し、相補フィルタで高度/上下速度を融合、
+//  altitude_fusion_wifi.c の状態判定と 高度保持 PID を移植して 1 行 CSV にまとめ、
+//  BLE_UART_DRIVER 経由で母艦へ送る。
 //
 //  元実装が Wi-Fi UDP だった送信経路を BLE UART (NUS)
 //  へ置き換えたもの。受信側は HELLO_WORLD と同じ rx_sink
 //  機構でコマンドを受ける。
+//
+//  センサ入力はかつて set_sample_sink 方式 (各ドライバが CALL_METHOD で本オブジェクト
+//  のハンドラを呼ぶ) だった。これは融合ハンドラを producer のスレッド/スタックで走らせ
+//  ており、融合状態を「BNO のスレッドが書き、TELEMETRY のスレッドが読む」構図を
+//  協調スケジューラの原子性だけで支えていた。今は本スレッドがストリームを drain して
+//  融合するので、融合状態を触るのはこのスレッドだけになっている。
 // ===========================================================================
 #include <ble_tx_stream.hpp> // 優先度付き TX ストリーム (bulk/ctrl)
 #include <call_method.hpp>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <driver_streams.hpp> // センサ入力ストリームの ID
 #include <export_method.hpp>
 #include <obj_api.hpp>
 #include <object_headers/BLE_UART_DRIVER.hpp>
@@ -139,8 +146,8 @@ static volatile uint64_t blast_end_us = 0;
 static volatile uint32_t blast_seq = 0, blast_bytes = 0;
 static constexpr int BLAST_LINE_LEN = 480;
 
-// ---- 較正オフセット保存/復元 (push 受信) ------------------------------------
-// CS/CL を BNO へ要求し、完了は on_calib_result で push 受信する(ポーリングしない)。
+// ---- 較正オフセット保存/復元 ------------------------------------------------
+// CS/CL を BNO へ要求し、完了は ID_CALIB_RESULT ストリームで受け取る。
 // ダウンリンク自体は BLE バイト生成を単一スレッドに保つため送信ループ側で行う。
 static bool calib_pending_save = false;      // true=save(CDUMP), false=load(CLOAD)
 static volatile bool calib_dl_ready = false; // 結果を受領しダウンリンク待ち
@@ -302,7 +309,7 @@ static void handle_line() {
     if (rxlen >= 2 && rxline[1] == 'S') {
       call_method(object_ids::BNO055_DRIVER,
                   BNO055_DRIVER::METHOD_IDs::calib_save, 0);
-      calib_pending_save = true; // 結果は on_calib_result に push される
+      calib_pending_save = true; // 結果は ID_CALIB_RESULT で届く
       printf("[TELEMETRY] calib save requested\n");
     } else if (rxlen >= 2 && rxline[1] == 'L') {
       // "CL" + 44 hex (= 22 バイト) を期待。
@@ -329,7 +336,7 @@ static void handle_line() {
         call_method(object_ids::BNO055_DRIVER,
                     BNO055_DRIVER::METHOD_IDs::calib_load,
                     (uint32_t)(uintptr_t)prof);
-        calib_pending_save = false; // 結果は on_calib_result に push される
+        calib_pending_save = false; // 結果は ID_CALIB_RESULT で届く
         printf("[TELEMETRY] calib load requested\n");
       } else {
         ble_send("CLOAD err=parse\r\n", 16);
@@ -613,31 +620,41 @@ static void batch_push(uint32_t seq, uint32_t up_ms, const bme280_sample_t &bme,
 }
 
 // ===========================================================================
-//  融合状態 (push ハンドラが更新、送信ループが読む)
+//  融合状態 (入力ストリームの排出で更新、送信ループが読む)
 // ---------------------------------------------------------------------------
-//  協調スケジューラ単一コアなので、push ハンドラは yield せず原子的に走る。送信
-//  ループも状態の読み出し〜パケット化の間 yield しないため、torn read は起きない。
+//  排出も送信も本オブジェクトの単一スレッドで走るので、この状態を書くスレッドは
+//  1 つだけ。送信ループも状態の読み出し〜パケット化の間 yield しないため torn read は
+//  起きない (旧: producer のスレッドが CALL_METHOD 経由でここを書いていた)。
 // ===========================================================================
+static uint32_t g_bno_lost = 0, g_bme_lost = 0; // LOSSY 上書きで捨てた標本数
 static float g_h_est = 0.f, g_v_est = 0.f, g_h_baro_prev = 0.f;
 static float g_last_a_z = 0.f;
 static float g_vx_est = 0.f, g_vy_est = 0.f; // 世界系 水平速度(北/東) [m/s] リーク積分
-static uint64_t g_last_bno_us = 0, g_last_baro_us = 0;
+// 直近に融合した標本の時刻 (core1 の time_us_64 下位 32bit)。積分 dt はこの差分で
+// 取る (排出時刻ではなく標本時刻。fuse_bno のコメント参照)。primed は初回の
+// 「差分が意味を持たない 1 回」を弾くフラグ。
+static uint32_t g_last_bno_t_us = 0, g_last_bme_t_us = 0;
+static bool g_bno_t_primed = false, g_bme_t_primed = false;
 static uint32_t g_last_bme_seq = 0;
 static bno055_sample_t g_bno = {}; // 直近の BNO サンプル(送信スナップ用)
 static bme280_sample_t g_bme = {}; // 直近の BME サンプル
 
-// BNO055 から新サンプルが push される。慣性鉛直加速度を 100Hz フルレートで積分。
-static void handle_bno_push(uint32_t, uint32_t, uint32_t ptr, uint32_t) {
-  if (ptr == 0)
-    return;
-  memcpy(&g_bno, (const void *)(uintptr_t)ptr, sizeof(g_bno));
+// ID_BNO_SAMPLE から取り出した 1 標本を融合する。慣性鉛直加速度を 100Hz
+// フルレートで積分。
+static void fuse_bno(const bno055_sample_t &s) {
+  g_bno = s;
   if (!g_bno.valid)
     return;
-  uint64_t now = time_us_64();
-  float dt = (float)(now - g_last_bno_us) / 1e6f;
-  g_last_bno_us = now;
-  if (dt <= 0.f || dt > 0.5f)
-    dt = 0.01f; // 異常 dt のガード(初回含む)
+  // dt は標本時刻の差分で取る。ストリームからは 1 周回で複数標本がまとまって出て
+  // くるので、排出時刻 (time_us_64) で測ると先頭 1 標本が区間全体の dt を背負い、
+  // 残りが dt≈0 になって積分の重みが壊れる。u32 の引き算はラップに対して安全。
+  uint32_t d_us = (uint32_t)(s.t_us - g_last_bno_t_us);
+  g_last_bno_t_us = s.t_us;
+  float dt = (float)d_us / 1e6f;
+  if (!g_bno_t_primed || dt <= 0.f || dt > 0.5f) {
+    dt = 0.01f; // 異常 dt のガード (初回含む。NDOF は 100Hz)
+    g_bno_t_primed = true;
+  }
   float a_z = world_z_accel(g_bno);
   if (a_z > A_Z_CLIP)
     a_z = A_Z_CLIP;
@@ -657,18 +674,21 @@ static void handle_bno_push(uint32_t, uint32_t, uint32_t ptr, uint32_t) {
   g_vy_est = (g_vy_est + a_e * dt) * leak;
 }
 
-// BME280 から新サンプルが push される。気圧高度で相補補正(BME の実レート ~21Hz)。
-static void handle_bme_push(uint32_t, uint32_t, uint32_t ptr, uint32_t) {
-  if (ptr == 0)
-    return;
-  memcpy(&g_bme, (const void *)(uintptr_t)ptr, sizeof(g_bme));
+// ID_BME_SAMPLE から取り出した 1 標本を融合する。気圧高度で相補補正
+// (BME の実レート ~21Hz)。
+static void fuse_bme(const bme280_sample_t &s) {
+  g_bme = s;
   if (!g_bme.valid || g_bme.seq == g_last_bme_seq)
     return;
-  uint64_t now = time_us_64();
-  float baro_dt = (float)(now - g_last_baro_us) / 1e6f;
-  if (baro_dt <= 0.f)
-    baro_dt = 0.02f;
-  g_last_baro_us = now;
+  // fuse_bno と同じ理由で標本時刻の差分を使う (v_baro は高度の微分なので、dt が
+  // 潰れると速度推定が跳ねる)。
+  uint32_t d_us = (uint32_t)(s.t_us - g_last_bme_t_us);
+  g_last_bme_t_us = s.t_us;
+  float baro_dt = (float)d_us / 1e6f;
+  if (!g_bme_t_primed || baro_dt <= 0.f || baro_dt > 0.5f) {
+    baro_dt = 0.048f; // BME の実レート ~21Hz 相当。初回/異常のガード
+    g_bme_t_primed = true;
+  }
   g_last_bme_seq = g_bme.seq;
   g_h_est = ALPHA_H * g_h_est + (1.0f - ALPHA_H) * g_bme.alt_m;
   float v_baro = (g_bme.alt_m - g_h_baro_prev) / baro_dt;
@@ -676,13 +696,9 @@ static void handle_bme_push(uint32_t, uint32_t, uint32_t ptr, uint32_t) {
   g_h_baro_prev = g_bme.alt_m;
 }
 
-// BNO055 から較正 save/load 完了が push される。データを受け取りフラグを立てる
+// ID_CALIB_RESULT から取り出した較正 save/load 完了を受け取りフラグを立てる
 // (ダウンリンクは送信ループが行う)。
-static void handle_calib_push(uint32_t, uint32_t, uint32_t ptr, uint32_t) {
-  if (ptr == 0)
-    return;
-  bno055_calib_xfer_t x;
-  memcpy(&x, (const void *)(uintptr_t)ptr, sizeof(x));
+static void accept_calib_result(const bno055_calib_xfer_t &x) {
   calib_dl_ok = x.ok;
   memcpy(calib_dl_data, x.data, BNO055_CALIB_PROFILE_LEN);
   calib_dl_ready = true;
@@ -704,10 +720,8 @@ void TELEMETRY_SENDER::main() {
   // TX ストリーム (bulk/ctrl) を作成・PRODUCER bind し、BLE_UART の優先度付き排出表へ
   // 登録する。BLE_UART は先に async_call 済み (methods export 済み) なので、この
   // call_method 順で register が届く (set_rx_sink と同じ順序保証)。
-  stream::create(ble_tx::STREAM_BULK, &g_tx_bulk.desc);
-  stream::create(ble_tx::STREAM_CTRL, &g_tx_ctrl.desc);
-  stream::bind(ble_tx::STREAM_BULK, stream::role::PRODUCER);
-  stream::bind(ble_tx::STREAM_CTRL, stream::role::PRODUCER);
+  drv_stream::publish(ble_tx::STREAM_BULK, &g_tx_bulk.desc, "TELEMETRY");
+  drv_stream::publish(ble_tx::STREAM_CTRL, &g_tx_ctrl.desc, "TELEMETRY");
   call_method(object_ids::BLE_UART_DRIVER,
               BLE_UART_DRIVER::METHOD_IDs::register_tx_stream,
               (ble_tx::STREAM_BULK << 16) | ble_tx::PRIO_BULK);
@@ -715,20 +729,16 @@ void TELEMETRY_SENDER::main() {
               BLE_UART_DRIVER::METHOD_IDs::register_tx_stream,
               (ble_tx::STREAM_CTRL << 16) | ble_tx::PRIO_CTRL);
 
-  // センサ/較正の push を受け取るハンドラを公開し、各ドライバへ sink を登録する
-  // (以後 read_latest のポーリングは行わず、push されたサンプルで融合する)。
-  export_method<handle_bno_push>(TELEMETRY_SENDER::METHOD_IDs::on_bno_sample);
-  export_method<handle_bme_push>(TELEMETRY_SENDER::METHOD_IDs::on_bme_sample);
-  export_method<handle_calib_push>(TELEMETRY_SENDER::METHOD_IDs::on_calib_result);
-  auto pack = [](TELEMETRY_SENDER::METHOD_IDs m) {
-    return ((uint32_t)object_ids::TELEMETRY_SENDER << 16) | (uint32_t)m;
-  };
-  call_method(object_ids::BNO055_DRIVER, BNO055_DRIVER::METHOD_IDs::set_sample_sink,
-              pack(TELEMETRY_SENDER::METHOD_IDs::on_bno_sample));
-  call_method(object_ids::BNO055_DRIVER, BNO055_DRIVER::METHOD_IDs::set_calib_sink,
-              pack(TELEMETRY_SENDER::METHOD_IDs::on_calib_result));
-  call_method(object_ids::BME280_DRIVER, BME280_DRIVER::METHOD_IDs::set_sample_sink,
-              pack(TELEMETRY_SENDER::METHOD_IDs::on_bme_sample));
+  // センサ/較正の入力ストリームへ CONSUMER として繋ぐ。producer (BNO055/BME280) は
+  // 本オブジェクトより先に起動するが、open_wait は登録されるまで待つので順序には
+  // 依存しない。producer を起動しないビルド構成では invalid のまま縮退する
+  // (融合が更新されないだけで送信ループは回り続ける)。
+  auto rx_bno =
+      drv_stream::subscribe<bno055_sample_t>(drv_stream::ID_BNO_SAMPLE, "TELEMETRY");
+  auto rx_bme =
+      drv_stream::subscribe<bme280_sample_t>(drv_stream::ID_BME_SAMPLE, "TELEMETRY");
+  auto rx_calib = drv_stream::subscribe<bno055_calib_xfer_t>(
+      drv_stream::ID_CALIB_RESULT, "TELEMETRY");
 
   uint32_t seq = 0;
   uint64_t prev_us = time_us_64();
@@ -737,6 +747,22 @@ void TELEMETRY_SENDER::main() {
   char line[BLAST_LINE_LEN + 16];
 
   while (true) {
+    // ---- 入力ストリームの排出 (融合状態の更新) ----
+    // ブラスト判定より前に必ず引く。溜めっぱなしにしないための不変条件
+    // 「毎周回まず入力を空にする」を素直に置いている (LOSSY なので溜まっても
+    // 壊れはしないが、ブラスト中に古い標本で融合を再開したくない)。
+    {
+      bno055_sample_t bs;
+      while (rx_bno.valid() && rx_bno.pop(&bs, &g_bno_lost))
+        fuse_bno(bs);
+      bme280_sample_t ms;
+      while (rx_bme.valid() && rx_bme.pop(&ms, &g_bme_lost))
+        fuse_bme(ms);
+      bno055_calib_xfer_t cx;
+      while (rx_calib.valid() && rx_calib.pop(&cx))
+        accept_calib_result(cx);
+    }
+
     // スループット試験中はテレメトリを止めてブラストに専念する。
     if (blast_active) {
       flush_batch(); // 溜まっていれば吐き出してからブラストへ
@@ -773,8 +799,8 @@ void TELEMETRY_SENDER::main() {
     if (dt <= 0.f || dt > 0.5f)
       dt = 0.04f; // 制御/送信周期相当の dt。異常値ガード。
 
-    // 融合状態は push ハンドラ(on_bno_sample / on_bme_sample)が随時更新済み。ここ
-    // ではスナップショットするだけ(プルもポーリングもしない)。
+    // 融合状態はこの周回の頭で入力ストリームを排出した時点まで更新済み。ここでは
+    // スナップショットするだけ。
     float h_est = g_h_est, v_est = g_v_est, a_z = g_last_a_z;
     float vx = g_vx_est, vy = g_vy_est;
     float speed = sqrtf(vx * vx + vy * vy + v_est * v_est);

@@ -26,6 +26,8 @@ enum struct object_ids : uint32_t {
   SENSOR_IO=22,         // core1 ピン留めのセンサ I/O スレッド (旧 core1_io ベアメタル)。
   GRANT_TEST=23,        // 時限実行権移譲 (run_for) 自己テスト: driver/worker 群の所属先。
   SMP_STRESS=24,        // 2 コア SVC ピンポンストレス: worker/reporter 群の所属先。
+  BUSY_LOAD=25,         // CPU ホグ負荷試験: core1 ピンの busy_worker + reporter の所属先。
+  RT_SCHED_TEST=26,     // RT スケジューラ検証: 合成周期 victim + hog + reporter の所属先。
 };
 
 #endif // SHIZU_OBJECT_ID_HPP

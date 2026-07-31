@@ -7,7 +7,11 @@ namespace shizu {
 // BNO055 ドライバが公開する最新サンプル。read_latest にこの構造体へのポインタを
 // 渡すと、ドライバが内部キャッシュをコピーする (単一アドレス空間でのポインタ渡し)。
 struct bno055_sample_t {
-  uint32_t seq;               // 読み出しごとに +1
+  uint32_t seq; // 読み出しごとに +1
+  // 標本時刻 (core1 の time_us_64 下位 32bit)。consumer はストリームから複数標本を
+  // まとめて排出するので、積分の dt は「排出した時刻」ではなく必ずこの値の差分で
+  // 取ること (でないと先頭 1 標本が区間全体の dt を背負い、残りが dt≈0 になる)。
+  uint32_t t_us;
   float gx, gy, gz;           // 重力ベクトル [m/s^2]
   float lax, lay, laz;        // 線形加速度 (重力除去済) [m/s^2]
   float heading, roll, pitch; // オイラー角 [deg]
@@ -49,12 +53,9 @@ public:
     calib_get = 4,
     // arg0 = 0:0xFFFF 破損バーストをそのまま公開 / 1:検出して破棄(既定)。
     set_ffff_reject = 5,
-    // arg0 = (obj_id<<16)|method_id。新サンプル push 先(sink)を登録。0xFFFF..
-    // で無効。
-    set_sample_sink = 6,
-    // ↑未実装
-    // arg0 = (obj_id<<16)|method_id。較正 save/load 完了の push 先を登録。
-    set_calib_sink = 7,
+    // 6 = set_sample_sink / 7 = set_calib_sink は退役 (番号は再利用しない)。
+    // サンプルと較正結果は Shizuku ストリームで配る — driver_streams.hpp の
+    // ID_BNO_SAMPLE / ID_CALIB_RESULT を consumer 側が open_wait すること。
     // arg0 = 0:サンプリング再開 / 非0:一時停止(スループット試験中に I2C
     // を空ける)。
     set_paused = 8,

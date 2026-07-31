@@ -103,6 +103,59 @@ cmake --build build_pico2        # → build_pico2/main.uf2 (通常の build/ �
 
 ---
 
+## 0.8 2026-07-31 追加分: RT スケジューラ実機検証 + ドライバのストリーム化
+
+### やったこと
+- **ドライバ群をストリーム化** (stream.hpp): sink 方式 (set_sample_sink + CALL_METHOD) と
+  手書き `spsc_ring_t` / calib サイドバンドを撤去し、オブジェクト間データ経路を Shizuku
+  ストリームへ統一。追加仕様は `open_wait` (登録待ち = 起動順非依存) と ID レジストリ
+  `include/driver_streams.hpp`。cmd は MP_PROD (BNO/BME の 2 producer)、calib は片方向 2 本
+  (req/resp)。read_latest 等の一発 RPC は call_method のまま据え置き。
+- **RT 検証ハーネスを追加**: `rt_sched_test.cpp` (`SHIZU_RT_SCHED_TEST`)、`busy_load.cpp`
+  (`SHIZU_BUSY_LOAD`)、host 側 `tools/rt_sched_hosttest.py` (pyserial + bleak)。センサが
+  無くても回るよう周期負荷をソフト合成し、締切ジッタを device 側で自己計測する。
+
+### RT 試験の実機結果 (pico2_w, SHIZU_RT_SCHED_TEST=1)
+never-yield ホグ (core1, 既定 budget 3ms) を BLE と同居させ、代表レートの victim が締切
+ジッタを測る。**CPU ホグ競合下は PASS**:
+- ongoing ジッタ (device `late(win)`, 毎 window リセット) が両コアとも **budget(3ms)程度で
+  頭打ち** (core1 ~2.96–3.0ms、core0 ~0.93ms)。青天井にならない。
+- hog は全 window **ADVANCING** (0 STALLED) = 凍結ウォッチドッグが取り上げ、系は凍結しない。
+- **schedulable な victim (period ≥ budget) はレート維持** (100Hz 203/200、200Hz 406/400、
+  25Hz 50/50)。各周期タスクが独立に「正しく時を刻む」ことを確認。
+- **RT 応答の粒度 = grant budget (3ms) そのもの**。period < budget の 1kHz は 3ms ホグ下で
+  毎締切を守れず ~290Hz に律速 = 設計限界 (バグではない)。>~333Hz を競合下で保証したいなら
+  `SHIZU_DEFAULT_GRANT_BUDGET_US` を下げる (プリエンプト増と交換) か、そのタスクを
+  budget-0 / 優先 / 専用コアにする。
+
+### 今回の「原因」— なぜ数値が二転したか
+1. **BLE 接続・ペアリング活動中は RT が繰り返し数秒スタールする (要注意)**。切り分け:
+   - BLE **未接続** (advertising のみ) / CPU ホグのみ: RT 健全、ジッタ ~budget (上記 PASS)。
+   - host が BLE 接続して write を撃つと、victim の **`late(win)`** (毎 window リセット = ongoing)
+     が **~3.1s (core1) / ~1.9s (core0)** に跳ね、ticks が半減 (100Hz 104/200 等)。1 回きりでなく
+     **BLE 活動が続く間は再発**。**BLE 切断で完全回復**。
+   - 原因は **budget-0 の BLE 例外**: BLE は core1 で budget-0 (バトン、watchdog 対象外) で走り、
+     cyw43/btstack の接続/ペアリング処理は長時間 unpreemptible (BLE は「3ms 以上ロックしてよい
+     唯一の枠」)。→ この活動中は core1 (センサ同居) の RT 締切が数秒無保護。**接続/ペアリングは
+     飛行前に済ませる運用が前提**。
+2. **計測の罠**: device の `late(max)` は起動来の累積ピークで**リセットしない**ので、一過性の
+   スパイクを保持し続ける (回復しても数字が消えない)。**ongoing の判定は `late(win)` (毎 window)
+   で行うこと**。host ツールはこの分離をするよう修正済み。最初の誤 FAIL はこの罠が原因で、
+   CPU ホグ単独の実体は PASS。
+3. **定常 BLE トラフィック下の RT / ping・throughput はまだクリーンに測れていない**。RX write
+   (ping `P` / blast `B`) は LE Secure Connections の numeric-comparison ペアリング (Pico シリアル
+   6 桁確認 + **macOS のペアリングダイアログ = 人手クリック**) を要し、ヘッドレスからは完了でき
+   ない (実測でも ping 無応答・throughput は素のテレメトリ相当のまま)。→ 上記 (1) の「接続中
+   スタール」は**ペアリング交渉を含む活動**で、「**ペアリング完了後**の定常 notify トラフィックが
+   RT を崩すか」とは切り分けられていない。後者を測るには GUI クライアント (対話ペアリング対応)
+   を RT フラグ build に対して回すこと。
+
+### 関連メモリ
+`memory/rt-sched-hw-verified.md` (実測値の詳細)、`memory/object-memory-arena-vs-system-object.md`
+(次の保護レイヤ: per-object アリーナ + DMA 越境 + System Object)。
+
+---
+
 ## 0. 一言でいうと
 
 RP2350 (Cortex-M33 デュアルコア) 上の自作協調型マイクロカーネル **Shizuku** と、その上の

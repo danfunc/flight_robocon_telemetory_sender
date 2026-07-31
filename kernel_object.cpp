@@ -631,6 +631,15 @@ void kernel_object_main() {
   // カーネル SVC 経路の 2 コア同時進入ストレス (SLEEP/SWITCH ピンポン + 跨コア移動)。
   shizu::smp_stress_launch();
 #endif
+#if SHIZU_BUSY_LOAD
+  // CPU ホグ負荷試験 (core1 ピンの never-yield ループ + reporter)。BLE と同居させて
+  // 凍結ウォッチドッグの取り上げが実運用条件で効くことを見る。
+  shizu::busy_load_launch();
+#endif
+#if SHIZU_RT_SCHED_TEST
+  // RT スケジューラ検証 (合成周期 victim + hog + reporter)。締切ジッタを device 側で測る。
+  shizu::rt_sched_test_launch();
+#endif
   // スレッド 0 (カーネルオブジェクト) は以降 round-robin のアイドル/スケジューラ心拍。
   // 次の runnable スレッドへ切替え、誰も居なければ (全員 sleep 中/未生成) スピンする。
   // 最初の一手で IO_CONTROLLER(thr1) へ入り、以後は各スレッドの yield/sleep と協調して

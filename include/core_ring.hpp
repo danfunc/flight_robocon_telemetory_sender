@@ -1,22 +1,28 @@
 #ifndef SHIZU_CORE_RING_HPP
 #define SHIZU_CORE_RING_HPP
 // ===========================================================================
-//  コア間 SPSC リング (docs/sensor_stream_protocol.md §4)
+//  コア間ストリーム (docs/sensor_stream_protocol.md §4)
 // ===========================================================================
-//  core1 (ベアメタル I/O コア) → core0 (Shizuku) のセンサレコードストリームと、
-//  core0 → core1 の小さなコマンドリング、および較正プロファイル (22B、レア) 用の
-//  サイドバンド共有構造体を定義する。
+//  core1 (センサ I/O コア) と core0 (Shizuku) の間を流れる 4 本を定義する。全部
+//  Shizuku ストリーム API (include/stream.hpp) の storage で、両端は .hdl() で直接
+//  push/pop する「直接ハンドル型」— core1 には TU 制約 (core1_io.cpp 冒頭: Shizuku
+//  API は sleep_us のみ許可) があり create/open/bind の SVC を撃てないため、カーネル
+//  登録は通さず共有 storage を両端が直に触る。どちらが producer かはカーネルが強制
+//  できないので下表の規約で守ること。
 //
-//  ・SPSC: 各リングとも producer / consumer は 1 つずつ。インデックスは u32
-//    モノトニック (mod N でスロット化)。producer は payload を書いてから
-//    __dmb() して wr を公開する。RP2350 の SRAM はデータキャッシュ無しなので
-//    volatile + DMB で可視性は足りる。
-//  ・データリングは「上書き式 (lossy)」: producer は決してブロックせず常に
-//    書き進む。溢れは consumer 側が wr-rd の距離で検出し、古い方を捨てて
-//    ドロップ数を数える (設計書 §4「溢れたら古い方を捨てる」)。
-//  ・コマンドリング producer は core0 の複数スレッドから呼ばれ得るが、Shizuku は
-//    協調型単一コアで push 中に yield しないため実質直列化されており SPSC 侵害は
-//    起きない。
+//    g_data_stream   core1 → core0   センサレコード       LOSSY (上書き)
+//    g_cmd_stream    core0 → core1   設定コマンド         LOSSLESS + MP_PROD
+//    g_calib_req     core0 → core1   較正 save/load 要求  LOSSLESS
+//    g_calib_resp    core1 → core0   その結果             LOSSLESS
+//
+//  ・データは上書き式 (LOSSY): producer は決してブロックせず常に書き進む。溢れは
+//    consumer 側が wr-rd の距離で検出し、古い方を捨ててドロップ数を数える (設計書 §4
+//    「溢れたら古い方を捨てる」)。この論理は stream::handle::pop が実装している。
+//  ・コマンドは取りこぼすと設定が食い違うので LOSSLESS。producer が core0 の複数
+//    スレッド (BNO055 / BME280) なので MP_PROD を立て、push_mp の CAS で直列化する
+//    (旧実装は「協調型単一コアだから実質直列」に依存していた = デュアルコア化で崩れる)。
+//  ・較正は片方向 2 本 (req / resp) で表す。旧 req_seq/ack_seq のサイドバンド握手を
+//    畳んだもので、多重要求も落とさず順に処理される。
 // ===========================================================================
 #include <cstdint>
 #include <cstring>
@@ -63,58 +69,6 @@ struct __attribute__((packed)) record_t {
 };
 static_assert(sizeof(record_t) == 16, "record_t padded to 16B for DMA_RING ring");
 
-// ---- SPSC リング (上書き式) -------------------------------------------------
-template <typename REC, uint32_t N> struct spsc_ring_t {
-  volatile uint32_t wr; // producer 専有 (publish 済みレコード数)
-  volatile uint32_t rd; // consumer 専有
-  REC buf[N];
-
-  // 消費者が overrun 検出後に巻き戻す位置の安全マージン。producer は publish 前の
-  // スロット (wr % N) を書いている最中かもしれないので、wr-N ちょうどまで戻ると
-  // 次の pop で再び torn になり得る。数レコード新しい側へ寄せて回避する。
-  static constexpr uint32_t RESYNC_MARGIN = 8;
-
-  // producer (唯一): 常に成功する。満杯なら最古を黙って上書き (consumer が検出)。
-  // push/pop は両コアのホットパスから毎周期呼ばれるため SRAM (.time_critical) に
-  // 置く (core1 はフラッシュ実行だと XIP バスを core0 の BTstack と取り合う)。
-  void __not_in_flash_func(push)(const REC &r) {
-    uint32_t w = wr;
-    buf[w % N] = r;
-    __dmb();   // payload の書き込みを wr 公開より先に完了させる
-    wr = w + 1;
-  }
-
-  // consumer (唯一): 1 件取り出す。上書きで失われた件数を *lost に加算する。
-  // 戻り false = 空 (または torn 検出でリトライ待ち)。
-  bool __not_in_flash_func(pop)(REC *out, uint32_t *lost) {
-    uint32_t w = wr;
-    __dmb(); // wr 観測 → buf 読みの順序を保証
-    uint32_t r = rd;
-    if (r == w)
-      return false;
-    if (w - r >= N) { // 追い越された: 古い方を捨てて前へ
-      uint32_t nr = w - N + RESYNC_MARGIN;
-      if (lost)
-        *lost += nr - r;
-      r = nr;
-    }
-    REC tmp = buf[r % N];
-    __dmb(); // buf 読み終わり → wr 再検証の順序を保証
-    // コピー中に producer が一周してきたら tmp は破損の可能性 (torn) → 捨てる。
-    // (producer は publish 前にスロットを書くので、閾値は > ではなく >= N)
-    if (wr - r >= N) {
-      uint32_t nr = wr - N + RESYNC_MARGIN;
-      if (lost)
-        *lost += nr - r;
-      rd = nr;
-      return false;
-    }
-    rd = r + 1;
-    *out = tmp;
-    return true;
-  }
-};
-
 // ---- コマンド (core0 → core1) ----------------------------------------------
 enum cmd_op : uint8_t {
   CMD_SET_PAUSED_BNO = 1, // arg: 0=再開 / 非0=停止
@@ -132,32 +86,40 @@ struct cmd_rec_t {
 };
 static_assert(sizeof(cmd_rec_t) == 8, "cmd_rec_t must be 8 bytes");
 
-// ---- 較正プロファイル サイドバンド (22B、レア) ------------------------------
-// ストリームには乗せない (設計書 §4.2)。ハンドシェイク:
-//   core0: (load なら data を書き) op を書く → __dmb() → req_seq++ で発行
-//   core1: req_seq != ack_seq を検出 → 実行 → (save なら data,) ok を書く
-//          → __dmb() → ack_seq = req_seq で完了通知
-// core0 は ack_seq の変化で完了を知る。多重発行時は core1 が最後の req のみ処理。
-struct calib_sideband_t {
-  volatile uint32_t req_seq;
-  volatile uint32_t ack_seq;
-  volatile uint8_t op; // 1=save (BNO→data) / 2=load (data→BNO)
-  volatile uint8_t ok; // 1=I2C 成功
-  uint8_t data[22];    // BNO055 較正オフセットプロファイル (0x55..0x6A)
+// ---- 較正プロファイル (22B、レア) -------------------------------------------
+// BNO055 の較正オフセットプロファイル (レジスタ 0x55..0x6A)。
+constexpr uint32_t CALIB_PROFILE_LEN = 22;
+
+// 要求 (core0 BNO055 → core1)。旧サイドバンドの op/data に相当。
+struct calib_req_t {
+  uint8_t op; // 1 = save (BNO → data) / 2 = load (data → BNO)
+  uint8_t _rsv[3];
+  uint8_t data[CALIB_PROFILE_LEN]; // load のときだけ有効
 };
 
-// ---- リングの実体 (inline 変数、.bss でゼロ初期化) ---------------------------
-using cmd_ring_t = spsc_ring_t<cmd_rec_t, 16>;
+// 結果 (core1 → core0 BNO055)。旧サイドバンドの ok/data + ack に相当。
+struct calib_resp_t {
+  uint8_t op; // 実行した op をそのまま返す (要求と結果の対応付け)
+  uint8_t ok; // 1 = I2C 成功
+  uint8_t _rsv[2];
+  uint8_t data[CALIB_PROFILE_LEN]; // save なら吸い出した値、load なら要求のエコー
+};
 
-// データストリーム (core1 SENSOR_IO producer → core0 consumer)。stream API の storage
-// として正式化 + DMA_RING レイアウト化した。16B × 512 = 8192B (2冪) で、バッファは
-// その境界にアラインされる (RP2350 DMA のリングラップ要件)。実 DMA チャネルは未接続
-// だが、将来 producer/consumer を DMA 化できる配置。定常 ~323 rec/s の ~1.6 秒分。
-// アルゴリズムは従来の spsc_ring_t と同一 (LOSSY 上書き)。両端は g_data_stream.hdl()
-// の push/pop を使う (SVC を通らないライブラリ)。cmd/calib は従来の機構のまま。
+// ---- ストリームの実体 (inline 変数、.bss でゼロ初期化) -----------------------
+// データ: core1 SENSOR_IO producer → core0 BNO055 consumer。16B × 512 = 8192B (2冪)
+// で、バッファはその境界にアラインされる (RP2350 DMA のリングラップ要件)。実 DMA
+// チャネルは未接続だが、将来 producer/consumer を DMA 化できる配置。定常 ~323 rec/s
+// の ~1.6 秒分。LOSSY (DMA_RING のみ = LOSSY は 0)。
 inline stream::storage<record_t, 512, stream::DMA_RING> g_data_stream;
-inline cmd_ring_t g_cmd_ring;
-inline calib_sideband_t g_calib_xfer;
+
+// コマンド: core0 の BNO055 / BME280 スレッドが producer なので MP_PROD (push_mp の
+// CAS で直列化)。取りこぼすと core1 の設定が食い違うので LOSSLESS。
+inline stream::storage<cmd_rec_t, 16, stream::LOSSLESS | stream::MP_PROD>
+    g_cmd_stream;
+
+// 較正: 片方向 2 本。どちらも単一 producer / 単一 consumer で、落とせないので LOSSLESS。
+inline stream::storage<calib_req_t, 4, stream::LOSSLESS> g_calib_req;
+inline stream::storage<calib_resp_t, 4, stream::LOSSLESS> g_calib_resp;
 
 } // namespace core_ring
 
@@ -168,12 +130,6 @@ void core1_io_launch();
 // センサ I/O ループ本体。Shizuku の SENSOR_IO スレッド entry (core1 ピン留め、POC=1)
 // 兼ベアメタル core1 entry。core1_boot.cpp が method_t として起動する。
 [[noreturn]] void sensor_io_main();
-
-// core0 側ディスパッチフック: データリングの唯一の consumer (BNO055_DRIVER の
-// スレッド) が BARO/GROUND レコードを BME280 モジュールへ渡す (BME280_DRIVER.cpp)。
-// 協調スケジューラなので BNO スレッドからの直接呼び出しで競合しない。
-void bme280_on_baro(uint32_t press_pa, int16_t temp_cc, uint32_t t_us);
-void bme280_on_ground(uint32_t press_pa, int16_t temp_cc);
 
 } // namespace shizu
 

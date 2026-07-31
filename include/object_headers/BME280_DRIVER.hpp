@@ -8,7 +8,10 @@ namespace shizu {
 // ポインタを渡すと、ドライバが内部キャッシュをここへ memcpy する。
 // 単一アドレス空間なのでポインタ渡しでオブジェクト間の値受け渡しが成立する。
 struct bme280_sample_t {
-  uint32_t seq;     // 読み出しごとに +1 (鮮度確認用)
+  uint32_t seq; // 読み出しごとに +1 (鮮度確認用)
+  // 標本時刻 (core1 の time_us_64 下位 32bit)。bno055_sample_t と同じ理由で、
+  // 気圧微分 (v_baro) の dt は排出時刻ではなくこの値の差分で取ること。
+  uint32_t t_us;
   float temp_c;     // 温度 [℃]
   float press_hpa;  // 気圧 [hPa]
   float alt_m;      // 地上気圧基準の相対高度 [m] (init 時にキャリブレーション)
@@ -30,8 +33,8 @@ public:
     read_latest = 0,
     // arg0 = 無視。地上気圧を現在値で取り直す (高度ゼロ点の再較正)。
     rezero = 1,
-    // arg0 = (obj_id<<16)|method_id。新サンプル push 先(sink)を登録。0xFFFF... で無効。
-    set_sample_sink = 2,
+    // 2 = set_sample_sink は退役 (番号は再利用しない)。サンプルは Shizuku ストリーム
+    // で配る — driver_streams.hpp の ID_BME_SAMPLE を consumer 側が open_wait すること。
     // arg0 = 0:サンプリング再開 / 非0:一時停止(スループット試験中に I2C を空ける)。
     set_paused = 3,
   };

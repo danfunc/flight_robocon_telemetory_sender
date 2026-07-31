@@ -23,21 +23,44 @@
 //         DMA 非対応なら共有メモリで足りる、という前提をそのまま型で表す。
 //  3. MPU 前提: ディスクリプタ (制御) と データ領域 (base) を分離配置。将来 MPU で
 //       データ領域だけを region 保護できる (ディスクリプタはカーネルが持つ)。
+//  4. 登録の 2 階層。どちらを使うかは「両端が SVC を撃てるか」だけで決まる:
+//       (a) カーネル登録型 — producer が create + bind(PRODUCER)、consumer が
+//           open_wait + bind(CONSUMER)。ID だけで discovery でき、両端は相手の
+//           storage を extern 参照しない (疎結合)。core0 のオブジェクト間は全部これ。
+//       (b) 直接ハンドル型 — 共有の inline storage を両端が .hdl() で直接触る。
+//           core1 には TU 制約 (core1_io.cpp 冒頭: Shizuku API は sleep_us のみ許可)
+//           があり create/open/bind を撃てないので、コア間ストリームは全部これ。
+//           カーネル登録が無い = SPSC 強制も効かないので、役割は規約で守ること。
 //
-//  【使い方 (owner = producer 側)】
-//    static shizu::stream::storage<record_t, 682> g_sensors;      // 共有メモリ既定
-//    // object main 冒頭:
-//    shizu::stream::create(STREAM_SENSORS, &g_sensors.desc);
-//    shizu::stream::bind(STREAM_SENSORS, shizu::stream::role::PRODUCER);
-//    auto tx = g_sensors.hdl();
-//    // ホットループ: tx.push(rec);   // ライブラリ、SVC 無し
+//  【起動順非依存】consumer は open ではなく open_wait を使うこと。オブジェクトの初回
+//  実行順は async_call 順 (= スレッド番号昇順) なので、「consumer の方が producer より
+//  先に起動する」構成 (例: BME280 は BNO055 より先に起動するが baro の consumer) が
+//  普通に起きる。open_wait は登録されるまで yield して待つのでこの順序に依存しない。
 //
-//  【使い方 (consumer 側、別オブジェクト)】
-//    auto rx = shizu::stream::open<record_t>(STREAM_SENSORS);
-//    shizu::stream::bind(STREAM_SENSORS, shizu::stream::role::CONSUMER);
-//    record_t r; uint32_t lost = 0;
-//    while (rx.pop(&r, &lost)) { ... }         // ポーリング
-//    // または shizu::stream::wait(STREAM_SENSORS); でブロック (実装後)
+//  【待ち方】wait/notify は現状カーネル側スタブ (即戻り)。consumer は自分の周期グリッド
+//  で「空になるまで pop」するポーリングで回す。将来 blocking 化しても呼び出し側は pop の
+//  空振りが 1 回増減するだけで、ここの構造は変わらない。
+//
+//  【ストリーム ID の割り当て】include/driver_streams.hpp に一覧がある。
+//
+//  【使い方 (a) カーネル登録型 = core0 オブジェクト間】
+//    // producer 側 (storage を所有する側)
+//    static shizu::stream::storage<sample_t, 16> g_out;
+//    shizu::stream::create(ID_SAMPLE, &g_out.desc);
+//    shizu::stream::bind(ID_SAMPLE, shizu::stream::role::PRODUCER);
+//    auto tx = g_out.hdl();
+//    tx.push(s);                                   // ライブラリ、SVC 無し
+//
+//    // consumer 側 (別オブジェクト。起動順は問わない)
+//    auto rx = shizu::stream::open_wait<sample_t>(ID_SAMPLE);
+//    shizu::stream::bind(ID_SAMPLE, shizu::stream::role::CONSUMER);
+//    sample_t s; uint32_t lost = 0;
+//    while (rx.pop(&s, &lost)) { ... }              // 自分の周期で空になるまで
+//
+//  【使い方 (b) 直接ハンドル型 = コア間】
+//    // 共有ヘッダ: inline shizu::stream::storage<rec_t, 512, DMA_RING> g_ring;
+//    g_ring.hdl().push(r);                          // core1 producer
+//    while (g_ring.hdl().pop(&r, &lost)) { ... }    // core0 consumer
 // ===========================================================================
 #include <cstddef>
 #include <cstdint>
@@ -267,6 +290,24 @@ inline error_t<error> create(uint32_t id, stream_desc_t *d) {
 template <typename REC> inline handle<REC> open(uint32_t id) {
   auto r = obj_api::svci<obj_api::svc_num::OPEN_STREAM>(id);
   return handle<REC>(reinterpret_cast<stream_desc_t *>(r.value));
+}
+
+// 登録待ち付き open。オブジェクトの初回実行順 (async_call 順 = スレッド番号昇順) に
+// 依存させないための入口で、consumer 側は基本こちらを使う。登録が見えるまで yield して
+// 再試行するので、consumer が producer より先に起動しても正しく繋がる。
+//   ・rec_size が REC と食い違う登録は「別物が同じ ID を取った」= プログラミング
+//     エラーなので invalid を返す (盲目的な reinterpret でメモリを壊さない)。
+//   ・max_retry を撃ち切ったら invalid を返す (producer を起動しないビルド構成でも
+//     固まらない)。呼び出し側は valid() を見て縮退動作すること。
+template <typename REC>
+inline handle<REC> open_wait(uint32_t id, uint32_t max_retry = 10000) {
+  for (uint32_t i = 0; i < max_retry; ++i) {
+    handle<REC> h = open<REC>(id);
+    if (h.valid())
+      return (h.desc()->rec_size == sizeof(REC)) ? h : handle<REC>();
+    obj_api::yield();
+  }
+  return handle<REC>();
 }
 
 // 役割をバインドする。カーネルが単一 producer / 単一 consumer を強制する

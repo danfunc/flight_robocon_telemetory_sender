@@ -3,19 +3,25 @@
 // ===========================================================================
 //  step2 (docs/sensor_stream_protocol.md §7) で I2C アクセスは core1
 //  (core1_io.cpp) へ移った。本オブジェクトは I2C を一切触らず、
-//    1) コア間データリングの唯一の consumer として 100Hz でレコードを排出し、
-//       EUL/LIA/GRV の 3 レコード (同一 t_us) を bno055_sample_t へ再構成
-//       (float 換算 /16, /100 はここで行う)
-//    2) BARO/GROUND レコードを BME280 モジュールへ配る (bme280_on_baro/_ground)
-//    3) コマンド (pause/read_mode/ffff_reject) をコマンドリングへ、較正
-//       プロファイル save/load をサイドバンドへ転送する
-//  外部インタフェース (メソッド ID / セマンティクス) は従来と完全互換。
-//  TELEMETRY_SENDER / FLIGHT_CONTROLLER は無変更で動く。
+//    1) コア間データストリームの唯一の consumer として 100Hz でレコードを排出し、
+//       EUL/LIA/GRV の 3 レコード (同一 t_us) を bno055_sample_t へ再構成して
+//       ID_BNO_SAMPLE へ流す (float 換算 /16, /100 はここで行う)
+//    2) BARO/GROUND レコードを ID_BARO_RAW へ流す (consumer は BME280)
+//    3) コマンド (pause/read_mode/ffff_reject) を g_cmd_stream へ、較正プロファイル
+//       save/load を g_calib_req へ転送し、結果を g_calib_resp で受けて
+//       ID_CALIB_RESULT へ流す
+//  データの配りはすべて Shizuku ストリーム。旧 set_sample_sink / set_calib_sink の
+//  CALL_METHOD push は廃止した — sink 方式は consumer のコードを producer のスレッド
+//  とスタックで同期実行しており、「call_method は yield しないから原子的」という
+//  不変条件に全員がぶら下がっていた。ストリームなら各 consumer が自分のスレッドで
+//  自分の周期に drain するだけで済む。
+//  read_latest / set_paused など一発の RPC は従来どおり call_method のまま。
 // ===========================================================================
 #include <core_ring.hpp>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <driver_streams.hpp>
 #include <export_method.hpp>
 #include <obj_api.hpp>
 #include <object_headers/BNO055_DRIVER.hpp>
@@ -24,6 +30,8 @@
 namespace shizu {
 
 static constexpr int CALIB_PROFILE_LEN = BNO055_CALIB_PROFILE_LEN; // 22
+static_assert(CALIB_PROFILE_LEN == (int)core_ring::CALIB_PROFILE_LEN,
+              "calib profile length must agree with the core1 stream record");
 
 // ---- 最新サンプル ----------------------------------------------------------
 static bno055_sample_t latest = {};
@@ -33,9 +41,13 @@ static volatile bool g_calib_done = false;
 static volatile bool g_calib_ok = false;
 static uint8_t g_calib_buf[CALIB_PROFILE_LEN];
 
-// push 先 (sink)。set_sample_sink / set_calib_sink で (obj<<16)|method を登録。
-static uint32_t sample_sink_obj = 0xFFFF, sample_sink_method = 0;
-static uint32_t calib_sink_obj = 0xFFFF, calib_sink_method = 0;
+// ---- 出力ストリーム (カーネル登録型。consumer は open_wait で繋ぐ) ------------
+// モーションは LOSSY: consumer が遅れたら古い姿勢より新しい姿勢が要る (鮮度優先)。
+// baro / calib は LOSSLESS: GROUND (高度ゼロ点) や較正結果は落とすと状態が食い違う。
+static stream::storage<bno055_sample_t, 16> g_motion_tx;
+static stream::storage<drv_stream::baro_raw_t, 16, stream::LOSSLESS> g_baro_tx;
+static stream::storage<bno055_calib_xfer_t, 4, stream::LOSSLESS> g_calib_tx;
+static uint32_t g_cmd_drop = 0, g_baro_drop = 0, g_calib_drop = 0;
 
 // ---- リング排出の状態 --------------------------------------------------------
 // EUL/LIA/GRV は core1 が同一 t_us で 3 連続 push する。t_us で組にして 9 値
@@ -49,12 +61,15 @@ static uint8_t g_last_calib = 0;        // STATUS レコード由来
 static uint8_t g_health = 0;            // STATUS: HEALTH_* ビット
 static uint64_t g_last_motion_us = 0;   // 鮮度監視 (500ms 無音で valid=false)
 
-// core0 → core1 コマンド送信 (協調スケジューラなので push は実質直列)。
+// core0 → core1 コマンド送信。producer は BNO055 と BME280 の 2 スレッドなので
+// MP_PROD 版 (push_mp) で CAS 直列化する — 旧実装は「協調型単一コアだから push は
+// 実質直列」に寄りかかっており、デュアルコア化でその前提が消えている。
 static void send_cmd(uint8_t op, uint8_t arg) {
   core_ring::cmd_rec_t c = {};
   c.op = op;
   c.arg = arg;
-  core_ring::g_cmd_ring.push(c);
+  if (!core_ring::g_cmd_stream.hdl().push_mp(c))
+    ++g_cmd_drop; // LOSSLESS 満杯 (深さ 16)。設定コマンドは低頻度なので実質起きない
 }
 
 // ===========================================================================
@@ -81,22 +96,6 @@ static void method_set_ffff_reject(uint32_t, uint32_t, uint32_t on, uint32_t) {
   send_cmd(core_ring::CMD_SET_FFFF_REJECT, on != 0);
 }
 
-// arg0 = (obj<<16)|method。新サンプル push 先を登録。
-static void method_set_sample_sink(uint32_t, uint32_t, uint32_t packed,
-                                   uint32_t) {
-  printf("[BNO055]set_sample_sink called\n");
-  sample_sink_obj = (packed >> 16) & 0xFFFF;
-  sample_sink_method = packed & 0xFFFF;
-}
-
-// arg0 = (obj<<16)|method。較正 save/load 完了の push 先を登録。
-static void method_set_calib_sink(uint32_t, uint32_t, uint32_t packed,
-                                  uint32_t) {
-  printf("[BNO055]set_calib_sink called\n");
-  calib_sink_obj = (packed >> 16) & 0xFFFF;
-  calib_sink_method = packed & 0xFFFF;
-}
-
 // arg0: 非0=サンプリング一時停止 / 0=再開 (core1 へ転送)。
 static void method_set_paused(uint32_t, uint32_t, uint32_t on, uint32_t) {
   send_cmd(core_ring::CMD_SET_PAUSED_BNO, on != 0);
@@ -107,13 +106,13 @@ static void method_set_fail_backoff(uint32_t, uint32_t, uint32_t n, uint32_t) {
   send_cmd(core_ring::CMD_SET_FAIL_BACKOFF, (uint8_t)(n & 0xFF));
 }
 
-// 較正オフセットの吸い出し要求 (実処理は core1。完了はサイドバンド ack で届く)。
+// 較正オフセットの吸い出し要求 (実処理は core1。結果は g_calib_resp で届く)。
 static void method_calib_save(uint32_t, uint32_t, uint32_t, uint32_t) {
   g_calib_done = false;
   g_calib_ok = false;
-  core_ring::g_calib_xfer.op = 1;
-  __dmb(); // op を書いてから req 発行
-  core_ring::g_calib_xfer.req_seq = core_ring::g_calib_xfer.req_seq + 1;
+  core_ring::calib_req_t rq = {};
+  rq.op = 1; // save
+  core_ring::g_calib_req.hdl().push(rq);
 }
 
 // arg0: uint8_t[22] への ptr。オフセットを取り込み core1 へ書き戻し要求。
@@ -121,12 +120,12 @@ static void method_calib_load(uint32_t, uint32_t, uint32_t in_ptr, uint32_t) {
   if (in_ptr == 0)
     return;
   memcpy(g_calib_buf, (const void *)(uintptr_t)in_ptr, CALIB_PROFILE_LEN);
-  memcpy(core_ring::g_calib_xfer.data, g_calib_buf, CALIB_PROFILE_LEN);
   g_calib_done = false;
   g_calib_ok = false;
-  core_ring::g_calib_xfer.op = 2;
-  __dmb(); // data/op を書いてから req 発行
-  core_ring::g_calib_xfer.req_seq = core_ring::g_calib_xfer.req_seq + 1;
+  core_ring::calib_req_t rq = {};
+  rq.op = 2; // load
+  memcpy(rq.data, g_calib_buf, CALIB_PROFILE_LEN);
+  core_ring::g_calib_req.hdl().push(rq);
 }
 
 // arg0: bno055_calib_xfer_t*。直近 save/load の done/ok とダンプを返す。
@@ -147,6 +146,7 @@ static void method_calib_get(uint32_t, uint32_t, uint32_t out_ptr, uint32_t) {
 static void commit_motion_sample() {
   bno055_sample_t s;
   s.seq = latest.seq + 1;
+  s.t_us = pend_t; // core1 が付けた標本時刻 (consumer の積分 dt はこれの差分)
   s.heading = pend[0] / 16.0f; // 1/16 deg (デッドバンドは core1 で適用済み)
   s.roll = pend[1] / 16.0f;
   s.pitch = pend[2] / 16.0f;
@@ -160,9 +160,8 @@ static void commit_motion_sample() {
   s.valid = true;
   latest = s;
   g_last_motion_us = time_us_64();
-  if (sample_sink_obj != 0xFFFF)
-    obj_api::svc(obj_api::svc_num::CALL_METHOD, sample_sink_obj,
-                 sample_sink_method, (uint32_t)(uintptr_t)&latest);
+  // LOSSY なので満杯でも黙って最古を上書きする (戻り値は常に true)。
+  g_motion_tx.hdl().push(latest);
 }
 
 // モーション 3 点組の部分レコードを取り込む。idx: 0=EUL 1=LIA 2=GRV。
@@ -191,20 +190,19 @@ static void dispatch_record(const core_ring::record_t &rec) {
   case core_ring::CH_GRV:
     accept_motion_part(2, rec);
     break;
-  case core_ring::CH_BARO: {
-    uint32_t pa;
-    int16_t cc;
-    memcpy(&pa, &rec.payload[0], 4);
-    memcpy(&cc, &rec.payload[4], 2);
-    bme280_on_baro(pa, cc, rec.t_us);
-    break;
-  }
+  // BARO (定常) と GROUND (高度ゼロ点) は 1 本のストリームへ載せる。別ストリームに
+  // 割ると「ground が baro を追い越す」順序逆転が起き得るため (is_ground で区別)。
+  case core_ring::CH_BARO:
   case core_ring::CH_GROUND: {
-    uint32_t pa;
+    drv_stream::baro_raw_t b = {};
     int16_t cc;
-    memcpy(&pa, &rec.payload[0], 4);
+    memcpy(&b.press_pa, &rec.payload[0], 4);
     memcpy(&cc, &rec.payload[4], 2);
-    bme280_on_ground(pa, cc);
+    b.temp_cc = cc;
+    b.t_us = rec.t_us;
+    b.is_ground = (rec.ch_id == core_ring::CH_GROUND) ? 1 : 0;
+    if (!g_baro_tx.hdl().push(b))
+      ++g_baro_drop; // LOSSLESS 満杯 = BME280 が長時間 drain していない
     break;
   }
   case core_ring::CH_STATUS: {
@@ -247,10 +245,6 @@ void BNO055_DRIVER::init() {
   export_method<method_set_read_mode>(BNO055_DRIVER::METHOD_IDs::set_read_mode);
   export_method<method_set_ffff_reject>(
       BNO055_DRIVER::METHOD_IDs::set_ffff_reject);
-  export_method<method_set_sample_sink>(
-      BNO055_DRIVER::METHOD_IDs::set_sample_sink);
-  export_method<method_set_calib_sink>(
-      BNO055_DRIVER::METHOD_IDs::set_calib_sink);
   export_method<method_set_paused>(BNO055_DRIVER::METHOD_IDs::set_paused);
   export_method<method_set_fail_backoff>(
       BNO055_DRIVER::METHOD_IDs::set_fail_backoff);
@@ -258,7 +252,13 @@ void BNO055_DRIVER::init() {
   export_method<method_calib_load>(BNO055_DRIVER::METHOD_IDs::calib_load);
   export_method<method_calib_get>(BNO055_DRIVER::METHOD_IDs::calib_get);
 
-  uint32_t last_ack = core_ring::g_calib_xfer.ack_seq;
+  // 出力ストリームを登録する。consumer (TELEMETRY / BME280) は open_wait で繋ぐので
+  // 起動順は問わない (BME280 は本オブジェクトより先に起動するが ID_BARO_RAW の
+  // consumer、という順序でも成立する)。
+  drv_stream::publish(drv_stream::ID_BNO_SAMPLE, &g_motion_tx.desc, "BNO055");
+  drv_stream::publish(drv_stream::ID_BARO_RAW, &g_baro_tx.desc, "BNO055");
+  drv_stream::publish(drv_stream::ID_CALIB_RESULT, &g_calib_tx.desc, "BNO055");
+
   uint32_t last_drop_report = 0;
 
   // 排出周期は最高レートのチャンネル (NDOF 100Hz) に合わせた絶対グリッド。
@@ -274,28 +274,28 @@ void BNO055_DRIVER::init() {
          --budget)
       dispatch_record(rec);
     if (g_drop_count != last_drop_report) {
-      printf("[BNO055] ring overrun: %lu records dropped (total)\n",
-             (unsigned long)g_drop_count);
+      // baro/calib/cmd は LOSSLESS なので drop は「consumer が排出していない」の証拠。
+      // データストリームの overrun とは意味が違うので分けて出す。
+      printf("[BNO055] stream drops: data=%lu baro=%lu calib=%lu cmd=%lu\n",
+             (unsigned long)g_drop_count, (unsigned long)g_baro_drop,
+             (unsigned long)g_calib_drop, (unsigned long)g_cmd_drop);
       last_drop_report = g_drop_count;
     }
 
-    // ---- 較正サイドバンドの完了 (ack) 監視 ----
-    uint32_t ack = core_ring::g_calib_xfer.ack_seq;
-    if (ack != last_ack) {
-      last_ack = ack;
-      __dmb(); // ack 観測 → data/ok 読みの順序を保証
-      g_calib_ok = (core_ring::g_calib_xfer.ok != 0);
-      memcpy(g_calib_buf, core_ring::g_calib_xfer.data, CALIB_PROFILE_LEN);
+    // ---- 較正結果 (core1 → g_calib_resp) の受領 ----
+    // 自分のミラー (calib_get が返す) を更新してから、ダウンリンク用に
+    // ID_CALIB_RESULT へ流す (旧 calib_sink への CALL_METHOD)。
+    core_ring::calib_resp_t rs;
+    while (core_ring::g_calib_resp.hdl().pop(&rs)) {
+      g_calib_ok = (rs.ok != 0);
+      memcpy(g_calib_buf, rs.data, CALIB_PROFILE_LEN);
       g_calib_done = true;
-      // 結果を sink へ push (従来 handle_calib_cmd がやっていたのと同じ)。
-      if (calib_sink_obj != 0xFFFF) {
-        bno055_calib_xfer_t x;
-        x.done = 1;
-        x.ok = g_calib_ok ? 1 : 0;
-        memcpy(x.data, g_calib_buf, CALIB_PROFILE_LEN);
-        obj_api::svc(obj_api::svc_num::CALL_METHOD, calib_sink_obj,
-                     calib_sink_method, (uint32_t)(uintptr_t)&x);
-      }
+      bno055_calib_xfer_t x;
+      x.done = 1;
+      x.ok = g_calib_ok ? 1 : 0;
+      memcpy(x.data, g_calib_buf, CALIB_PROFILE_LEN);
+      if (!g_calib_tx.hdl().push(x))
+        ++g_calib_drop;
     }
 
     // ---- 鮮度監視: 500ms モーションが来なければ valid=false (I2C 断相当) ----

@@ -73,7 +73,8 @@ constexpr uint8_t OPMODE_CONFIG = 0x00;
 constexpr uint8_t OPMODE_NDOF = 0x0C;
 constexpr uint8_t USE_MODE = OPMODE_NDOF;
 constexpr uint8_t REG_CALIB_OFFSET_START = 0x55;
-constexpr int CALIB_PROFILE_LEN = 22;
+// プロファイル長 (22) は core_ring::CALIB_PROFILE_LEN に一本化 (using namespace
+// core_ring 済み)。ここで再定義すると using 経由の名前と衝突する。
 
 constexpr uint8_t REG_BLOCK_START = REG_EUL_HEAD_LSB; // 0x1A
 constexpr int MOTION_BLOCK_LEN =
@@ -357,8 +358,7 @@ void __not_in_flash_func(push_baro_like)(uint8_t ch, uint32_t t_us, uint32_t pre
 // ---- コマンドリング処理 ------------------------------------------------------
 void __not_in_flash_func(handle_cmds)() {
   cmd_rec_t c;
-  uint32_t lost = 0;
-  while (g_cmd_ring.pop(&c, &lost)) {
+  while (g_cmd_stream.hdl().pop(&c)) {
     switch (c.op) {
     case CMD_SET_PAUSED_BNO:
       g_paused_bno = (c.arg != 0);
@@ -385,36 +385,36 @@ void __not_in_flash_func(handle_cmds)() {
   }
 }
 
-// ---- 較正プロファイル サイドバンド処理 ---------------------------------------
-// モード切替 (busy_wait 30ms×2) を伴うので処理後は BNO グリッドを取り直すこと。
-bool __not_in_flash_func(handle_calib_sideband)() {
-  uint32_t req = g_calib_xfer.req_seq;
-  if (req == g_calib_xfer.ack_seq)
-    return false;
-  __dmb(); // req_seq 観測 → op/data 読みの順序を保証
-  uint8_t op = g_calib_xfer.op;
+// ---- 較正プロファイル要求の処理 ----------------------------------------------
+// g_calib_req から 1 件取り出して実行し、結果を g_calib_resp へ返す (旧: req_seq/
+// ack_seq のサイドバンド握手)。モード切替 (busy_wait 30ms×2) を伴うので、処理した
+// ときは呼び出し側で BNO グリッドを取り直すこと。1 周回につき 1 件だけ処理する
+// (較正は最大 ~100ms 掛かるので、溜まっていてもセンサグリッドを連続で潰さない)。
+bool __not_in_flash_func(handle_calib_req)() {
+  calib_req_t rq;
+  if (!g_calib_req.hdl().pop(&rq))
+    return false; // 要求なし
+  calib_resp_t rs = {};
+  rs.op = rq.op;
   bool ok = false;
   if (g_bno_ok) {
     bno_set_mode(OPMODE_CONFIG);
-    if (op == 1) { // save: 現オフセットを吸い出す
-      uint8_t buf[CALIB_PROFILE_LEN];
-      ok = (i2c_bus::read_regs(BNO055_ADDR, REG_CALIB_OFFSET_START, buf,
+    if (rq.op == 1) { // save: 現オフセットを吸い出す
+      ok = (i2c_bus::read_regs(BNO055_ADDR, REG_CALIB_OFFSET_START, rs.data,
                                CALIB_PROFILE_LEN) >= 0);
-      if (ok)
-        memcpy(const_cast<uint8_t *>(g_calib_xfer.data), buf,
-               CALIB_PROFILE_LEN);
-    } else if (op == 2) { // load: オフセットを書き戻す
+    } else if (rq.op == 2) { // load: オフセットを書き戻す
       ok = true;
-      for (int i = 0; i < CALIB_PROFILE_LEN; ++i)
+      for (uint32_t i = 0; i < CALIB_PROFILE_LEN; ++i)
         if (i2c_bus::write_reg(BNO055_ADDR, REG_CALIB_OFFSET_START + i,
-                               g_calib_xfer.data[i]) < 0)
+                               rq.data[i]) < 0)
           ok = false;
+      // core0 のミラー (calib_get が返す) を旧挙動どおりにするため要求をエコーする。
+      memcpy(rs.data, rq.data, CALIB_PROFILE_LEN);
     }
     bno_set_mode(USE_MODE);
   }
-  g_calib_xfer.ok = ok ? 1 : 0;
-  __dmb(); // data/ok の書き込みを ack 公開より先に完了させる
-  g_calib_xfer.ack_seq = req;
+  rs.ok = ok ? 1 : 0;
+  g_calib_resp.hdl().push(rs);
   return true;
 }
 
@@ -447,7 +447,7 @@ bool __not_in_flash_func(handle_calib_sideband)() {
     // しなければ末尾で次の締切まで sleep してスケジューラへ CPU を返す。
     bool did_work = false;
     handle_cmds();
-    if (handle_calib_sideband()) {
+    if (handle_calib_req()) {
       next_bno = now_us(); // モード切替 (~100ms) 後はグリッド取り直し
       did_work = true;
     }

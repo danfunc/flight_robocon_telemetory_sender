@@ -30,6 +30,23 @@
 #define SHIZU_SMP_STRESS 0
 #endif
 
+// CPU ホグ負荷試験トグル: 1 = BUSY_LOAD オブジェクトに「yield しない無限ループ」を
+// BLE と同じ core1 へ既定 budget (3ms) でピン留めし、凍結ウォッチドッグの取り上げが
+// 通常運転の BLE と同居して効くこと (= ホグが BLE を妨げない) を実地確認する。reporter
+// が生存カウンタを 2s ごとに印字 (ADVANCING = ホグが 3ms スライスをもらえ系も非凍結)。
+// BLE 側の無事は BLE_UART の 1s tx 統計 (ctrl_lat) / ブラストで別途見る。
+#ifndef SHIZU_BUSY_LOAD
+#define SHIZU_BUSY_LOAD 0
+#endif
+
+// RT スケジューラ検証トグル: 1 = RT_SCHED_TEST に「合成周期 victim (代表レートで締切
+// ジッタを自己計測) + never-yield hog + reporter」を置き、CPU ホグ同居下でも周期タスクが
+// 締切 (ジッタ ~budget) を保つかを device 側だけで測る (センサ実機/ホスト接続不要)。
+// reporter が 2s ごとに victim ジッタ表と hog 生存を stdio へ印字。詳細は rt_sched_test.cpp。
+#ifndef SHIZU_RT_SCHED_TEST
+#define SHIZU_RT_SCHED_TEST 0
+#endif
+
 // Pico 2 (無印) 一時テストビルド用トグル: 1 = BLE (cyw43/btstack/BLE_UART_DRIVER) を
 // ビルドから外す。CMake の -DSHIZU_PICO2_TEST=1 が定義する (手で立てるものではない)。
 // RP2350 チップは pico2_w と同一なので、カーネル検証 (PSPLIM/MPU/DMA/affinity) は等価。
@@ -97,6 +114,8 @@ void core1_kernel_launch();      // core0 から core1 を起動する (core1_bo
 void stream_selftest_launch();   // ストリーム自己テストの起動 (stream_selftest.cpp)
 void grant_selftest_launch();    // 時限移譲自己テストの起動 (grant_selftest.cpp)
 void smp_stress_launch();        // 2 コア SVC ストレスの起動 (smp_stress.cpp)
+void busy_load_launch();         // CPU ホグ負荷試験の起動 (busy_load.cpp)
+void rt_sched_test_launch();     // RT スケジューラ検証の起動 (rt_sched_test.cpp)
 // per-core の例外優先度設定 (SVC 最優先 > SysTick > PendSV 最低)。SHPR は banked な
 // ので core0 は cpu_manager::init、core1 は init_core1 がそれぞれ呼ぶ。
 void init_exception_priorities();

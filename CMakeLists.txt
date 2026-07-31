@@ -48,9 +48,17 @@ endif()
 include($ENV{PICO_SDK_PATH}/external/pico_sdk_import.cmake)
 project(shizupico C CXX ASM)
 pico_sdk_init()
-add_executable(main main.cpp kernel.cpp kernel_object.cpp svc_asm_handler.S obj_api.cpp core1_boot.cpp stream_selftest.cpp grant_selftest.cpp smp_stress.cpp)
+add_executable(main main.cpp kernel.cpp kernel_object.cpp svc_asm_handler.S obj_api.cpp core1_boot.cpp stream_selftest.cpp grant_selftest.cpp smp_stress.cpp busy_load.cpp rt_sched_test.cpp)
 target_sources(main PRIVATE IO_CONTROLLER.cpp WS2812_DRIVER.cpp HELLO_WORLD.cpp BME280_DRIVER.cpp BNO055_DRIVER.cpp TELEMETRY_SENDER.cpp FLIGHT_CONTROLLER.cpp core1_io.cpp)
 target_link_libraries(main pico_stdlib pico_stdio pico_multicore hardware_exception hardware_irq hardware_pwm hardware_gpio hardware_pio hardware_i2c hardware_dma)
+if(SHIZU_BUSY_LOAD)
+    # CPU ホグ負荷試験を有効化 (kernel.hpp の既定 0 を上書き)。cmake -DSHIZU_BUSY_LOAD=ON。
+    target_compile_definitions(main PRIVATE SHIZU_BUSY_LOAD=1)
+endif()
+if(SHIZU_RT_SCHED_TEST)
+    # RT スケジューラ検証を有効化。cmake -DSHIZU_RT_SCHED_TEST=ON。
+    target_compile_definitions(main PRIVATE SHIZU_RT_SCHED_TEST=1)
+endif()
 if(SHIZU_PICO2_TEST)
     # BLE 無し: ドライバ本体を外し、コード側の #if ガード (IO_CONTROLLER / main の
     # ble_dbg スタブ) を有効化する。
