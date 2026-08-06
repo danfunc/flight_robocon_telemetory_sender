@@ -47,6 +47,13 @@ endif()
 
 include($ENV{PICO_SDK_PATH}/external/pico_sdk_import.cmake)
 project(shizupico C CXX ASM)
+# 診断用: CYW43 IOCTL タイムアウト (既定 1s = cyw43_configport.h) を上書きして、
+# BLE 接続時の「1s LONG poll」がこの定数に追従するか確認する。pico_sdk_init より前に
+# add_compile_definitions すると SDK ライブラリ (pico_cyw43_driver) にも -D が効く。
+# cmake -DSHIZU_IOCTL_TIMEOUT_US=200000 で 200ms 等に。
+if(DEFINED SHIZU_IOCTL_TIMEOUT_US)
+    add_compile_definitions(CYW43_IOCTL_TIMEOUT_US=${SHIZU_IOCTL_TIMEOUT_US})
+endif()
 pico_sdk_init()
 add_executable(main main.cpp kernel.cpp kernel_object.cpp svc_asm_handler.S obj_api.cpp core1_boot.cpp stream_selftest.cpp grant_selftest.cpp smp_stress.cpp busy_load.cpp rt_sched_test.cpp)
 target_sources(main PRIVATE IO_CONTROLLER.cpp WS2812_DRIVER.cpp HELLO_WORLD.cpp BME280_DRIVER.cpp BNO055_DRIVER.cpp TELEMETRY_SENDER.cpp FLIGHT_CONTROLLER.cpp core1_io.cpp)
@@ -58,6 +65,14 @@ endif()
 if(SHIZU_RT_SCHED_TEST)
     # RT スケジューラ検証を有効化。cmake -DSHIZU_RT_SCHED_TEST=ON。
     target_compile_definitions(main PRIVATE SHIZU_RT_SCHED_TEST=1)
+endif()
+if(SHIZU_BLE_POLL_INSTR)
+    # BLE poll 計装を有効化 (cyw43_arch_poll 1 回の所要時間)。cmake -DSHIZU_BLE_POLL_INSTR=ON。
+    target_compile_definitions(main PRIVATE SHIZU_BLE_POLL_INSTR=1)
+endif()
+if(SHIZU_BLE_NO_PHY_PROBE)
+    # 診断: 2M PHY プローブを無効化。cmake -DSHIZU_BLE_NO_PHY_PROBE=ON。
+    target_compile_definitions(main PRIVATE SHIZU_BLE_NO_PHY_PROBE=1)
 endif()
 if(SHIZU_PICO2_TEST)
     # BLE 無し: ドライバ本体を外し、コード側の #if ガード (IO_CONTROLLER / main の

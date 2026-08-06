@@ -47,6 +47,21 @@
 #define SHIZU_RT_SCHED_TEST 0
 #endif
 
+// BLE poll 計装トグル: 1 = BLE_UART の主ループで cyw43_arch_poll() 1 回の所要時間を測り、
+// 窓内最大を 1s 統計へ出す + 閾値 (BLE_POLL_WARN_US) 超えは接続/認可/NC 状態つきで即警告。
+// 目的: RT を数秒スタールさせる「budget-0 の BLE がコアを握る一塊」が cyw43_arch_poll 内の
+// 単発長時間処理か (ble_dbg_poll が止まるか) を実機で確定し、それが接続/ペアリング局面に
+// 限るか定常でも起きるかを切り分ける。既定 OFF (計装の printf/時刻読みを常用ビルドに載せない)。
+#ifndef SHIZU_BLE_POLL_INSTR
+#define SHIZU_BLE_POLL_INSTR 0
+#endif
+
+// 診断トグル: 1 = 接続時の 2M PHY プローブ (gap_le_set_phy) を無効化する。接続時に必ず出る
+// ~38ms/ときに1s の LONG poll が、この PHY 設定 IOCTL 由来かを切り分ける (OFF で消えれば犯人)。
+#ifndef SHIZU_BLE_NO_PHY_PROBE
+#define SHIZU_BLE_NO_PHY_PROBE 0
+#endif
+
 // Pico 2 (無印) 一時テストビルド用トグル: 1 = BLE (cyw43/btstack/BLE_UART_DRIVER) を
 // ビルドから外す。CMake の -DSHIZU_PICO2_TEST=1 が定義する (手で立てるものではない)。
 // RP2350 チップは pico2_w と同一なので、カーネル検証 (PSPLIM/MPU/DMA/affinity) は等価。

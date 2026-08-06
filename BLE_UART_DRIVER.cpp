@@ -210,6 +210,17 @@ static uint32_t tx_stat_pkts = 0;  // 直近窓の notify 送信数
 static uint32_t tx_stat_csn = 0;   // 直近窓の CAN_SEND_NOW イベント数
 static uint32_t tx_stat_bytes = 0; // 直近窓の送信バイト数
 
+#if SHIZU_BLE_POLL_INSTR
+// ---- BLE poll 計装 (SHIZU_BLE_POLL_INSTR) ----------------------------------
+// budget-0 の BLE がコアを握る一塊は cyw43_arch_poll の中にしか残らない (主ループの
+// 送信は非ブロッキング・末尾で 1ms yield する)。1 回の poll 所要を測り、窓内最大を 1s
+// 統計へ出す + 閾値超えは接続/認可/NC 状態つきで即警告 (接続/ペアリング局面か定常かを
+// 切り分ける)。ble_dbg_poll (毎周 ++) がスタール中に止まれば「単発 poll が数秒」で確定。
+static constexpr uint32_t BLE_POLL_WARN_US = 5000; // これを超えた poll を即警告
+static uint32_t poll_max_win_us = 0;  // 窓内最大 (1s 統計でリセット)
+static uint32_t poll_max_ever_us = 0; // 起動来最大
+#endif
+
 // ---- TX flush --------------------------------------------------------------
 // 1 回の CAN_SEND_NOW で notification を 1 発だけ送ると、CI (15ms) あたり
 // 1 パケットに律速され ~130kbps が理論上限になる。コントローラの ACL バッファ
@@ -410,6 +421,9 @@ static constexpr uint64_t PHY_PROBE_TIMEOUT_US = 5000000ull;
 // / Command Status / 5s タイムアウトの 3 経路のどれかで必ずログに出る。
 // tx_phys/rx_phys: bit0=1M, bit1=2M, bit2=Coded。all_phys=0 = 両方向とも希望を指定。
 static void request_2m_phy() {
+#if SHIZU_BLE_NO_PHY_PROBE
+  return; // 診断: PHY プローブが接続時 LONG poll の原因か切り分けるため無効化
+#endif
   if (con_handle == HCI_CON_HANDLE_INVALID)
     return;
   uint8_t r = gap_le_set_phy(con_handle, 0, 0x02, 0x02, 0);
@@ -867,7 +881,22 @@ void BLE_UART_DRIVER::init() {
   absolute_time_t next_tx_stat = make_timeout_time_ms(1000);
   while (true) {
     ble_dbg_poll = ble_dbg_poll + 1;
+#if SHIZU_BLE_POLL_INSTR
+    uint64_t _poll_t0 = time_us_64();
+#endif
     cyw43_arch_poll();
+#if SHIZU_BLE_POLL_INSTR
+    uint32_t _poll_us = (uint32_t)(time_us_64() - _poll_t0);
+    if (_poll_us > poll_max_win_us)
+      poll_max_win_us = _poll_us;
+    if (_poll_us > poll_max_ever_us)
+      poll_max_ever_us = _poll_us;
+    if (_poll_us > BLE_POLL_WARN_US)
+      printf("[BLE_UART] LONG poll %luus (con=%d authz=%d nc_pending=%d)\n",
+             (unsigned long)_poll_us,
+             con_handle != HCI_CON_HANDLE_INVALID ? 1 : 0, cmd_authorized ? 1 : 0,
+             nc_pending_handle != HCI_CON_HANDLE_INVALID ? 1 : 0);
+#endif
 
     // LE features 読み出し (HCI ready 時に予約)。クレジットが空くのを待って
     // から送る (hci_send_cmd はクレジット無しだと黙って捨てるため)。
@@ -898,6 +927,15 @@ void BLE_UART_DRIVER::init() {
         tx_stat_csn = 0;
         tx_stat_bytes = 0;
       }
+#if SHIZU_BLE_POLL_INSTR
+      // cyw43_arch_poll 1 回の最大所要 (窓/起動来)。窓最大が数 ms を超えるなら、その間
+      // core1 の RT スレッドは走れない (budget-0 の BLE は preempt されず、poll 内では
+      // yield もできないため) = 数秒スタールの正体。
+      printf("[BLE_UART] poll 1s: max=%luus ever=%luus (dbg_poll=%lu)\n",
+             (unsigned long)poll_max_win_us, (unsigned long)poll_max_ever_us,
+             (unsigned long)ble_dbg_poll);
+      poll_max_win_us = 0;
+#endif
       // ctrl (ping 応答等) の device 内滞在時間。RTT>100ms の切り分け: この値が
       // 小さい (≲CI=15ms) のに GUI の RTT が跳ねるなら犯人は host 側で確定。
       if (bt::ctrl_lat_max_us != 0) {
