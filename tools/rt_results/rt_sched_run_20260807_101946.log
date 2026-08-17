@@ -1,0 +1,19 @@
+[SERIAL] /dev/cu.usbmodem1101 @ 115200 を 26s 監視
+[BLE] 'Shizuku UART' をスキャン中…
+[BLE] ping ×30 …
+[BLE] blast 3s …
+
+==================== RT スケジューラ検証結果 ====================
+SERIAL: シリアル読み取り失敗: read failed: [Errno 6] Device not configured
+[SERIAL] 受信行 0, armed=False, hog windows=0 (STALLED 0)
+victim     late_win_max  late_max*  overrun  windows    min ticks/exp
+  * late_max = 起動来累積ピーク (BLE 接続等の一過性を含む)。ongoing は late_win_max で判断
+
+[BLE]
+   ping 応答なし
+   throughput(競合下): 32 kbps (1-notify上限比 23%)
+
+---------------------------------------------------------------
+  (観察) armed 行は未受信 (キャプチャ開始が arm より後なだけなら無害)
+判定: ❌ FAIL
+  - hog の window を 1 つも受信していない

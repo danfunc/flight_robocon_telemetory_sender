@@ -125,29 +125,15 @@ context_t *kernel_context_for(uint32_t thread_id) {
 // スレッド数 (本番構成で ~10、selftest 込みでも ~30 程度) に対して 32 スレッド分の
 // 余裕を静的確保し、超過時だけ malloc へフォールバックする (性能でなく安全側: 想定を
 // 超えた場合に panic させず、分離の恩恵をその分だけ諦めて動作を継続する)。
-constexpr uint32_t KERNEL_ARENA_THREAD_MARGIN = 32;
-constexpr uint32_t KERNEL_ARENA_BYTES =
-    KERNEL_ARENA_THREAD_MARGIN * call_stack_t::MAX_DEPTH *
-    sizeof(method_call_stack_t);
-alignas(8) static uint8_t g_kernel_arena[KERNEL_ARENA_BYTES];
-static uint32_t g_kernel_arena_used = 0;
-static uint32_t g_kernel_arena_fallback_n = 0; // malloc フォールバック回数 (計装)
-
-method_call_stack_t *kernel_arena_alloc_call_stack() {
-  constexpr uint32_t bytes = sizeof(method_call_stack_t) * call_stack_t::MAX_DEPTH;
-  if (g_kernel_arena_used + bytes <= KERNEL_ARENA_BYTES) {
-    void *p = &g_kernel_arena[g_kernel_arena_used];
-    g_kernel_arena_used += bytes;
-    return (method_call_stack_t *)p;
-  }
-  // 想定スレッド数を超過。malloc へフォールバック (この分だけ Step1 の分離対象から
-  // 漏れるが、致命的にはしない — g_kernel_arena_fallback_n で検知可能にしておく)。
-  ++g_kernel_arena_fallback_n;
-  printf("[KERNEL] arena exhausted (fallback #%lu) — bump "
-        "KERNEL_ARENA_THREAD_MARGIN if this repeats\n",
-        (unsigned long)g_kernel_arena_fallback_n);
-  return (method_call_stack_t *)malloc(bytes);
-}
+// ★32 → 20 (2026-08-13)。call_stack_t::MAX_DEPTH を 16→32 に倍増したので、枠を
+// 据え置くとアリーナも倍 (86KB→172KB) になり、8KB/本 のスレッドスタックを malloc する
+// ヒープが 200KB→116KB まで削られて 14 本で尽きる。実スレッド数は本番構成 ~10 /
+// selftest 込みで ~15 なので、枠を実数へ寄せて総量をほぼ据え置く (20×32×168B=107KB)。
+// これを超えた分は下の malloc フォールバックが受ける (警告を 1 行出して動作継続)。
+// 呼び出しフレーム用のカーネルアリーナは撤去した (2026-08-13)。退避先はスレッド
+// 自身のスタック (include/kernel.hpp の call_frame_hdr_t の幾何を参照)。実際に
+// ネストした分しか消費せず、溢れは PSPLIM が捕まえる。旧実装は 20 スレッド ×
+// 32 段 × 168B = 105KB を .bss へ予約していた。
 
 void object_table_init() {
   for (uint32_t i = 0; i < 128; i++) {
@@ -197,6 +183,44 @@ volatile uint64_t cpu_busy_us[2] = {0, 0};
 //  panic リング (panic_ring.hpp) — noinit RAM なのでリセットを跨いで残る
 // ---------------------------------------------------------------------------
 panic_slot_t __uninitialized_ram(panic_slots)[2];
+#if SHIZU_SVC_DELEGATION
+// svc 委譲の計装リング (noinit = リセットを跨いで残る)。
+svc_trace_t __uninitialized_ram(svc_trace);
+// 記録は最小コスト (ロック無し・printf 無し)。固まる直前の数件が残ればよい。
+void svc_trace_record(uint32_t num, uint32_t obj, uint32_t in_handler,
+                      bool primitive, bool trampoline, uint32_t pc) {
+  if (svc_trace.magic != SVC_TRACE_MAGIC) {
+    svc_trace.magic = SVC_TRACE_MAGIC;
+    svc_trace.n = 0;
+  }
+  svc_trace_t::entry_t &e = svc_trace.e[svc_trace.n % SVC_TRACE_SLOTS];
+  e.num = (uint16_t)num;
+  e.obj = (uint8_t)obj;
+  e.flags = (in_handler ? 1u : 0u) | (primitive ? 2u : 0u) | (trampoline ? 4u : 0u);
+  e.pc = pc;
+  __dmb();
+  svc_trace.n = svc_trace.n + 1;
+}
+
+void svc_trace_boot_report() {
+  if (svc_trace.magic != SVC_TRACE_MAGIC)
+    return;
+  const uint32_t n = svc_trace.n;
+  const uint32_t shown = n < SVC_TRACE_SLOTS ? n : SVC_TRACE_SLOTS;
+  printf("[SVCTRACE] 前回の残骸 %lu 件 (総 %lu):\n", (unsigned long)shown,
+         (unsigned long)n);
+  for (uint32_t i = 0; i < shown; ++i) {
+    const uint32_t idx = (n - shown + i) % SVC_TRACE_SLOTS;
+    const svc_trace_t::entry_t &e = svc_trace.e[idx];
+    printf("  #%lu num=%u obj=%u %s%s%s pc=%08lx\n", (unsigned long)(n - shown + i),
+           (unsigned)e.num, (unsigned)e.obj,
+           (e.flags & 1) ? "in_handler " : "",
+           (e.flags & 2) ? "primitive " : "",
+           (e.flags & 4) ? "->trampoline" : "->direct", (unsigned long)e.pc);
+  }
+  svc_trace.magic = 0;
+}
+#endif
 
 static void panic_slot_print(const panic_slot_t &s, const char *tag) {
   printf("[PANIC-RING] %s core%lu exc=%lu thr=%lu t=%llums: %.*s\n", tag,
@@ -381,6 +405,7 @@ void cpu_manager::init() {
 
 cpu_manager::svc_handler_descriptor cpu_manager::svc_handler_info{nullptr, 0};
 
+
 // MPU Step1 プロトタイプ: obj_id が現在の「実行中オブジェクト」であるとき、
 // CONTROL レジスタが持つべき値 (nPRIV ビット) を object_table[obj_id].unprivileged
 // から導出する。svc_cpp_handler の METHOD_CALL/トランポリンと create_thread が使う
@@ -388,6 +413,54 @@ cpu_manager::svc_handler_descriptor cpu_manager::svc_handler_info{nullptr, 0};
 static inline uint32_t control_for_object(uint32_t obj_id) {
   return object_table[obj_id].unprivileged ? CONTROL_UNPRIV_PSP
                                            : CONTROL_PRIV_PSP;
+}
+
+// exit_method の svc が「戻ってきてしまった」= 巻き戻しがカーネルの検算で弾かれた
+// ときの落ち先 (naked な exit_method から b で飛ぶ)。r0/r1 に METHOD_EXIT の戻り
+// (exit_error と実際のネスト数) がそのまま乗っているので、そのまま診断に使える。
+// 巻き戻せない以上ここから復帰する先が無いので panic する。
+extern "C" [[noreturn]] void exit_method_failed(uint32_t err,
+                                                uint32_t actual_depth) {
+  // exit_method / delegate_exit_method の svc が「戻ってきてしまった」= 巻き戻しが
+  // カーネルの検算で弾かれたときの落ち先。
+  // err: 1=DEPTH_MISMATCH (申告したネスト数が実際と違う) / 2=BAD_COUNT。
+  //
+  // ★**panic しない**。段数の申告はオブジェクト側の責任なので、間違えた者だけが
+  //   止まるべきで、系全体を道連れにするのは方針として誤り (CPU 予算の超過が
+  //   guest から取り上げるだけで系を殺さないのと同じ)。
+  //   ・shizu_panic() は panic スロットへ記録して**戻る**だけなので、診断は残る
+  //     (ビーコン IRQ の panic_ring_poll_report が拾って印字する)。
+  //   ・その後このスレッドは yield ループに入って永久に実務へ戻らない = 隔離。
+  //     他のスレッド/コアは動き続ける。
+  shizu_panic("exit unwind rejected: err=%lu actual_depth=%lu (thread parked)\n",
+              (unsigned long)err, (unsigned long)actual_depth);
+  while (true) {
+    // obj_api の YIELD (旧 r0 ディスパッチ: 即値 0 / r0=0)。一般オブジェクトからも
+    // カーネルオブジェクトからも撃てる唯一の共通経路。
+    asm volatile("movs r0, #0\n"
+                 "movs r1, #0\n"
+                 "movs r2, #0\n"
+                 "movs r3, #0\n"
+                 "svc  0\n" ::: "r0", "r1", "r2", "r3", "memory");
+  }
+}
+
+// ---------------------------------------------------------------------------
+//  ★ARCH SEAM — アトミックな枠取り
+// ---------------------------------------------------------------------------
+//  「UNINITIALIZED なら RESERVED にする」を不可分に行う。**ここが ISA/ボード依存の
+//  継ぎ目**で、移植時に差し替える点。同一ベンダの 2 チップで答えが真逆になる:
+//    ・RP2350 (ARMv8-M): LDREX/STREX (= __atomic 系) を使う。SIO ハードウェア
+//      スピンロックは **E2 erratum で使えない**
+//    ・RP2040 (ARMv6-M): **LDREX/STREX がそもそも無い**。マルチコアでは SIO
+//      ハードウェアスピンロックを使うしかない
+//  → 新実装では `arch` テンプレートのパラメータとして外から与えること
+//     (docs/SHIZUKU_REDESIGN_PORTABILITY.md §5.1)。ここは RP2350 用の実装。
+static bool arch_claim_thread_slot(thread_t &t) {
+  uint32_t expected = (uint32_t)thread_t::state_t::UNINITIALIZED;
+  return __atomic_compare_exchange_n(
+      (uint32_t *)&t.state, &expected, (uint32_t)thread_t::state_t::RESERVED,
+      false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED);
 }
 
 namespace FOR_KERNEL_OBJECT {
@@ -405,7 +478,10 @@ void create_object(uint32_t obj_num) { shizu::create_object(obj_num); }
 uint32_t async_call(uint32_t obj_num, method_t entry, uint32_t arg,
                     uint32_t affinity, uint32_t budget_us) {
   for (uint32_t t = 1; t < 128; ++t) {
-    if (thread_table[t].state == thread_t::state_t::UNINITIALIZED) {
+    // ★「空いているか見てから作る」は 2 コアで TOCTOU になる。両コアが同じ枠を
+    //   UNINITIALIZED と観測すると、片方は create_thread の二重初期化検査で
+    //   **panic して系ごと落ちる** (I-9 違反)。CAS で枠を先に予約する。
+    if (arch_claim_thread_slot(thread_table[t])) {
       shizu::FOR_KERNEL_OBJECT::create_thread(obj_num, t, entry, arg, affinity,
                                               budget_us);
       return t;
@@ -417,7 +493,10 @@ uint32_t async_call(uint32_t obj_num, method_t entry, uint32_t arg,
 
 void create_thread(uint32_t obj_num, uint32_t thread_num, method_t entry,
                    uint32_t arg, uint32_t affinity, uint32_t budget_us) {
-  if (thread_table[thread_num].state == thread_t::state_t::UNINITIALIZED) {
+  // 枠は「RESERVED 済み (async_call が CAS で取った)」か「これから CAS で取る
+  // (明示 thread_num 指定の経路)」のどちらか。どちらでもなければ二重初期化。
+  if (thread_table[thread_num].state == thread_t::state_t::RESERVED ||
+      arch_claim_thread_slot(thread_table[thread_num])) {
     thread_t &t = thread_table[thread_num];
     t.object_id = obj_num;
     // context_t はカーネル専用の固定プールから (malloc しない。kernel.hpp 冒頭
@@ -450,7 +529,7 @@ void create_thread(uint32_t obj_num, uint32_t thread_num, method_t entry,
     // 呼び出しスタックはカーネル専用アリーナから create 時 (スレッドモード) に
     // 1 回だけ確保する。以後 SVC 例外ハンドラ内 (METHOD_CALL / トランポリン) では
     // malloc しない (アリーナ超過時のみ内部でフォールバックする)。
-    t.call_stack.frames = kernel_arena_alloc_call_stack();
+    t.call_stack.top = 0; // 退避先はスレッドスタック (事前確保なし)
     t.call_stack.depth = 0;
     object_table[obj_num].thread_table.insert(thread_num);
     // 生成時オプション (0 / BUDGET_KEEP = thread_table_init の既定を維持)。
@@ -476,10 +555,44 @@ void create_thread(uint32_t obj_num, uint32_t thread_num, method_t entry,
 void export_method(uint32_t obj_num, uint32_t method_num, method_t entry) {
   shizu::object_table[obj_num].method_table[method_num] = entry;
 }
-void exit_method(uint32_t return_code) {
-  svc<(uint32_t)shizu::kernel_object_svc_num::METHOD_EXIT>(return_code, 0, 0, 0,
-                                                           0);
+// ハンドラ活性化 / スレッドエントリの lr に載る「落ちてきたときの戻り口」。
+// r0 = 戻り値 (C の return 値がそのまま乗る), r7 = カーネルが活性化時に打った
+// 「今のネスト数」。r7 をそのまま arg3 に載せるので、この経路の 1 段 pop も
+// カーネル側の検算を通る (旧実装は無検査で、段数がズレると無音でロックアップした)。
+// naked なのは r7 を確実に捕まえるため — 通常関数だとプロローグで壊され得る。
+__attribute__((naked)) void exit_method(uint32_t return_code) {
+  (void)return_code;
+  asm volatile("mov  r1, #0\n"  // arg1 = 追加 pop 段数 0 → 1 枚だけ落とす
+               "mov  r2, #0\n"  // arg2 = エラーコード (成功)
+               "mov  r3, r7\n"  // arg3 = 申告する「今のネスト数」
+               "svc  %[num]\n"  // 戻ってきた = 検算で弾かれた (成功なら戻らない)
+               "b    exit_method_failed\n"
+               :
+               : [num] "i"((uint32_t)shizu::kernel_object_svc_num::METHOD_EXIT)
+               :);
 };
+
+// 委譲サブハンドラ (一般オブジェクト) 用の戻り口。生のカーネルプリミティブ (201) は
+// 一般オブジェクトからは撃てない (撃つとトランポリンに乗る) ので、**obj_api の
+// EXIT_METHOD** を使う。これはカーネルオブジェクトのハンドラ側で
+// METHOD_EXIT(値, 追加1段) に変換される = 「この exit 自身のトランポリン枠 + 自分の
+// 活性化枠」の 2 枚巻き戻し。段数はカーネルが arg3 の申告と突き合わせて検算する。
+// ★これが「一般オブジェクトに特権を渡さずに戻る」ための唯一の口。ここを exit_method
+// (生 201) にすると一般オブジェクトがカーネルプリミティブを叩けることになり、
+// SET_SVC_HANDLER 等のバイパスに繋がる。
+__attribute__((naked)) void delegate_exit_method(uint32_t return_code) {
+  (void)return_code;
+  asm volatile("mov  r1, r0\n"   // obj_api の引数は r1..r3 (r0 は予約)
+               "mov  r0, #0\n"
+               "mov  r2, #0\n"
+               "mov  r3, #0\n"
+               "svc  %[num]\n"   // obj_api::EXIT_METHOD (即値ディスパッチ)
+               "b    exit_method_failed\n"
+               :
+               : [num] "i"((uint32_t)shizu::obj_api_EXIT_METHOD_NUM)
+               :);
+};
+
 } // namespace FOR_KERNEL_OBJECT
 
 } // namespace shizu
@@ -562,6 +675,104 @@ static shizu::switch_error try_claim(shizu::thread_t &t, uint32_t core) {
   return shizu::switch_error::OK;
 }
 
+
+// ---------------------------------------------------------------------------
+//  呼び出しフレームの push/pop — 退避先はスレッド自身のスタック
+//  幾何とFP の扱いは include/kernel.hpp の call_frame_hdr_t のコメントを参照。
+// ---------------------------------------------------------------------------
+// 積む。成功で true。失敗 (PSPLIM に届く) は false — 呼び出し側は panic せず
+// エラー復帰させること。成功時 *frame_io は「書き換え用フレーム」を指すよう更新する。
+static bool call_frame_push(shizu::thread_t &t, shizu::context_t *ctx,
+                            shizu::exception_frame_t **frame_io,
+                            uint32_t caller_obj) {
+  // EXC_RETURN bit4=0 → FP 拡張フレーム (基本 32B + S0-S15/FPSCR/予約 = 104B)。
+  const bool has_fp = (ctx->exc_return & 0x10u) == 0;
+  const uint32_t fs = has_fp ? 104u : 32u;
+  uint32_t total = (uint32_t)sizeof(shizu::call_frame_hdr_t) +
+                   (has_fp ? 64u : 0u) + fs;
+  total = (total + 7u) & ~7u; // 8B アライン維持 (xPSR bit9 のパディング整合)
+  const uint32_t sp_old = (uint32_t)ctx->sp; // = X - fs (元の例外フレーム位置)
+  const uint32_t X = sp_old + fs;            // 呼び出し元の SVC 直前の PSP
+  const uint32_t snap = X - total;           // 退避域の先頭
+  // ★8B の余裕。呼び出し元の SVC 発行時に SP が 8B 境界でないと、ハードウェアが
+  //   フレームにパディングを入れて xPSR bit9 を立て、**例外復帰時に SP へ +4 余分に
+  //   足す**。それを見込まないと呼び先の開始 PSP が退避域へ 4B 食い込み、直後の
+  //   プッシュでヘッダ先頭 (prev) を潰して連鎖が壊れる。
+  const uint32_t new_sp = snap - fs - 8;     // 書き換え用フレームの置き場
+  // PSPLIM 手前で止める (呼び先のプロローグぶんの余裕も見る)。ここで false を返せば
+  // 呼び出し側がエラーを返すので、スタック不足が無音ロックアップにならない。
+  if (ctx->psplim != 0 && new_sp < ctx->psplim + 64u)
+    return false;
+  shizu::call_frame_hdr_t *h = (shizu::call_frame_hdr_t *)snap;
+  h->prev = t.call_stack.top;
+  h->total_bytes = total;
+  h->frame_bytes = fs;
+  h->caller_object_id = caller_obj;
+  h->control = ctx->control;
+  h->exc_return = ctx->exc_return;
+  h->has_fp = has_fp ? 1u : 0u;
+  h->pad = 0;
+  memcpy(h->r4_r11, &ctx->r4, sizeof(h->r4_r11));
+#if SHIZU_SVC_DELEGATION
+  h->in_handler = ctx->in_handler;
+  h->inv_svc_num = ctx->inv_svc_num;
+  h->inv_caller_obj = ctx->inv_caller_obj;
+  h->inv_caller_thread = ctx->inv_caller_thread;
+#endif
+  // FP 活性のときだけ S16-S31 の枠を使う (非活性なら 64B ぶん退避域が小さい)。
+  if (has_fp)
+    memcpy((void *)(snap + sizeof(shizu::call_frame_hdr_t)), ctx->fp, 64);
+  // ★元の例外フレーム [X-fs, X) は退避域の一番上にそのまま残す = 一切動かさない。
+  //   (FP 拡張の S0-S15 と乖離させないための最重要点。) 書き換えるのは下へ複製した
+  //   作業コピーの方で、呼び先はそれを pop して PSP=snap から下へ伸びる。
+  memcpy((void *)new_sp, (const void *)sp_old, fs);
+  ctx->sp = (shizu::exception_frame_t *)new_sp;
+  *frame_io = ctx->sp;
+  t.call_stack.top = snap;
+  t.call_stack.depth++;
+  return true;
+}
+
+// 1 枚戻す。空なら false。元の例外フレームは退避域の中に生きているので指すだけ。
+static bool call_frame_pop(shizu::thread_t &t, shizu::context_t *ctx,
+                           shizu::exception_frame_t **frame_io) {
+  if (t.call_stack.top == 0)
+    return false;
+  shizu::call_frame_hdr_t *h = (shizu::call_frame_hdr_t *)t.call_stack.top;
+  // ★幾何は push 時に記録した値を読み戻す (再計算しない)。呼び先の実行中に FP 状態が
+  //   変わっても push/pop で寸法がズレない。
+  const uint32_t X = t.call_stack.top + h->total_bytes;
+  memcpy(&ctx->r4, h->r4_r11, sizeof(h->r4_r11));
+  ctx->control = h->control;
+  ctx->exc_return = h->exc_return;
+#if SHIZU_SVC_DELEGATION
+  ctx->in_handler = h->in_handler;
+  ctx->inv_svc_num = h->inv_svc_num;
+  ctx->inv_caller_obj = h->inv_caller_obj;
+  ctx->inv_caller_thread = h->inv_caller_thread;
+#endif
+  if (h->has_fp)
+    memcpy(ctx->fp,
+           (const void *)(t.call_stack.top + sizeof(shizu::call_frame_hdr_t)),
+           64);
+  t.object_id = h->caller_object_id;
+  ctx->sp = (shizu::exception_frame_t *)(X - h->frame_bytes);
+  *frame_io = ctx->sp;
+  t.call_stack.top = h->prev;
+  t.call_stack.depth--;
+  return true;
+}
+
+// 最内フレームに保存されている「発行元の例外フレーム」。REDISPATCH_SVC が元の
+// syscall の r0..r3 を回収するのに使う。
+static shizu::exception_frame_t *
+call_frame_saved_frame(const shizu::call_stack_t &cs) {
+  if (cs.top == 0)
+    return nullptr;
+  shizu::call_frame_hdr_t *h = (shizu::call_frame_hdr_t *)cs.top;
+  return (shizu::exception_frame_t *)(cs.top + h->total_bytes - h->frame_bytes);
+}
+
 // 本当はcontext_t* svc_cpp_handler(context_t
 // *context)として変更の有無に応じてcontextを変更した方が早い
 void svc_cpp_handler(shizu::context_t *context) {
@@ -611,8 +822,40 @@ void svc_cpp_handler(shizu::context_t *context) {
     }
   }*/
 
+#if SHIZU_SVC_DELEGATION
+  // ハンドラ活性化から撃たれた svc は「**カーネルオブジェクト宛**の svc」と見做す。
+  // ★発行元をカーネルオブジェクト**扱いにする**のとは違う (object_id は書き換えない)。
+  //   宛先がカーネルオブジェクトなら、その届け先は 2 つある:
+  //     ・カーネルが**プリミティブとして実装している番号** → ここで直接実行
+  //       (これによりハンドラは METHOD_EXIT を自分で叩け、戻るためだけの svc と
+  //        その余分なフレームが消える = 1 枚 pop)
+  //     ・それ以外 → カーネルオブジェクトの**登録ハンドラ** (obj_api の実装) へ
+  //       トランポリン。これを落とすとハンドラから obj_api も他サブシステムへの
+  //       委譲も撃てなくなる (実機で多段が塞がった原因はこれだった)。
+  //   番号は「経路を決めた後のプリミティブ選択」に使うだけで、経路を番号で分けては
+  //   いない — 選べなかったときの既定を「黙殺」から「委譲」に戻しただけ。
+  // 即値 0 は旧 ABI (r0 ディスパッチ, YIELD 等) なので プリミティブ扱いしない。
+  const uint32_t imm_num = (uint32_t)(*(uint16_t *)(pc - 2) & 0xff);
+#endif
+  // 発行元の「種別」で経路が決まる (svc 番号では決めない — 冒頭の不変条件)。
+  // ★経路は「発行元オブジェクトの種別」だけで決まる。ハンドラとして走っているか
+  // (in_handler) は**一切考慮しない**。
+  // 【2026-08-13 削除】以前はここに `|| (in_handler && to_kernel_primitive)` があり、
+  // 委譲サブハンドラ (= ルート表に登録されただけの**一般オブジェクト**) が 200..206/208 を
+  // 生で叩けた。これは「svc を捌く役を任される」が「カーネル特権を得る」と同義になる
+  // セキュリティポリシーのバイパスで、とくに SET_SVC_HANDLER(202) は系全体の svc
+  // ハンドラを自分に差し替えられる = 全オブジェクトの syscall 乗っ取りだった。
+  // この昇格は「ハンドラが戻るための METHOD_EXIT を自分で叩けるように」= 戻り口の
+  // 自己参照問題を特権で殴るために入っていたが、**巻き戻す層数を明示的に渡す API**
+  // (METHOD_EXIT の arg1 と、arg3 のネスト数申告による検算) がある今は不要。
+  // 委譲サブハンドラは普通の一般オブジェクトとしてトランポリンを経由し、
+  // delegate_exit_method (obj_api EXIT_METHOD = 2 枚巻き戻し) で戻る。
   if (shizu::object_table[current_thread.object_id].state ==
       shizu::object_t::state_t::KERNEL_OBJECT) {
+#if SHIZU_SVC_DELEGATION
+    shizu::svc_trace_record(imm_num, current_thread.object_id,
+                            context->in_handler, false, false, pc);
+#endif
 
     shizu::kernel_object_svc_num svc_num =
         (shizu::kernel_object_svc_num)(*(uint16_t *)(pc - 2) & 0xff);
@@ -650,22 +893,14 @@ void svc_cpp_handler(shizu::context_t *context) {
       // 元の位置に居続けなければならない (フレームを別アドレスへ再配置しない)。
       // FP 拡張分 (S0-S15/FPSCR) は PSP 上に残り、call_stack.context.sp が
       // 指す位置は不変なので、ここは basic 部のみのコピーで正しい。
-      if (current_thread.call_stack.full()) {
-        panic("call_stack overflow (METHOD_CALL)\n caller obj: %lu\n callee "
-              "obj: %lu\n method: %lu\n",
-              (unsigned long)current_thread.object_id, (unsigned long)arg0,
-              (unsigned long)arg1);
+      // 退避先はスレッドスタック。積めない (PSPLIM 手前) ときは panic せず
+      // call_error で返す — 呼び出し元が対処できる (無音ロックアップにしない)。
+      if (!call_frame_push(current_thread, context, &stack_frame,
+                           current_thread.object_id)) {
+        stack_frame->r0 = (uint32_t)shizu::call_error::NO_STACK;
+        stack_frame->r1 = 0;
+        break;
       }
-      current_thread.call_stack.push(
-          {.stack_frame = *stack_frame,
-           .context = *context,
-           .caller_object_id = current_thread.object_id});
-      /*
-        current_thread.call_stack.push(
-        {.stack_frame = *stack_frame,
-         .context = *context,
-         .caller_object_id = current_thread.object_id});
-      */
       // printf("pc: %lx\n", stack_frame->pc);
       stack_frame->pc = (uint32_t)shizu::object_table[arg0].method_table[arg1];
       stack_frame->lr = (uint32_t)::trap;
@@ -681,6 +916,11 @@ void svc_cpp_handler(shizu::context_t *context) {
       // call_stack スナップショット (= 張り替え前の *context) に残っているので、
       // METHOD_EXIT 側は明示コード無しでスナップショット復元だけで元に戻る。
       context->control = shizu::control_for_object(arg0);
+#if SHIZU_SVC_DELEGATION
+      // ★ハンドラ状態は METHOD_CALL では伝播させない。伝播させると「ハンドラから
+      // 呼ばれた普通のメソッド」まで暗黙に特権化してしまう (この機構の一番鋭い刃)。
+      context->in_handler = 0;
+#endif
       // printf("pc: %lx\n", stack_frame->pc);
       break;
     }
@@ -688,24 +928,40 @@ void svc_cpp_handler(shizu::context_t *context) {
       // call_stack を (arg1+1) 段 pop して元のフレーム/オブジェクト ID を復元する。
       // 復元したフレームの r1 に arg0 (メソッド戻り値)、r0 に arg2 (エラーコード、
       // 0 = 成功 — 既存呼び出し元は arg2=0 なのでワイヤ互換) を載せて返す。
-      shizu::method_call_stack_t call_stack_top;
-      for (size_t i = 0; i < arg1 + 1; i++) {
-        if (current_thread.call_stack.empty()) {
-          panic("call_stack empty");
-        } else {
-          call_stack_top = current_thread.call_stack.top();
-          current_thread.call_stack.pop();
-        }
-        // NOTE(FPU): basic フレームを元のスタック位置へ書き戻すだけ。フレームは
-        // 決して別アドレスへ再配置しないこと (拡張 FP フレームの S0-S15 が同じ
-        // PSP 位置に残っており、sp を張り替えると FP 分と乖離する)。
-        *get_current_context() = call_stack_top.context;
-        stack_frame = call_stack_top.context.sp;
-        *stack_frame = call_stack_top.stack_frame;
-        current_thread.object_id = call_stack_top.caller_object_id;
-        stack_frame->r0 = arg2;
-        stack_frame->r1 = arg0;
+      //
+      // ★段数の検算 (arg3 = 発行側が申告する「今のネスト数」)。落とす枚数は発行側の
+      //   自由 (任意段数) だが、発行側が想定している呼び出し文脈と実際がズレていたら
+      //   巻き戻してはいけない — ズレたまま落とすと「無関係な祖先が偽の戻り値で
+      //   再開する」という最悪の壊れ方をする (無音ロックアップの正体)。カーネルは
+      //   実際の深さと突き合わせ、合わなければ 1 段も落とさずエラーで返す。
+      //   発行側 (exit_method / kernel_obj_svc_handler) も自分が持つ深さを申告する
+      //   ことで同じ検算に参加している = 両側チェック。
+      const uint32_t depth_now = current_thread.call_stack.depth;
+      const uint32_t pops = arg1 + 1; // arg1 = 追加段数
+      if (depth_now == 0) {
+        // 戻り先が 1 枚も無い (スレッドの main が return した等)。**panic しない** —
+        // 発行元の例外フレームは生きているのでエラーを返せる。系全体を落とすのは
+        // 「超過は超過した者にだけ当たる」という資源管理の方針に反する。
+        stack_frame->r0 = (uint32_t)shizu::exit_error::BAD_COUNT;
+        stack_frame->r1 = 0;
+        break;
       }
+      if (arg3 != 0 && arg3 != depth_now) {
+        stack_frame->r0 = (uint32_t)shizu::exit_error::DEPTH_MISMATCH;
+        stack_frame->r1 = depth_now; // 実際の深さを返す (発行側の自己診断用)
+        break;
+      }
+      if (pops == 0 || pops > depth_now) {
+        stack_frame->r0 = (uint32_t)shizu::exit_error::BAD_COUNT;
+        stack_frame->r1 = depth_now;
+        break;
+      }
+      // NOTE(FPU): 元の例外フレームは退避域の中に**元の位置のまま**生きているので
+      // 書き戻しも再配置も不要 (call_frame_pop は ctx->sp をそこへ向けるだけ)。
+      for (uint32_t i = 0; i < pops; i++)
+        call_frame_pop(current_thread, context, &stack_frame);
+      stack_frame->r0 = arg2;
+      stack_frame->r1 = arg0;
 
       break;
     }
@@ -717,6 +973,70 @@ void svc_cpp_handler(shizu::context_t *context) {
       break;
     }
 
+#if SHIZU_SVC_DELEGATION
+    case shizu::kernel_object_svc_num::REDISPATCH_SVC: {
+      // arg0 = サブハンドラ entry, arg1 = 担当オブジェクト。
+      // 今の syscall を「そのオブジェクトのハンドラ」として実行し直す。カーネルは
+      // svc 番号を見ない — 誰に回すかは発行元 (カーネルオブジェクトのハンドラ) の判断。
+      // 現フレームを積み、pc/object を張り替え、r4/r5/r6 に**元の呼び出し情報**を載せる
+      // (kernel_obj_svc_handler と同じ ABI)。サブハンドラは in_handler=1 で走るので
+      // METHOD_EXIT を直接叩け、戻りは 1 枚 pop で足りる。
+      if (arg1 >= 128 || arg0 == 0 ||
+          shizu::object_table[arg1].state ==
+              shizu::object_t::state_t::UNINITIALIZED) {
+        stack_frame->r0 = 1; // 対象不正 — 呼び出し元 (ハンドラ) がエラーを返せる
+        break;
+      }
+      if (current_thread.call_stack.empty()) {
+        // ハンドラ活性化はトランポリンが 1 枚積んだ上で走るので、ここが空なのは
+        // 「ハンドラでない誰か」が REDISPATCH を撃った = 使い方の誤り。
+        stack_frame->r0 = 3;
+        break;
+      }
+      const uint32_t inv_num = context->inv_svc_num;
+      const uint32_t inv_obj = context->inv_caller_obj;
+      const uint32_t inv_thr = context->inv_caller_thread;
+      // ★元の syscall の引数 (r0..r3) を回収する。**この svc の引数ではない**。
+      // 今の stack_frame->r0..r3 は REDISPATCH 自身の引数 (entry / 担当 obj) に
+      // 上書きされているので、そのまま飛ばすとサブハンドラは元の引数の代わりに
+      // 担当オブジェクト ID を受け取る。トランポリンは r0..r3 を書き換えないため、
+      // 直前に積まれた発行元フレーム (= 今の top) に元の引数が生きている。
+      // 【実測 2026-08-13】これが無いと最小プローブが arg=35 のはずが arg=27
+      // (= 担当 obj の ID) を受け取り、ネストでは「減らない引数」で終了条件に
+      // 到達せず**無限相互再帰** → call_stack とスレッドスタックを食い潰して
+      // IRQ ごと死ぬ無言ロックアップになっていた。
+      const shizu::exception_frame_t *orig =
+          call_frame_saved_frame(current_thread.call_stack);
+      const uint32_t orig_r0 = orig->r0, orig_r1 = orig->r1,
+                     orig_r2 = orig->r2, orig_r3 = orig->r3;
+      if (!call_frame_push(current_thread, context, &stack_frame,
+                           current_thread.object_id)) {
+        stack_frame->r0 = 2; // スタック不足。panic でなくエラーで返す
+        break;
+      }
+      stack_frame->r0 = orig_r0;
+      stack_frame->r1 = orig_r1;
+      stack_frame->r2 = orig_r2;
+      stack_frame->r3 = orig_r3;
+      stack_frame->pc = arg0;
+      // ★サブハンドラは一般オブジェクトとして走るので、戻り口も一般オブジェクト用。
+      stack_frame->lr =
+          (uint32_t)shizu::FOR_KERNEL_OBJECT::delegate_exit_method;
+      current_thread.object_id = arg1;
+      context->control = shizu::control_for_object(arg1);
+      context->in_handler = 1; // サブハンドラも「ハンドラとして」走る
+      context->inv_svc_num = inv_num;
+      context->inv_caller_obj = inv_obj;
+      context->inv_caller_thread = inv_thr;
+      current_thread.context->r4 = inv_num;
+      current_thread.context->r5 = inv_obj;
+      current_thread.context->r6 = inv_thr;
+      // サブハンドラにも「今のネスト数」を打つ (トランポリンと同じ規約)。委譲で
+      // 何段挟まっても、各層は自分が入った時点の深さを申告して巻き戻せる。
+      current_thread.context->r7 = current_thread.call_stack.depth;
+      break;
+    }
+#endif
     case shizu::kernel_object_svc_num::GET_CURRENT_THREAD_ID: {
       stack_frame->r1 = shizu::cpu_manager::current_thread_id[get_core_num()];
       stack_frame->r0 = 0;
@@ -806,6 +1126,16 @@ void svc_cpp_handler(shizu::context_t *context) {
       break;
     }
     default:
+      // ★ここに来るのは**信頼された発行元** (カーネルオブジェクト、または信頼活性化)
+      // だけ。存在しないプリミティブ番号を撃つのは**カーネル自身の不変条件の破れ**
+      // なので panic してよい (§14: panic はカーネル自身が壊れた場合に限る)。
+      // 【2026-08-17】ここが `break` で**黙って捨てていた**ため、カーネルオブジェクト
+      // から撃った obj_api 番号 (24 = SET_OBJECT_UNPRIVILEGED) が無音で消え、
+      // 「非特権で動いた」と誤認する計測事故を起こした。無音の握り潰しは禁止。
+      panic("unknown kernel primitive svc %lu\n obj: %lu\n thread: %lu\n pc: %08lx\n"
+            " (obj_api の番号をカーネルオブジェクトから撃っていないか?)\n",
+            (unsigned long)svc_num, (unsigned long)current_thread.object_id,
+            (unsigned long)current_thread.thread_id, (unsigned long)pc);
       break;
     }
   } else {
@@ -817,28 +1147,52 @@ void svc_cpp_handler(shizu::context_t *context) {
     // r4/r5/r6 に載せて渡す (ハンドラ側はこれを引数として受け取る)。
     uint32_t caller_obj_num = current_thread.object_id;
     uint32_t caller_thread_id = current_thread.thread_id;
-    if (current_thread.call_stack.full()) {
-      panic("call_stack overflow (svc trampoline)\n caller obj: %lu\n thread: "
-            "%lu\n",
-            (unsigned long)caller_obj_num, (unsigned long)caller_thread_id);
+#if SHIZU_SVC_DELEGATION
+    shizu::svc_trace_record(imm_num, caller_obj_num, context->in_handler,
+                            false, true, pc);
+#endif
+
+    // 既定の宛先 = 従来の単一ハンドラ (カーネルオブジェクト)。
+    shizu::method_t handler_entry =
+        (shizu::method_t)shizu::cpu_manager::svc_handler_info.entry_point;
+    uint32_t handler_obj = shizu::cpu_manager::svc_handler_info.handling_object_id;
+    if (handler_entry == nullptr) {
+      panic("no svc handler for num %lu\n caller obj: %lu\n thread: %lu\n",
+            (unsigned long)svc_num, (unsigned long)caller_obj_num,
+            (unsigned long)caller_thread_id);
     }
-    current_thread.call_stack.push(
-        {.stack_frame = *stack_frame,
-         .context = *context,
-         .caller_object_id = current_thread.object_id});
-    stack_frame->pc =
-        (uint32_t)shizu::cpu_manager::svc_handler_info.entry_point;
+    // 積めない (PSPLIM 手前) ときは panic せず、フレームを積まずに r0 へエラーを
+    // 返して復帰する。一般オブジェクトの再帰でカーネルを落とせないようにする。
+    if (!call_frame_push(current_thread, context, &stack_frame,
+                         current_thread.object_id)) {
+      stack_frame->r0 = (uint32_t)shizu::call_error::NO_STACK;
+      stack_frame->r1 = 0;
+      return; // トランポリンは switch の外なので break ではなく return
+    }
+    stack_frame->pc = (uint32_t)handler_entry;
     stack_frame->lr = (uint32_t)shizu::FOR_KERNEL_OBJECT::exit_method;
-    current_thread.object_id =
-        shizu::cpu_manager::svc_handler_info.handling_object_id;
+    current_thread.object_id = handler_obj;
     // MPU Step1: ハンドラ所有オブジェクト (通常カーネルオブジェクト=特権) の値へ。
     // METHOD_CALL 分岐と同じ規約 — push は上で完了済みなので、戻り側 (EXIT_METHOD →
     // METHOD_EXIT) は call_stack のスナップショット復元だけで元の呼び出し元の
     // 特権に戻る (明示コード不要)。
-    context->control = shizu::control_for_object(
-        shizu::cpu_manager::svc_handler_info.handling_object_id);
+    context->control = shizu::control_for_object(handler_obj);
     current_thread.context->r4 = (uint32_t)svc_num;
     current_thread.context->r5 = caller_obj_num;
     current_thread.context->r6 = caller_thread_id;
+    // ★「今のネスト数」を打つ: この活性化が走り出す時点の call_stack 深さ。ハンドラは
+    // これを METHOD_EXIT の arg3 に載せ返すことで、落とす段数がカーネルの持つ実際の
+    // 深さと突き合わされる (段数の申告を鵜呑みにしない = 両側チェック)。r7 なのは
+    // ハンドラ shim が既に {r4-r7} を積んでおり、第 7 引数としてそのまま届くため。
+    current_thread.context->r7 = current_thread.call_stack.depth;
+#if SHIZU_SVC_DELEGATION
+    // このハンドラ活性化は「svc ハンドラとして」走る (上の判定が同等に扱う)。
+    // 呼び出し情報も記録しておき、委譲 (REDISPATCH_SVC) がサブハンドラへ同じ材料を
+    // 渡せるようにする。どちらも context_t なので call_stack の復元で自動的に戻る。
+    context->in_handler = 1;
+    context->inv_svc_num = (uint32_t)svc_num;
+    context->inv_caller_obj = caller_obj_num;
+    context->inv_caller_thread = caller_thread_id;
+#endif
   }
 }

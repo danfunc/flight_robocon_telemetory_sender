@@ -44,6 +44,7 @@
 #include <obj_api.hpp>
 #include <object_headers/FLIGHT_CONTROLLER.hpp>
 #include <object_id.hpp>
+#include <log.hpp>
 
 namespace shizu {
 
@@ -243,7 +244,7 @@ static void handle_set_command(uint32_t, uint32_t, uint32_t ptr, uint32_t) {
     // PRIMASK 経由の CPSID を使うことがあり、CPS 系命令は ARMv8-M で unprivileged
     // 実行時に NOP 化される (フォールトせず割り込み禁止だけがサイレントに効かなく
     // なる) — kernel.hpp SHIZU_STEP1_UNPRIV_FLIGHT_CONTROLLER のコメント参照。
-    printf("[FLIGHT] disarm\n");
+    log::printf("[FLIGHT] disarm\n");
 #endif
     break;
   case 1: // arm (方位目標を再捕捉, 積分リセット)
@@ -252,7 +253,7 @@ static void handle_set_command(uint32_t, uint32_t, uint32_t ptr, uint32_t) {
     g_pitch_i = 0.f;
     g_alt_i = 0.f;
 #if !SHIZU_STEP1_UNPRIV_FLIGHT_CONTROLLER
-    printf("[FLIGHT] arm\n");
+    log::printf("[FLIGHT] arm\n");
 #endif
     break;
   case 2: // alt_ref [m]
@@ -278,7 +279,7 @@ static void handle_set_command(uint32_t, uint32_t, uint32_t ptr, uint32_t) {
 // ===========================================================================
 void FLIGHT_CONTROLLER::main() {
 #if !SHIZU_STEP1_UNPRIV_FLIGHT_CONTROLLER
-  printf("[FLIGHT] main\n");
+  log::printf("[FLIGHT] main\n");
 #endif
   // 制御はすべて on_state の push (TELEMETRY からの同期呼び出し) で駆動する。
   export_method<handle_state>(FLIGHT_CONTROLLER::METHOD_IDs::on_state);

@@ -1,4 +1,5 @@
 #include "btstack_config.h"
+#include <log.hpp>
 extern "C" {
 #include "ble/att_db.h"
 #include "ble/att_server.h"
@@ -18,6 +19,21 @@ extern "C" {
 #include <object_headers/BLE_UART_DRIVER.hpp>
 #include <stream.hpp> // open / bind (register_tx_stream)
 #include <pico/cyw43_arch.h> // cyw43_arch_init / cyw43_arch_poll
+#if SHIZU_CYW43_YIELD_WAIT
+#include <obj_api.hpp>                 // Stage1: 待ちを Shizuku yield へ
+#include <pico/async_context.h>        // async_context_t / vtable (wait_for_work_until)
+#include <pico/async_context_poll.h>   // async_context_poll_t (sem)
+#include <pico/sem.h>                  // sem_try_acquire
+#endif
+#if SHIZU_CYW43_SVC_THREAD
+extern "C" {
+#include <cyw43.h>                     // CYW43_PIN_WL_HOST_WAKE (cyw43_configport.h 経由)
+}
+#include <hardware/gpio.h>             // gpio_get_irq_event_mask
+#include <hardware/irq.h>              // irq_add_shared_handler / IO_IRQ_BANK0
+#include <object_id.hpp>               // object_ids::BLE_UART_DRIVER (自オブジェクトへ spawn)
+#include <pico/async_context_base.h>   // async_context_base_needs_servicing
+#endif
 
 namespace shizu {
 
@@ -187,7 +203,7 @@ static void process_rx(const uint8_t *data, uint16_t len) {
   // により保護されている(A)ので、ここに到達する
   // 時点で本来は認証済みのはず。二重に fail-closed で確認する。
   if (!cmd_authorized) {
-    printf("[BLE_UART] RX dropped (unauthorized, %u byte)\n", len);
+    log::printf("[BLE_UART] RX dropped (unauthorized, %u byte)\n", len);
     return;
   }
   for (uint16_t i = 0; i < len; i++) {
@@ -199,10 +215,10 @@ static void process_rx(const uint8_t *data, uint16_t len) {
     }
   }
   // デバッグ出力
-  printf("[BLE_UART] RX %u byte: ", len);
+  log::printf("[BLE_UART] RX %u byte: ", len);
   for (uint16_t i = 0; i < len; i++)
-    printf("%02x ", data[i]);
-  printf("\n");
+    log::printf("%02x ", data[i]);
+  log::printf("\n");
 }
 
 // ---- TX 統計 (A/B 計測用: 1 CAN_SEND_NOW あたり何発詰めたか) ----------------
@@ -325,7 +341,7 @@ static int att_write_callback(hci_con_handle_t connection_handle,
         (little_endian_read_16(buffer, 0) ==
          GATT_CLIENT_CHARACTERISTICS_CONFIGURATION_NOTIFICATION);
     con_handle = connection_handle;
-    printf("[BLE_UART] notify %s\n",
+    log::printf("[BLE_UART] notify %s\n",
            tx_notify_enabled ? "enabled" : "disabled");
     if (tx_notify_enabled && !tx_all_empty() && !can_send_requested) {
       can_send_requested = true;
@@ -349,7 +365,7 @@ static int att_write_callback(hci_con_handle_t connection_handle,
 // (%f に依存しない)。
 static void print_conn_interval(const char *tag) {
   uint32_t x100 = (uint32_t)conn_interval * 125u; // 1.25ms = 125/100
-  printf("[BLE_UART] %s CI = %u units (%lu.%02lu ms)\n", tag, conn_interval,
+  log::printf("[BLE_UART] %s CI = %u units (%lu.%02lu ms)\n", tag, conn_interval,
          (unsigned long)(x100 / 100), (unsigned long)(x100 % 100));
 }
 
@@ -384,7 +400,7 @@ static void request_fast_ci() {
   int r = gap_request_connection_parameter_update(con_handle, FORCED_CI,
                                                   FORCED_CI, 0, 400);
   uint32_t ms100 = (uint32_t)FORCED_CI * 125u; // 単位 1.25ms → ms×100
-  printf("[BLE_UART] request CI pinned %lu.%02lu ms -> %d\n",
+  log::printf("[BLE_UART] request CI pinned %lu.%02lu ms -> %d\n",
          (unsigned long)(ms100 / 100), (unsigned long)(ms100 % 100), r);
 }
 
@@ -395,7 +411,7 @@ static void request_ci_fallback(const char *why) {
   ci_nego_stage = 2; // 終端: これ以上再要求しない
   int r = gap_request_connection_parameter_update(con_handle, FORCED_CI,
                                                   2 * FORCED_CI, 0, 400);
-  printf("[BLE_UART] CI fallback (12,24) [%s] -> %d\n", why, r);
+  log::printf("[BLE_UART] CI fallback (12,24) [%s] -> %d\n", why, r);
 }
 
 // ---- 2M PHY / LE features 診断 ----------------------------------------------
@@ -429,7 +445,7 @@ static void request_2m_phy() {
   uint8_t r = gap_le_set_phy(con_handle, 0, 0x02, 0x02, 0);
   phy_probe_active = true;
   phy_req_us = time_us_64();
-  printf("[BLE_UART] request 2M PHY -> %u (watching for PHY update, 5s)\n", r);
+  log::printf("[BLE_UART] request 2M PHY -> %u (watching for PHY update, 5s)\n", r);
 }
 
 // ---- HCI / ATT イベント ----------------------------------------------------
@@ -446,7 +462,7 @@ static void packet_handler(uint8_t packet_type, uint16_t channel,
 
   case BTSTACK_EVENT_STATE:
     if (btstack_event_state_get_state(packet) == HCI_STATE_WORKING) {
-      printf("[BLE_UART] HCI ready, advertising start\n");
+      log::printf("[BLE_UART] HCI ready, advertising start\n");
       gap_advertisements_enable(1);
       // 2M PHY サポートの白黒付け: ローカル LE features を読む。ここで直接
       // hci_send_cmd すると btstack 自身のコマンドとクレジット競合して黙って
@@ -462,7 +478,7 @@ static void packet_handler(uint8_t packet_type, uint16_t channel,
       // return params: [0]=status, [1..8]=LE features (LSB first)。
       // LE 2M PHY = feature bit 8 = byte1 の bit0。
       const uint8_t *rp = hci_event_command_complete_get_return_parameters(packet);
-      printf("[BLE_UART] LE features: status=0x%02x 2M_PHY=%s "
+      log::printf("[BLE_UART] LE features: status=0x%02x 2M_PHY=%s "
              "(bytes[0..1]=%02x %02x)\n",
              rp[0], (rp[2] & 0x01) ? "supported" : "NOT supported", rp[1],
              rp[2]);
@@ -470,7 +486,7 @@ static void packet_handler(uint8_t packet_type, uint16_t channel,
       // 旧 FW は未知オペコードに Command Complete (status=0x01 Unknown HCI
       // Command) で応えることがある。ここに来たら 2M PHY 非対応がほぼ確定。
       const uint8_t *rp = hci_event_command_complete_get_return_parameters(packet);
-      printf("[BLE_UART] LE Set PHY answered via Command Complete: "
+      log::printf("[BLE_UART] LE Set PHY answered via Command Complete: "
              "status=0x%02x (0x01 = Unknown HCI Command → 2M PHY unsupported)\n",
              rp[0]);
       phy_probe_active = false;
@@ -485,7 +501,7 @@ static void packet_handler(uint8_t packet_type, uint16_t channel,
     uint16_t opcode = hci_event_command_status_get_command_opcode(packet);
     if (opcode == HCI_OPCODE_HCI_LE_SET_PHY) {
       uint8_t st = hci_event_command_status_get_status(packet);
-      printf("[BLE_UART] LE Set PHY command status = 0x%02x%s\n", st,
+      log::printf("[BLE_UART] LE Set PHY command status = 0x%02x%s\n", st,
              st == 0 ? " (pending, wait for PHY update)" : " (REJECTED)");
       if (st != 0)
         phy_probe_active = false; // 棄却 = 応答済み。タイムアウトログは不要
@@ -499,7 +515,7 @@ static void packet_handler(uint8_t packet_type, uint16_t channel,
     // だけ (12,24) へフォールバック。
     uint16_t result =
         l2cap_event_connection_parameter_update_response_get_result(packet);
-    printf("[BLE_UART] CI param update response: %s (result=%u)\n",
+    log::printf("[BLE_UART] CI param update response: %s (result=%u)\n",
            result == 0 ? "accepted" : "rejected", result);
     if (result != 0)
       request_ci_fallback("rejected");
@@ -514,7 +530,7 @@ static void packet_handler(uint8_t packet_type, uint16_t channel,
       // ため再アドバタイズ経路が完全に死ぬ(=再起動するまで再接続不能)。
       uint8_t st = hci_subevent_le_connection_complete_get_status(packet);
       if (st != ERROR_CODE_SUCCESS) {
-        printf("[BLE_UART] connection failed (status=0x%02x), re-advertising\n",
+        log::printf("[BLE_UART] connection failed (status=0x%02x), re-advertising\n",
                st);
         gap_advertisements_enable(1);
         break;
@@ -532,7 +548,7 @@ static void packet_handler(uint8_t packet_type, uint16_t channel,
       can_send_requested = false;
       cmd_authorized = false;
       ci_nego_stage = 0; // 新しい接続: CI ネゴシエーションを仕切り直す
-      printf("[BLE_UART] connected, handle=0x%04x (requesting pairing)\n", h);
+      log::printf("[BLE_UART] connected, handle=0x%04x (requesting pairing)\n", h);
       sm_request_pairing(con_handle); // ★ 接続直後に Security Request を送る
       break;
     }
@@ -552,7 +568,7 @@ static void packet_handler(uint8_t packet_type, uint16_t channel,
       // この btstack には rx_phy の getter が無い。HCI 仕様上 tx_phy(event[6])
       // の次のバイトが rx_phy。
       uint8_t rxp = packet[7];
-      printf("[BLE_UART] PHY update: status=0x%02x tx=%uM rx=%uM\n", st, txp,
+      log::printf("[BLE_UART] PHY update: status=0x%02x tx=%uM rx=%uM\n", st, txp,
              rxp);
       phy_probe_active = false; // 応答あり → タイムアウト監視を解除
       break;
@@ -565,7 +581,7 @@ static void packet_handler(uint8_t packet_type, uint16_t channel,
   case HCI_EVENT_DISCONNECTION_COMPLETE:{
     // reason: 0x13=central(mac)側が切断 / 0x08=supervision timeout /
     // 0x3D=MIC failure / 0x16=こちら(host)発。原因切り分けの決定打になる。
-    printf("[BLE_UART] disconnected (reason=0x%02x), re-advertising\n",
+    log::printf("[BLE_UART] disconnected (reason=0x%02x), re-advertising\n",
            hci_event_disconnection_complete_get_reason(packet));
     con_handle = HCI_CON_HANDLE_INVALID;
     tx_notify_enabled = false;
@@ -584,7 +600,7 @@ static void packet_handler(uint8_t packet_type, uint16_t channel,
     break;
 
   case ATT_EVENT_MTU_EXCHANGE_COMPLETE:
-    printf("[BLE_UART] MTU = %u\n",
+    log::printf("[BLE_UART] MTU = %u\n",
            att_event_mtu_exchange_complete_get_MTU(packet));
     break;
 
@@ -601,7 +617,7 @@ static void packet_handler(uint8_t packet_type, uint16_t channel,
       can_send_requested = true;
       att_server_request_can_send_now_event(con_handle);
     }
-    printf("[BLE_UART] RSSI = %d dBm\n", rssi);
+    log::printf("[BLE_UART] RSSI = %d dBm\n", rssi);
     break;
   }
 
@@ -626,18 +642,18 @@ static void sm_packet_handler(uint8_t packet_type, uint16_t channel,
     // NC: 番号を USB CDC に出し、オペレータの照合 confirm を poll
     // ループで待つ。
     nc_pending_handle = sm_event_numeric_comparison_request_get_handle(packet);
-    printf("[BLE_UART] === NUMERIC COMPARISON ===\n");
-    printf(
+    log::printf("[BLE_UART] === NUMERIC COMPARISON ===\n");
+    log::printf(
         "[BLE_UART] device number : %06lu\n",
         (unsigned long)sm_event_numeric_comparison_request_get_passkey(packet));
-    printf(
+    log::printf(
         "[BLE_UART] スマホ側の表示と一致していれば 'y'、違えば 'n' を入力\n");
     break;
 
   case SM_EVENT_PASSKEY_DISPLAY_NUMBER:
     // Central が Passkey Entry を選んだ場合のフォールバック。BTstack 生成の
     // ランダム passkey をシリアルへ出し、これをスマホ側へ入力させる。
-    printf("[BLE_UART] passkey (enter on phone) = %06lu\n",
+    log::printf("[BLE_UART] passkey (enter on phone) = %06lu\n",
            (unsigned long)sm_event_passkey_display_number_get_passkey(packet));
     break;
 
@@ -645,13 +661,13 @@ static void sm_packet_handler(uint8_t packet_type, uint16_t channel,
     if (sm_event_pairing_complete_get_status(packet) == ERROR_CODE_SUCCESS) {
       cmd_authorized = true;
       note_conn_activity(); // 認可直後からウォッチドッグの窓を仕切り直す
-      printf("[BLE_UART] pairing complete -> authorized\n");
+      log::printf("[BLE_UART] pairing complete -> authorized\n");
       print_conn_interval("paired"); // ★ ペアリング直後に CI を表示
       request_fast_ci();             // ★ CI=12 (15ms) を強制要求
       request_2m_phy();              // ★ 2M PHY を要求 (結果は PHY update イベント)
     } else {
       cmd_authorized = false;
-      printf("[BLE_UART] pairing failed (status 0x%02x)\n",
+      log::printf("[BLE_UART] pairing failed (status 0x%02x)\n",
              sm_event_pairing_complete_get_status(packet));
     }
     break;
@@ -664,13 +680,13 @@ static void sm_packet_handler(uint8_t packet_type, uint16_t channel,
         ERROR_CODE_SUCCESS) {
       cmd_authorized = true;
       note_conn_activity(); // 再接続(再暗号化)直後も窓を仕切り直す
-      printf("[BLE_UART] reencryption complete -> authorized\n");
+      log::printf("[BLE_UART] reencryption complete -> authorized\n");
       print_conn_interval("paired"); // ★ 再接続(再暗号化)直後にも CI を表示
       request_fast_ci();             // ★ CI=12 (15ms) を強制要求
       request_2m_phy();              // ★ 2M PHY を要求 (結果は PHY update イベント)
     } else {
       cmd_authorized = false;
-      printf("[BLE_UART] reencryption failed -> stays locked\n");
+      log::printf("[BLE_UART] reencryption failed -> stays locked\n");
     }
     break;
 
@@ -690,11 +706,22 @@ static uint32_t compat_len = 0;
 
 // notify が有効で要求未発なら次の送信機会を確保 (send_byte/send_buf 用)。
 static void request_send_if_needed() {
+#if SHIZU_CYW43_SVC_THREAD
+  // ★ Stage 2 ではここから btstack を突かない。この関数は export された
+  //   send_byte/send_buf の中 = **呼び出し元スレッドのコア** (TELEMETRY なら core0)
+  //   で走るので、(a) core1 の cyw43 サービススレッドと直列化されておらず、
+  //   (b) そもそも cyw43/btstack の「init したコアからしか触れない」縛りを破る
+  //   (BLE on core1 以降ずっと潜在していた穴)。送信機会の要求は主ループの 1ms 補填
+  //   (「notify 有効 + ストリーム非空 + 要求未発」) が同じ条件で出すので、最大 1ms
+  //   遅れるだけで機能は落ちない。現行の飛行構成はこの互換経路自体を使わない。
+  return;
+#else
   if (con_handle != HCI_CON_HANDLE_INVALID && tx_notify_enabled &&
       !can_send_requested) {
     can_send_requested = true;
     att_server_request_can_send_now_event(con_handle);
   }
+#endif
 }
 
 static void method_send_byte(uint32_t _caller_obj_id,
@@ -754,13 +781,13 @@ static void method_register_tx_stream(uint32_t _caller_obj_id,
   uint32_t prio = arg & 0xFFFFu;
   bt::handle_t h = shizu::stream::open<bt::frame_t>(id);
   if (!h.valid()) {
-    printf("[BLE_UART] register_tx_stream: id=%lu not found\n",
+    log::printf("[BLE_UART] register_tx_stream: id=%lu not found\n",
            (unsigned long)id);
     return;
   }
   shizu::stream::bind(id, shizu::stream::role::CONSUMER);
   tx_src_insert(h, prio);
-  printf("[BLE_UART] tx stream registered: id=%lu prio=%lu\n",
+  log::printf("[BLE_UART] tx stream registered: id=%lu prio=%lu\n",
          (unsigned long)id, (unsigned long)prio);
 }
 
@@ -772,7 +799,7 @@ static void method_set_rx_sink(uint32_t _caller_obj_id,
   (void)_arg1;
   rx_sink_obj_id = (packed >> 16) & 0xFFFF;
   rx_sink_method_id = packed & 0xFFFF;
-  printf("[BLE_UART] rx_sink -> obj=%lu method=%lu\n",
+  log::printf("[BLE_UART] rx_sink -> obj=%lu method=%lu\n",
          (unsigned long)rx_sink_obj_id, (unsigned long)rx_sink_method_id);
 }
 
@@ -785,9 +812,221 @@ static void method_set_rx_sink(uint32_t _caller_obj_id,
 // 再起動時は呼び出し前に bt_stack_teardown() で各層を deinit しておくこと
 // (sm_init 等は再初期化ガード付きのため、deinit しないと no-op になり、
 // 新しい hci にハンドラが再登録されず SM が沈黙する)。
+#if SHIZU_CYW43_YIELD_WAIT
+// Stage 1: cyw43 の待ち (async_context.wait_for_work_until) を WFE→Shizuku yield へ。
+// POLL 版の実体は sem_acquire_block_until = WFE でコアを握る。ここでは「sem を非ブロッキング
+// に試し、無ければ Shizuku へ yield」に置換 → 待ちの間 RT タスクが走り core1 が凍結しない。
+// 差し替えは async_context 実体 (RAM) の vtable ポインタを自前 RAM コピーへ向け替えるだけで、
+// SDK コードは無改変。応答が来れば sem が release され (元と同じく) 即 return する。
+static async_context_type_t g_cyw43_vtable_shim;
+static void shizu_cyw43_wait_for_work_until(async_context_t *self,
+                                            absolute_time_t until) {
+  semaphore_t *sem = &reinterpret_cast<async_context_poll_t *>(self)->sem;
+  while (!time_reached(until)) {
+    if (sem_try_acquire(sem))
+      return;                  // work signaled (元の sem_acquire_block_until と同義)
+    shizu::obj_api::yield();   // ★ WFE でなく Shizuku スケジューラへ制御を返す
+  }
+}
+// wait_until 経路 (cyw43_await_background_or_timeout_us の IRQ/exception 分岐や、
+// 締切までの単純 sleep。元は sleep_until = WFE 保持)。切断時の 2s フリーズがここ。
+static void shizu_cyw43_wait_until(async_context_t *, absolute_time_t until) {
+  while (!time_reached(until))
+    shizu::obj_api::yield(); // sleep_until 相当を Shizuku yield で (WFE 回避)
+}
+static void install_cyw43_yield_wait() {
+  async_context_t *ctx = cyw43_arch_async_context();
+  if (!ctx || !ctx->type)
+    return;
+  g_cyw43_vtable_shim = *ctx->type; // 元 vtable を丸ごとコピー (他エントリは不変)
+  g_cyw43_vtable_shim.wait_for_work_until = shizu_cyw43_wait_for_work_until;
+  g_cyw43_vtable_shim.wait_until = shizu_cyw43_wait_until; // sleep_until 経路も yield へ
+  ctx->type = &g_cyw43_vtable_shim; // 実体 (RAM) の type を自前 vtable へ
+  log::printf("[BLE_UART] cyw43 wait -> Shizuku yield (Stage1: no WFE core-hold)\n");
+}
+#endif
+
+// ===========================================================================
+//  Stage 2: 独自 host-wake IRQ + cyw43 サービススレッド (ロック順守のドレイン)
+// ===========================================================================
+// 【なぜ要るか】
+//  poll モードの cyw43 は「誰かが cyw43_arch_poll() を呼んだときだけ」チップと会話する。
+//  Stage 1 以前は主ループがそれを兼ねていたので、cyw43 の内部待ち (IOCTL 応答待ち /
+//  SDPCM クレジット待ち / バス wake の KSO ハンドシェイク) に入った瞬間、ドレインする
+//  主体が居なくなり、待ちは応答の到着ではなくタイムアウト満了 (最悪 1s) で終わっていた。
+//  Stage 1 はその待ちを WFE から yield へ変えて「コアを握らない」ようにしただけで、
+//  待ちが長い事実は変えていない。Stage 2 は待ちを終わらせる側を用意する:
+//    ① チップが上げる WL_HOST_WAKE の GPIO 割り込みに自前ハンドラを相乗り登録し、
+//       「チップが何か持っている」を Shizuku 側の通し番号 (g_hostwake_seq) にする。
+//    ② その通知で cyw43 サービススレッド (BLE と同じコアにピン留め、budget0) が起きて
+//       cyw43_arch_poll() でドレインする。待ち側 (Stage 1 の yield) はこのドレインが
+//       進めた結果 (sem release / 応答パケット) を見て即座に抜ける = IOCTL 完了。
+//    ③ cyw43/btstack を同時に 2 スレッドが触らないよう単一所有ロックで直列化する
+//       (= ロック順守)。SDK の poll モードは lock が no-op = 単一スレッド前提なので、
+//       スレッドを増やす以上この排他は我々が持つ必要がある。
+//
+// 【スレッド分割の線引き】
+//  ・cyw43_arch_poll() (= cyw43 本体 + btstack run loop + 各種コールバック) …… svc
+//  ・btstack API 呼び出し (hci_send_cmd / gap_* / sm_* / att_server_*) …… 主ループ
+//  どちらもロックを取る。btstack コールバックの中 (packet_handler → flush_tx →
+//  att_server_notify など) は既に poll のロック内なので**追加で取らない**。
+#if SHIZU_CYW43_SVC_THREAD
+
+// ---- 単一所有ロック --------------------------------------------------------
+// 協調スケジューラ + 同一コアなので所有権トークンで足りるが、budget 付きスレッドの
+// PendSV プリエンプトと (主ループ/サービススレッドの) 2 者競合があるので取得は CAS。
+// RP2350-E2 のため SIO ハードウェアスピンロックは使わない (LDREX/STREX = __atomic)。
+// 再入カウント (g_cyw43_depth) は所有者だけが触るので非 atomic で良い。
+enum : uint32_t {
+  CYW43_OWNER_NONE = 0,
+  CYW43_OWNER_MAIN = 1, // BLE_UART_DRIVER::init の主ループ
+  CYW43_OWNER_SVC = 2,  // cyw43 サービススレッド
+};
+static volatile uint32_t g_cyw43_owner = CYW43_OWNER_NONE;
+static uint32_t g_cyw43_depth = 0;
+// ロック待ちの譲り方。待ちは稀 (相手が cyw43 の長い待ちに入っている間だけ) なので、
+// 生 yield の churn を避けて短い sleep で回す。
+static constexpr uint32_t CYW43_LOCK_BACKOFF_US = 200;
+
+struct cyw43_guard {
+  const uint32_t who;
+  explicit cyw43_guard(uint32_t w) : who(w) {
+    if (__atomic_load_n(&g_cyw43_owner, __ATOMIC_RELAXED) == who) {
+      ++g_cyw43_depth; // 自分が既に持っている (再入)
+      return;
+    }
+    uint32_t expected = CYW43_OWNER_NONE;
+    while (!__atomic_compare_exchange_n((uint32_t *)&g_cyw43_owner, &expected,
+                                        who, /*weak=*/true, __ATOMIC_ACQUIRE,
+                                        __ATOMIC_RELAXED)) {
+      expected = CYW43_OWNER_NONE; // CAS 失敗で expected が汚れるので毎回戻す
+      obj_api::yield_us(CYW43_LOCK_BACKOFF_US);
+    }
+    g_cyw43_depth = 1;
+  }
+  ~cyw43_guard() {
+    if (--g_cyw43_depth == 0)
+      __atomic_store_n((uint32_t *)&g_cyw43_owner, CYW43_OWNER_NONE,
+                       __ATOMIC_RELEASE);
+  }
+  cyw43_guard(const cyw43_guard &) = delete;
+  cyw43_guard &operator=(const cyw43_guard &) = delete;
+};
+
+// ---- 独自 host-wake IRQ ----------------------------------------------------
+// SDK も同じピンに cyw43_gpio_irq_handler を持っている (レベル HIGH 割り込みを自分で
+// disable し、cyw43_poll_func 末尾の CYW43_POST_POLL_HOOK で再 enable する)。ここは
+// 相乗りの**観測専用**ハンドラ: enable/disable と ack は SDK 側の責務のまま触らず、
+// 通し番号を進めるだけにする (二重管理でレベル割り込みを取りこぼさないため)。
+// order priority を SDK (0x40) より高くして先に走らせる = SDK が disable する前に数える。
+static constexpr uint8_t HOSTWAKE_IRQ_PRIORITY = 0x41;
+static volatile uint32_t g_hostwake_seq = 0;
+volatile uint32_t ble_dbg_hostwake = 0; // 診断用 (main.cpp の [BEACON] から見たい場合用)
+static bool g_hostwake_installed = false;
+// bringup 済み (teardown〜再 bringup の間は false)。サービススレッドはこの間ドレインしない。
+static volatile bool g_cyw43_up = false;
+// 実際に cyw43_arch_poll を回した回数 (1s 統計へ)。回転数 (ble_dbg_poll) との比で
+// 「どれだけの周回が空振りだったか」= イベント駆動がどれだけ効いているかが読める。
+static uint32_t g_drain_cnt = 0;
+
+static void hostwake_irq_handler() {
+  if (gpio_get_irq_event_mask(CYW43_PIN_WL_HOST_WAKE) & GPIO_IRQ_LEVEL_HIGH) {
+    g_hostwake_seq = g_hostwake_seq + 1;
+    ble_dbg_hostwake = g_hostwake_seq;
+  }
+}
+
+// ★ gpio_add_raw_irq_handler_*() は使えない: 内部の
+//   `hard_assert(!(raw_irq_mask[core] & gpio_mask))` が「1 GPIO につきハンドラ 1 本」を
+//   強制していて、この GPIO は既に SDK の cyw43_irq_init が取っている (= 呼んだ瞬間に
+//   panic する)。その helper の実体は irq_add_shared_handler(IO_IRQ_BANK0, ...) に
+//   gpio 単位の帳簿を足しただけなので、帳簿を通さず共有ハンドラへ直接相乗りする。
+//   どの GPIO の事象かは自分で gpio_get_irq_event_mask して判定する (下のハンドラ)。
+// 共有ハンドラは**登録したコアの**ベクタに載る。サービススレッドは BLE と同じコア
+// (= cyw43_arch_init を実行したコア) にピン留めしてあるので、このスレッドから登録
+// するのが正しい。IO_IRQ_BANK0 の enable は SDK の cyw43_irq_init が済ませている。
+// チップ再起動 (deinit→init) で SDK 側ハンドラは付け直されるが、こちらは一度だけ
+// 登録して外さない (二重登録の回避 = 登録済みフラグ)。
+static void install_hostwake_irq() {
+  if (g_hostwake_installed)
+    return;
+  irq_add_shared_handler(IO_IRQ_BANK0, hostwake_irq_handler,
+                         HOSTWAKE_IRQ_PRIORITY);
+  g_hostwake_installed = true;
+  log::printf("[BLE_UART] host-wake IRQ hooked (gpio %u, Stage2)\n",
+         (unsigned)CYW43_PIN_WL_HOST_WAKE);
+}
+
+// ---- cyw43 サービススレッド -------------------------------------------------
+// 起床条件は 2 つ: (a) 自前 host-wake の通し番号が進んだ = チップが何か持っている、
+// (b) async_context に処理待ち (when_pending の work_pending / 期限到来の at_time
+// worker = btstack タイマ) がある。どちらも無ければドレインを丸ごと省く。
+// 注意: host-wake IRQ は「sleep 中の Shizuku スレッド」を起こせない (IRQ 文脈から SVC は
+// 撃てない) ので、実際のドレイン遅延の上限は SHIZU_CYW43_SVC_NAP_US になる。既定 1000µs
+// は Stage 1 以前の主ループ poll と同じ刻みで、退行しないことを優先した値。
+static void cyw43_service_thread() {
+  install_hostwake_irq();
+  log::printf("[BLE_UART] cyw43 service thread up (Stage2: host-wake IRQ drain)\n");
+  uint32_t seen = g_hostwake_seq;
+  while (true) {
+    // [BEACON] の生存判定 (main.cpp: 「poll が進まない = BLE スレッド停止」) はこの
+    // スレッドの回転数で読む。ドレインを省いた周回も進めること — 実仕事が無いだけで
+    // 生きている状態を「停止」と誤読させないため。
+    ble_dbg_poll = ble_dbg_poll + 1;
+    if (g_cyw43_up) {
+      cyw43_guard g(CYW43_OWNER_SVC);
+      async_context_t *ctx = cyw43_arch_async_context();
+      // ロック取得中に主ループが teardown を始めていないか再確認 (二重チェック)。
+      if (g_cyw43_up && ctx) {
+        const uint32_t seq = g_hostwake_seq;
+        // seen の更新はドレイン**前**に読んだ値で行う。ドレイン中に来た host-wake は
+        // 次周で拾う (取りこぼしでなく 1 周遅れになるだけ)。
+        if (seq != seen || async_context_base_needs_servicing(ctx)) {
+          seen = seq;
+          ++g_drain_cnt;
+#if SHIZU_BLE_POLL_INSTR
+          uint64_t _poll_t0 = time_us_64();
+#endif
+          cyw43_arch_poll();
+#if SHIZU_BLE_POLL_INSTR
+          uint32_t _poll_us = (uint32_t)(time_us_64() - _poll_t0);
+          if (_poll_us > poll_max_win_us)
+            poll_max_win_us = _poll_us;
+          if (_poll_us > poll_max_ever_us)
+            poll_max_ever_us = _poll_us;
+          if (_poll_us > BLE_POLL_WARN_US)
+            log::printf("[BLE_UART] LONG poll %luus (con=%d authz=%d nc_pending=%d)\n",
+                   (unsigned long)_poll_us,
+                   con_handle != HCI_CON_HANDLE_INVALID ? 1 : 0,
+                   cmd_authorized ? 1 : 0,
+                   nc_pending_handle != HCI_CON_HANDLE_INVALID ? 1 : 0);
+#endif
+        }
+      }
+    }
+    obj_api::yield_us(SHIZU_CYW43_SVC_NAP_US);
+  }
+}
+#endif // SHIZU_CYW43_SVC_THREAD
+
+// Stage 2 が OFF のときは「ロックを取る」も「up 印」も丸ごと消える (主ループが唯一の
+// 触り手)。呼び出し側を #if で分岐させないためのマクロ/インライン。
+#if SHIZU_CYW43_SVC_THREAD
+#define CYW43_LOCK_MAIN() cyw43_guard _cyw43_lk(CYW43_OWNER_MAIN)
+static inline void cyw43_mark_up(bool up) { g_cyw43_up = up; }
+#else
+#define CYW43_LOCK_MAIN() ((void)0)
+static inline void cyw43_mark_up(bool) {}
+#endif
+
 static void bt_stack_bringup() {
   // CYW43 チップ起動 (WiFi/BT ファームウェアのロードを含む)
   cyw43_arch_init();
+#if SHIZU_CYW43_YIELD_WAIT
+  // cyw43_arch_init は毎回 async_context を作り直し vtable を張り直すので、init 直後に
+  // 差し替える (bt_stack_bringup は初回起動 + チップリセット後の再起動の両方で呼ばれる)。
+  install_cyw43_yield_wait();
+#endif
   l2cap_init();
   sm_init();
 
@@ -829,6 +1068,10 @@ static void bt_stack_bringup() {
 
   // 電源 ON (HCI_STATE_WORKING 到達で packet_handler が広告を開始する)
   hci_power_control(HCI_POWER_ON);
+
+  // Stage 2: ここから先はサービススレッドがドレインしてよい (bringup 自体は
+  // 呼び出し元がロックを持って走るので、印を立てるのは全部積み終わってから)。
+  cyw43_mark_up(true);
 }
 
 // BT スタック一式の解体 → チップ電源断。上位層の明示 deinit が重要
@@ -836,6 +1079,9 @@ static void bt_stack_bringup() {
 // hci_power_control(OFF) + hci_close + run loop/メモリ解体まで行い、
 // チップの電源も落とす (次の cyw43_arch_init で FW が再ロードされる)。
 static void bt_stack_teardown() {
+  // Stage 2: 解体中は async_context ごと消えるのでサービススレッドを止める
+  // (ロックでも排他されるが、ロックを離した瞬間に「まだ chip が居ない」窓が残る)。
+  cyw43_mark_up(false);
   att_server_deinit();
   sm_deinit();
   l2cap_deinit();
@@ -847,18 +1093,21 @@ static void bt_stack_teardown() {
 // ~2s ブロックする (協調スケジューラなので全スレッド停止) が、BT が死んでいる
 // 時点でテレメトリは既に止まっており、代償より復旧を優先する。
 static void bt_full_chip_restart() {
-  printf("[BLE_UART] full CYW43 chip reset...\n");
+  log::printf("[BLE_UART] full CYW43 chip reset...\n");
+  // Stage 2: 解体〜再構築の全区間でロックを保持する。間の 100ms yield 中も
+  // サービススレッドは (up 印が倒れているのに加えて) ロックが取れず入ってこない。
+  CYW43_LOCK_MAIN();
   bt_stack_teardown();
   obj_api::yield_us(100000); // 100ms: チップ電源断を落ち着かせつつ他スレッドへ譲る
   bt_stack_bringup();
-  printf("[BLE_UART] chip reset done, waiting for HCI ready\n");
+  log::printf("[BLE_UART] chip reset done, waiting for HCI ready\n");
 }
 
 // ===========================================================================
 //  オブジェクトエントリ
 // ===========================================================================
 void BLE_UART_DRIVER::init() {
-  printf("[BLE_UART] init\n");
+  log::printf("[BLE_UART] init\n");
 
   // 1) メソッドを先にエクスポート (BT が立ち上がる前でも積める)
   export_method<method_send_byte>(BLE_UART_DRIVER::METHOD_IDs::send_byte);
@@ -875,11 +1124,27 @@ void BLE_UART_DRIVER::init() {
   // 2) BT スタック起動 (CYW43 チップ + btstack 全層 + 広告設定 + 電源 ON)
   bt_stack_bringup();
 
-  // 3) poll ループ
+#if SHIZU_CYW43_SVC_THREAD
+  // 2.5) Stage 2: cyw43 のドレインを専用スレッドへ移す。**必ず同じオブジェクト・
+  // 同じコア**に置くこと — cyw43/btstack/async_context は「init を実行したコアから
+  // しか触れない」縛りがあり (SHIZU_BLE_ON_CORE1 のコメント参照)、poll モードの
+  // lock_check も get_core_num() != context->core_num で panic する。budget0 =
+  // バトン組なのは主ループと同じ理由 (cyw43 は 3ms でスライスできない)。
+  obj_api::async_call((uint32_t)object_ids::BLE_UART_DRIVER,
+                      (uintptr_t)cyw43_service_thread, 0,
+                      SHIZU_BLE_ON_CORE1 ? AFFINITY_CORE1 : AFFINITY_CORE0,
+                      /*budget0=*/true);
+#endif
+
+  // 3) 主ループ。Stage 2 が ON なら cyw43_arch_poll はサービススレッドの担当で、
+  //    ここに残るのはアプリ層 (診断/RSSI/NC 確認/TX 補填/ウォッチドッグ/広告保険)
+  //    だけになる。btstack API に触る箇所はサービススレッドと直列化するため
+  //    CYW43_LOCK_MAIN() で括る (Stage 2 OFF では丸ごと消える)。
   absolute_time_t next_rssi = make_timeout_time_ms(RSSI_PERIOD_MS);
   absolute_time_t next_adv_ensure = make_timeout_time_ms(1000);
   absolute_time_t next_tx_stat = make_timeout_time_ms(1000);
   while (true) {
+#if !SHIZU_CYW43_SVC_THREAD
     ble_dbg_poll = ble_dbg_poll + 1;
 #if SHIZU_BLE_POLL_INSTR
     uint64_t _poll_t0 = time_us_64();
@@ -892,27 +1157,31 @@ void BLE_UART_DRIVER::init() {
     if (_poll_us > poll_max_ever_us)
       poll_max_ever_us = _poll_us;
     if (_poll_us > BLE_POLL_WARN_US)
-      printf("[BLE_UART] LONG poll %luus (con=%d authz=%d nc_pending=%d)\n",
+      log::printf("[BLE_UART] LONG poll %luus (con=%d authz=%d nc_pending=%d)\n",
              (unsigned long)_poll_us,
              con_handle != HCI_CON_HANDLE_INVALID ? 1 : 0, cmd_authorized ? 1 : 0,
              nc_pending_handle != HCI_CON_HANDLE_INVALID ? 1 : 0);
 #endif
+#endif // !SHIZU_CYW43_SVC_THREAD
 
     // LE features 読み出し (HCI ready 時に予約)。クレジットが空くのを待って
     // から送る (hci_send_cmd はクレジット無しだと黙って捨てるため)。
-    if (le_features_pending && hci_can_send_command_packet_now()) {
-      le_features_pending = false;
-      uint8_t st = hci_send_cmd(&hci_le_read_local_supported_features);
-      printf("[BLE_UART] LE features read sent -> %u\n", st);
-      if (st != 0)
-        le_features_pending = true; // 万一失敗したら次周で再試行
+    if (le_features_pending) {
+      CYW43_LOCK_MAIN();
+      if (hci_can_send_command_packet_now()) {
+        le_features_pending = false;
+        uint8_t st = hci_send_cmd(&hci_le_read_local_supported_features);
+        log::printf("[BLE_UART] LE features read sent -> %u\n", st);
+        if (st != 0)
+          le_features_pending = true; // 万一失敗したら次周で再試行
+      }
     }
 
     // 2M PHY 応答ウォッチ: 要求から 5s、Command Status / PHY update のどちらも
     // 来なければ 1 回だけ結論を出す (コントローラ FW 非対応の可能性が濃厚)。
     if (phy_probe_active && time_us_64() - phy_req_us > PHY_PROBE_TIMEOUT_US) {
       phy_probe_active = false;
-      printf("[BLE_UART] 2M PHY: no response in 5s (likely unsupported by "
+      log::printf("[BLE_UART] 2M PHY: no response in 5s (likely unsupported by "
              "controller FW)\n");
     }
 
@@ -920,7 +1189,7 @@ void BLE_UART_DRIVER::init() {
     // pkts/csn が 1.0 を超えていれば 1 CI に複数発詰められている証拠。
     if (time_reached(next_tx_stat)) {
       if (tx_stat_pkts != 0 || tx_stat_csn != 0) {
-        printf("[BLE_UART] tx 1s: %lu pkts / %lu csn / %lu B\n",
+        log::printf("[BLE_UART] tx 1s: %lu pkts / %lu csn / %lu B\n",
                (unsigned long)tx_stat_pkts, (unsigned long)tx_stat_csn,
                (unsigned long)tx_stat_bytes);
         tx_stat_pkts = 0;
@@ -931,15 +1200,31 @@ void BLE_UART_DRIVER::init() {
       // cyw43_arch_poll 1 回の最大所要 (窓/起動来)。窓最大が数 ms を超えるなら、その間
       // core1 の RT スレッドは走れない (budget-0 の BLE は preempt されず、poll 内では
       // yield もできないため) = 数秒スタールの正体。
-      printf("[BLE_UART] poll 1s: max=%luus ever=%luus (dbg_poll=%lu)\n",
+      log::printf("[BLE_UART] poll 1s: max=%luus ever=%luus (dbg_poll=%lu)\n",
              (unsigned long)poll_max_win_us, (unsigned long)poll_max_ever_us,
              (unsigned long)ble_dbg_poll);
       poll_max_win_us = 0;
 #endif
+#if SHIZU_CYW43_SVC_THREAD
+      // Stage 2 の効きを 1 行で読む: hostwake = チップが上げた host-wake IRQ の総数
+      // (0 のままなら IRQ が届いていない = ドレインが巡回頼みに退化している)、
+      // drains = 実際に cyw43_arch_poll を回した回数、spin = 空振り周回数。
+      {
+        static uint32_t prev_hw = 0, prev_drain = 0, prev_rot = 0;
+        const uint32_t hw = ble_dbg_hostwake, dr = g_drain_cnt, rot = ble_dbg_poll;
+        log::printf("[BLE_UART] cyw43 svc 1s: hostwake=%lu(+%lu) drains=%lu spin=%lu\n",
+               (unsigned long)hw, (unsigned long)(hw - prev_hw),
+               (unsigned long)(dr - prev_drain),
+               (unsigned long)((rot - prev_rot) - (dr - prev_drain)));
+        prev_hw = hw;
+        prev_drain = dr;
+        prev_rot = rot;
+      }
+#endif
       // ctrl (ping 応答等) の device 内滞在時間。RTT>100ms の切り分け: この値が
       // 小さい (≲CI=15ms) のに GUI の RTT が跳ねるなら犯人は host 側で確定。
       if (bt::ctrl_lat_max_us != 0) {
-        printf("[BLE_UART] ctrl_lat 1s: last=%luus max=%luus\n",
+        log::printf("[BLE_UART] ctrl_lat 1s: last=%luus max=%luus\n",
                (unsigned long)bt::ctrl_lat_last_us,
                (unsigned long)bt::ctrl_lat_max_us);
         bt::ctrl_lat_max_us = 0;
@@ -951,6 +1236,7 @@ void BLE_UART_DRIVER::init() {
     // 結果は GAP_EVENT_RSSI_MEASUREMENT で受けてホストへ送る。
     if (con_handle != HCI_CON_HANDLE_INVALID && tx_notify_enabled &&
         cmd_authorized && time_reached(next_rssi)) {
+      CYW43_LOCK_MAIN();
       gap_read_rssi(con_handle);
       next_rssi = make_timeout_time_ms(RSSI_PERIOD_MS);
     }
@@ -960,11 +1246,13 @@ void BLE_UART_DRIVER::init() {
     if (nc_pending_handle != HCI_CON_HANDLE_INVALID) {
       int c = getchar_timeout_us(0);
       if (c == 'y' || c == 'Y') {
-        printf("[BLE_UART] numeric comparison confirmed\n");
+        log::printf("[BLE_UART] numeric comparison confirmed\n");
+        CYW43_LOCK_MAIN();
         sm_numeric_comparison_confirm(nc_pending_handle);
         nc_pending_handle = HCI_CON_HANDLE_INVALID;
       } else if (c == 'n' || c == 'N') {
-        printf("[BLE_UART] numeric comparison declined\n");
+        log::printf("[BLE_UART] numeric comparison declined\n");
+        CYW43_LOCK_MAIN();
         sm_bonding_decline(nc_pending_handle);
         nc_pending_handle = HCI_CON_HANDLE_INVALID;
       }
@@ -974,6 +1262,7 @@ void BLE_UART_DRIVER::init() {
     // push は SVC を通らないので、この poll がアイドル→非空の cold start を拾う)。
     if (con_handle != HCI_CON_HANDLE_INVALID && tx_notify_enabled &&
         !tx_all_empty() && !can_send_requested) {
+      CYW43_LOCK_MAIN();
       can_send_requested = true;
       att_server_request_can_send_now_event(con_handle);
     }
@@ -988,9 +1277,12 @@ void BLE_UART_DRIVER::init() {
                            ? CONN_IDLE_TIMEOUT_US
                            : CONN_PAIRING_TIMEOUT_US;
       if (idle > limit) {
-        printf("[BLE_UART] link idle %lums — force cleanup & re-advertise\n",
+        log::printf("[BLE_UART] link idle %lums — force cleanup & re-advertise\n",
                (unsigned long)(idle / 1000));
-        gap_disconnect(con_handle); // リンクがまだ生きていれば正規に切る (死んでいれば無害)
+        {
+          CYW43_LOCK_MAIN();
+          gap_disconnect(con_handle); // リンクが生きていれば正規に切る (死んでいれば無害)
+        }
         con_handle = HCI_CON_HANDLE_INVALID;
         tx_notify_enabled = false;
         can_send_requested = false;
@@ -1012,7 +1304,7 @@ void BLE_UART_DRIVER::init() {
         wd_recovery_pending = false; // 応答あり = コントローラ生存、掃除で十分
       } else if (time_us_64() - wd_cleanup_us > WD_RECOVERY_TIMEOUT_US) {
         wd_recovery_pending = false;
-        printf("[BLE_UART] controller unresponsive — resetting CYW43\n");
+        log::printf("[BLE_UART] controller unresponsive — resetting CYW43\n");
         // hci_power_control の OFF→ON (+BT FW 再ダウンロード) では蘇生しない
         // ことを実測済み。チップごとリセットして btstack 全層を作り直す。
         bt_full_chip_restart();
@@ -1022,6 +1314,7 @@ void BLE_UART_DRIVER::init() {
     // 広告保険: 未接続なのに広告が止まっている事態 (切断イベント取りこぼし後や
     // enable 失敗) を避けるため、切断中は 1s ごとに広告を張り直す (enable は冪等)。
     if (con_handle == HCI_CON_HANDLE_INVALID && time_reached(next_adv_ensure)) {
+      CYW43_LOCK_MAIN();
       gap_advertisements_enable(1);
       next_adv_ensure = make_timeout_time_ms(1000);
     }

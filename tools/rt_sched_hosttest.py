@@ -41,6 +41,7 @@ LATE_BOUND_MULT = 2.5       # late_max 許容 = budget × これ + マージン 
 LATE_BOUND_MARGIN_US = 3000
 TICK_FRAC = 0.80            # schedulable victim の各 window ticks はこの割合以上であるべき
 REPORT_WIN_US = 2000000     # reporter の window (period = REPORT_WIN_US / exp で逆算)
+FREEZE_GAP_S = 0.5          # CDC データ列に これ以上の空白 = デバイスがフリーズした証拠
 
 RTTEST_VICTIM = re.compile(
     r"\[RTTEST\]\s+(\S+)\s+late\(win\)=(\d+)us late\(max\)=(\d+)us "
@@ -64,6 +65,12 @@ class SerialMonitor(threading.Thread):
         self.hog_stalled = 0
         self.err = None
         self.lines_seen = 0
+        # デバイスが数秒フリーズすると USB CDC も一時的に落ちる (macOS: Errno 6)。
+        # 致命ではなく「フリーズの兆候」なので再接続で乗り切る。フリーズ時間は
+        # 「成功した行と行の実時間ギャップ」で測る (再接続レイテンシではない —
+        #  フリーズ中はポート記述子が生きたまま read だけ失敗し瞬時 reopen が連発するため)。
+        self._last_line_t = None
+        self.freezes = []  # data-stream 上のギャップ [s] (> FREEZE_GAP_S のみ)
 
     def stop(self):
         self._stop.set()
@@ -74,23 +81,44 @@ class SerialMonitor(threading.Thread):
         except ImportError as e:
             self.err = f"pyserial が要ります (pip install pyserial): {e}"
             return
-        try:
-            ser = serial.Serial(self._port_name, self._baud, timeout=1.0)
-        except Exception as e:  # noqa: BLE001
-            self.err = f"シリアルポートを開けません ({self._port_name}): {e}"
-            return
-        with ser:
-            while not self._stop.is_set():
-                try:
-                    raw = ser.readline()
-                except Exception as e:  # noqa: BLE001
-                    self.err = f"シリアル読み取り失敗: {e}"
+        first_open = True
+        dropped = False  # 直前に read 例外 (実 CDC 切断) があったか
+        while not self._stop.is_set():
+            try:
+                ser = serial.Serial(self._port_name, self._baud, timeout=1.0)
+            except Exception as e:  # noqa: BLE001
+                if first_open:
+                    # 最初の 1 回だけは致命 (ポート名間違い等)
+                    self.err = f"シリアルポートを開けません ({self._port_name}): {e}"
                     return
-                if not raw:
-                    continue
-                line = raw.decode("utf-8", errors="replace").rstrip()
-                self.lines_seen += 1
-                self._parse(line)
+                time.sleep(0.3)  # フリーズ中で未再列挙 — 待って再試行
+                continue
+            first_open = False
+            with ser:
+                while not self._stop.is_set():
+                    try:
+                        raw = ser.readline()
+                    except Exception:  # noqa: BLE001
+                        # 読み取り失敗 = デバイスがフリーズ/CDC 再列挙。致命にせず再接続。
+                        dropped = True
+                        break
+                    if not raw:
+                        continue  # 単なる無出力 (デバイスは bursty) — フリーズではない
+                    line = raw.decode("utf-8", errors="replace").rstrip()
+                    now = time.time()
+                    # フリーズは「実 CDC 切断 (read 例外) を跨いだ行間ギャップ」だけを数える。
+                    # 通常の無出力 (2s window 待ち等) は例外を出さないので誤検出しない。
+                    if dropped and self._last_line_t is not None:
+                        gap = now - self._last_line_t
+                        if gap > FREEZE_GAP_S:
+                            self.freezes.append(round(gap, 2))
+                    dropped = False
+                    self._last_line_t = now
+                    self.lines_seen += 1
+                    self._parse(line)
+            if self._stop.is_set():
+                break
+            time.sleep(0.05)  # 実 CDC 切断後の小休止 → 即再接続
 
     def _parse(self, line):
         if RTTEST_ARMED.search(line):
@@ -216,6 +244,11 @@ def verdict(mon: SerialMonitor, budget_us: int):
 
     if not mon.armed:
         notes.append("armed 行は未受信 (キャプチャ開始が arm より後なだけなら無害)")
+    if mon.freezes:
+        # CDC データ列に 0.5s 超の空白 = USB スタックまで止まる級のフリーズ = RT 失敗。
+        worst = max(mon.freezes)
+        fails.append(f"CDC データ列に {len(mon.freezes)} 回のフリーズ (最大 {worst:.2f}s, "
+                     f"{mon.freezes}s) = デバイスが USB CDC ごと停止 (BLE 接続/切断経路の残存フリーズ)")
     if mon.hog_windows == 0:
         fails.append("hog の window を 1 つも受信していない")
     elif mon.hog_stalled > 0:
@@ -304,6 +337,9 @@ def main():
         print("SERIAL:", mon.err)
     print(f"[SERIAL] 受信行 {mon.lines_seen}, armed={mon.armed}, "
           f"hog windows={mon.hog_windows} (STALLED {mon.hog_stalled})")
+    if mon.freezes:
+        print(f"[SERIAL] ⚠ CDC データ列に {len(mon.freezes)} 回のフリーズ "
+              f"(最大 {max(mon.freezes):.2f}s, {mon.freezes}s) = デバイスが数秒 USB CDC ごと停止")
     print(f"{'victim':<10} {'late_win_max':>12} {'late_max*':>10} {'overrun':>8} "
           f"{'windows':>8} {'min ticks/exp':>16}")
     for name, v in sorted(mon.victims.items()):

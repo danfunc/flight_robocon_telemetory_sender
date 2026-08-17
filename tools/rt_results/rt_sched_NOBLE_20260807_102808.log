@@ -1,0 +1,11 @@
+[SERIAL] /dev/cu.usbmodem1101 @ 115200 を 16s 監視
+
+==================== RT スケジューラ検証結果 ====================
+[SERIAL] 受信行 1, armed=False, hog windows=0 (STALLED 0)
+victim     late_win_max  late_max*  overrun  windows    min ticks/exp
+  * late_max = 起動来累積ピーク (BLE 接続等の一過性を含む)。ongoing は late_win_max で判断
+
+---------------------------------------------------------------
+  (観察) armed 行は未受信 (キャプチャ開始が arm より後なだけなら無害)
+判定: ❌ FAIL
+  - hog の window を 1 つも受信していない

@@ -15,6 +15,7 @@
 #include <object_id.hpp>
 #include <pico/stdlib.h>
 #include <stream.hpp>
+#include <log.hpp>
 
 namespace shizu {
 namespace {
@@ -41,7 +42,7 @@ st::storage<test_rec_t, 64, st::LOSSLESS> g_conn_dst;
 void stream_test_producer() {
   auto e = st::create(TEST_STREAM_ID, &g_test_stream.desc);
   if (e.is_err())
-    printf("[STREAMTEST] create err=%lu\n", (unsigned long)e.raw());
+    log::printf("[STREAMTEST] create err=%lu\n", (unsigned long)e.raw());
   st::bind(TEST_STREAM_ID, st::role::PRODUCER);
   auto tx = g_test_stream.hdl();
   uint32_t seq = 0;
@@ -73,7 +74,7 @@ void stream_test_consumer() {
       got++;
     }
     if (got >= next_print) {
-      printf("[STREAMTEST] core=%u got=%lu lost=%lu last_seq=%lu order_ok=%d\n",
+      log::printf("[STREAMTEST] core=%u got=%lu lost=%lu last_seq=%lu order_ok=%d\n",
              get_core_num(), (unsigned long)got, (unsigned long)lost,
              (unsigned long)last, order_ok ? 1 : 0);
       next_print += 5000;
@@ -90,7 +91,7 @@ void conn_test_producer() {
   st::create(CONN_DST_ID, &g_conn_dst.desc);
   st::bind(CONN_SRC_ID, st::role::PRODUCER);
   auto e = st::connect(CONN_SRC_ID, CONN_DST_ID);
-  printf("[CONNTEST] connect err=%lu (0=OK)\n", (unsigned long)e.raw());
+  log::printf("[CONNTEST] connect err=%lu (0=OK)\n", (unsigned long)e.raw());
   auto tx = g_conn_src.hdl();
   uint32_t seq = 0;
   while (true) {
@@ -120,7 +121,7 @@ void conn_test_consumer() {
       got++;
     }
     if (got >= next_print) {
-      printf("[CONNTEST] got=%lu bad=%lu (bad=0 = DMA pump PASS)\n",
+      log::printf("[CONNTEST] got=%lu bad=%lu (bad=0 = DMA pump PASS)\n",
              (unsigned long)got, (unsigned long)bad);
       next_print += 5000;
     }

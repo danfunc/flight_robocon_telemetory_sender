@@ -17,6 +17,7 @@
 #include <obj_api.hpp>
 #include <object_id.hpp>
 #include <pico/stdlib.h>
+#include <log.hpp>
 
 namespace shizu {
 namespace {
@@ -116,7 +117,7 @@ void nest_worker(uint32_t idx) {
 
 void report(const char *name, bool pass, uint64_t elapsed_us, uint32_t err,
             uint32_t reason) {
-  printf("[GRANTTEST] %s: %s (elapsed=%lluus err=%lu reason=%lu)\n", name,
+  log::printf("[GRANTTEST] %s: %s (elapsed=%lluus err=%lu reason=%lu)\n", name,
          pass ? "PASS" : "FAIL", (unsigned long long)elapsed_us,
          (unsigned long)err, (unsigned long)reason);
 }
@@ -124,7 +125,7 @@ void report(const char *name, bool pass, uint64_t elapsed_us, uint32_t err,
 // テストの司令塔。grant の外でだけ printf する。
 void driver(uint32_t) {
   obj_api::sleep_us(3000000); // 他オブジェクト (BLE 等) の初期化が済むまで待つ
-  printf("[GRANTTEST] start (busy=%lu yield=%lu mid=%lu)\n",
+  log::printf("[GRANTTEST] start (busy=%lu yield=%lu mid=%lu)\n",
          (unsigned long)g_busy_tid, (unsigned long)g_yield_tid,
          (unsigned long)g_mid_tid);
   bool all = true;
@@ -196,7 +197,7 @@ void driver(uint32_t) {
          g_mid_elapsed >= 1500 && g_mid_elapsed <= 3500 && elapsed >= 1900 &&
          elapsed <= 5000;
   report("D clamp", pass, elapsed, g_mid_err, g_mid_reason);
-  printf("[GRANTTEST]   (inner elapsed=%luus mid_first=%d outer_reason=%lu)\n",
+  log::printf("[GRANTTEST]   (inner elapsed=%luus mid_first=%d outer_reason=%lu)\n",
          (unsigned long)g_mid_elapsed, g_mid_before_driver ? 1 : 0,
          (unsigned long)r.reason);
   all = all && pass;
@@ -212,7 +213,7 @@ void driver(uint32_t) {
   report("E long", pass, elapsed, (uint32_t)r.error, (uint32_t)r.reason);
   all = all && pass;
 
-  printf("[GRANTTEST] ==== %s ====\n", all ? "ALL PASS" : "SOME FAILED");
+  log::printf("[GRANTTEST] ==== %s ====\n", all ? "ALL PASS" : "SOME FAILED");
   while (true)
     obj_api::sleep_us(1000000);
 }

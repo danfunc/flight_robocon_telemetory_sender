@@ -22,7 +22,7 @@ namespace shizu {
   // カーネルオブジェクト (id=0) は常に特権。以後この値がスレッド切替のたびに
   // CTX_RESTORE から適用される (MPU Step1 プロトタイプ)。
   thread_table[0].context->control = CONTROL_PRIV_PSP;
-  thread_table[0].call_stack.frames = kernel_arena_alloc_call_stack();
+  thread_table[0].call_stack.top = 0; // 退避先はスレッドスタック (事前確保なし)
   thread_table[0].call_stack.depth = 0;
   // thread0 (カーネルオブジェクトの idle/スケジューラ心拍) はバトン組 = budget 無制限。
   // guest として host されると自分の GRANT_CPU がネスト扱いになるため必ず 0。

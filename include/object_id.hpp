@@ -11,7 +11,7 @@ enum struct object_ids : uint32_t {
   MOTOR_DRIVER_RL=4,
   MOTOR_DRIVER_RR=5,
   IO_CONTROLLER=6,
-  STDIO_DRIVER=7,
+  SHIZUKU_USB=7,
   LINE_SENSOR_DRIVER=8,
   CYW43_BL_DRIVER=9,
   WS2812_DRIVER=10,
@@ -28,6 +28,12 @@ enum struct object_ids : uint32_t {
   SMP_STRESS=24,        // 2 コア SVC ピンポンストレス: worker/reporter 群の所属先。
   BUSY_LOAD=25,         // CPU ホグ負荷試験: core1 ピンの busy_worker + reporter の所属先。
   RT_SCHED_TEST=26,     // RT スケジューラ検証: 合成周期 victim + hog + reporter の所属先。
+  SVC_DELEGATE_A=27,    // svc 委譲自己テスト: 1 段目の担当オブジェクト。
+  SVC_DELEGATE_B=28,    // svc 委譲自己テスト: 2 段目の担当オブジェクト (ネスト実証)。
+  SVC_DELEGATE_T=29,    // svc 委譲自己テスト: 呼び出し元 (一般オブジェクト)。
+  UNPRIV_PROBE=30,      // 非特権実行の最小プローブ (CONTROL.nPRIV=1 で走る本体)。
+  UNPRIV_PRIV_REF=31,   // 上と同一コードを特権のまま走らせる A/B 比較用。
+  UNPRIV_REPORTER=32,   // 上の観測側 (特権のまま。stdio を使う)。
 };
 
 #endif // SHIZU_OBJECT_ID_HPP

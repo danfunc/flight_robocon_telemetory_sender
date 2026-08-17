@@ -33,6 +33,7 @@
 #include <object_id.hpp>
 #include <pico/time.h>
 #include <cmath> // 標準 libm (kernel が FP コンテキスト退避に対応したため soft_math は退役)
+#include <log.hpp>
 
 namespace shizu {
 
@@ -212,7 +213,7 @@ static void handle_line() {
     if (ok) {
       clock_offset_us = (int64_t)v - (int64_t)time_us_64();
       clock_synced = true;
-      printf("[TELEMETRY] time synced\n");
+      log::printf("[TELEMETRY] time synced\n");
     }
     break;
   }
@@ -236,7 +237,7 @@ static void handle_line() {
       if (ms > 1000)
         ms = 1000;
       telemetry_period_us = ms * 1000u;
-      printf("[TELEMETRY] period -> %lu ms\n", (unsigned long)ms);
+      log::printf("[TELEMETRY] period -> %lu ms\n", (unsigned long)ms);
     }
     break;
   }
@@ -258,7 +259,7 @@ static void handle_line() {
     blast_end_us = time_us_64() + (uint64_t)secs * 1000000ull;
     blast_active = true;
     set_sensors_paused(true); // 試験中はセンサを止めて帯域に振る
-    printf("[TELEMETRY] blast start %lu s\n", (unsigned long)secs);
+    log::printf("[TELEMETRY] blast start %lu s\n", (unsigned long)secs);
     break;
   }
   case 'S': { // 統計返信 (制御応答 → 優先ストリーム)
@@ -271,21 +272,21 @@ static void handle_line() {
   }
   case 'F': { // 送信フォーマット: F1=バイナリ(既定), F0=CSV テキスト
     telemetry_binary = !(rxlen >= 2 && rxline[1] == '0');
-    printf("[TELEMETRY] format -> %s\n", telemetry_binary ? "binary" : "CSV");
+    log::printf("[TELEMETRY] format -> %s\n", telemetry_binary ? "binary" : "CSV");
     break;
   }
   case 'X': { // BNO055 読みモード: X1=2B 個別読み, X0=26B ブロック読み(既定)
     uint32_t mode = (rxlen >= 2 && rxline[1] == '1') ? 1 : 0;
     call_method(object_ids::BNO055_DRIVER,
                 BNO055_DRIVER::METHOD_IDs::set_read_mode, mode);
-    printf("[TELEMETRY] BNO read mode -> %s\n", mode ? "split2B" : "block");
+    log::printf("[TELEMETRY] BNO read mode -> %s\n", mode ? "split2B" : "block");
     break;
   }
   case 'Y': { // 0xFFFF 破損破棄: Y1=有効(既定), Y0=素通し
     uint32_t on = (rxlen >= 2 && rxline[1] == '0') ? 0 : 1;
     call_method(object_ids::BNO055_DRIVER,
                 BNO055_DRIVER::METHOD_IDs::set_ffff_reject, on);
-    printf("[TELEMETRY] 0xFFFF reject -> %s\n", on ? "on" : "off");
+    log::printf("[TELEMETRY] 0xFFFF reject -> %s\n", on ? "on" : "off");
     break;
   }
   case 'K': { // I2C 失敗バックオフ閾値: "K<n>" (連続 n 回で 20Hz 退避。1=毎回=旧, 既定5)
@@ -300,7 +301,7 @@ static void handle_line() {
     if (any) {
       call_method(object_ids::BNO055_DRIVER,
                   BNO055_DRIVER::METHOD_IDs::set_fail_backoff, n);
-      printf("[TELEMETRY] BNO fail-backoff threshold -> %lu\n",
+      log::printf("[TELEMETRY] BNO fail-backoff threshold -> %lu\n",
              (unsigned long)n);
     }
     break;
@@ -310,7 +311,7 @@ static void handle_line() {
       call_method(object_ids::BNO055_DRIVER,
                   BNO055_DRIVER::METHOD_IDs::calib_save, 0);
       calib_pending_save = true; // 結果は ID_CALIB_RESULT で届く
-      printf("[TELEMETRY] calib save requested\n");
+      log::printf("[TELEMETRY] calib save requested\n");
     } else if (rxlen >= 2 && rxline[1] == 'L') {
       // "CL" + 44 hex (= 22 バイト) を期待。
       static uint8_t prof[BNO055_CALIB_PROFILE_LEN];
@@ -337,7 +338,7 @@ static void handle_line() {
                     BNO055_DRIVER::METHOD_IDs::calib_load,
                     (uint32_t)(uintptr_t)prof);
         calib_pending_save = false; // 結果は ID_CALIB_RESULT で届く
-        printf("[TELEMETRY] calib load requested\n");
+        log::printf("[TELEMETRY] calib load requested\n");
       } else {
         ble_send("CLOAD err=parse\r\n", 16);
       }
@@ -347,7 +348,7 @@ static void handle_line() {
   case 'A': { // 制御 arm/disarm: "A1"=arm, "A0"=disarm
     bool arm = !(rxlen >= 2 && rxline[1] == '0');
     fc_cmd(arm ? 1u : 0u, 0.f);
-    printf("[TELEMETRY] flight %s\n", arm ? "arm" : "disarm");
+    log::printf("[TELEMETRY] flight %s\n", arm ? "arm" : "disarm");
     break;
   }
   case 'G': { // 制御目標: "G<sub><signed int>"
@@ -708,7 +709,7 @@ static void accept_calib_result(const bno055_calib_xfer_t &x) {
 //  オブジェクトエントリ
 // ===========================================================================
 void TELEMETRY_SENDER::main() {
-  printf("[TELEMETRY] main\n");
+  log::printf("[TELEMETRY] main\n");
 
   // RX コマンドを受け取れるよう rx_sink を自分へ向ける。
   export_method<rx_byte_method>(TELEMETRY_SENDER::METHOD_IDs::rx_byte);

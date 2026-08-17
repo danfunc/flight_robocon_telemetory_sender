@@ -26,6 +26,7 @@
 #include <obj_api.hpp>
 #include <object_id.hpp>
 #include <pico/stdlib.h>
+#include <log.hpp>
 
 namespace shizu {
 namespace {
@@ -49,7 +50,7 @@ void busy_worker(uint32_t) {
 void reporter(uint32_t) {
   obj_api::sleep_us(3000000); // 他オブジェクト (BLE/センサ) の初期化完了を待つ
   g_armed = true;
-  printf("[BUSYLOAD] armed: core1 never-yield hog @ budget=%dus. Watch BLE_UART "
+  log::printf("[BUSYLOAD] armed: core1 never-yield hog @ budget=%dus. Watch BLE_UART "
          "ctrl_lat / blast throughput for interference.\n",
          SHIZU_DEFAULT_GRANT_BUDGET_US);
   uint32_t prev = g_busy_counter;
@@ -58,7 +59,7 @@ void reporter(uint32_t) {
     uint32_t now = g_busy_counter;
     uint32_t delta = now - prev; // u32 引き算はラップ安全
     prev = now;
-    printf("[BUSYLOAD] hog counter=%lu (+%lu/2s) %s\n", (unsigned long)now,
+    log::printf("[BUSYLOAD] hog counter=%lu (+%lu/2s) %s\n", (unsigned long)now,
            (unsigned long)delta, delta ? "ADVANCING" : "**STALLED**");
   }
 }

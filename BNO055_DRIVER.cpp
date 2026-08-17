@@ -23,6 +23,7 @@
 #include <cstring>
 #include <driver_streams.hpp>
 #include <export_method.hpp>
+#include <log.hpp> // ログの出力先はこのドライバでは決めない (合成側が set_sink する)
 #include <obj_api.hpp>
 #include <object_headers/BNO055_DRIVER.hpp>
 #include <pico/time.h>
@@ -216,7 +217,7 @@ static void dispatch_record(const core_ring::record_t &rec) {
     static uint16_t prev_fail = 0;
     uint16_t dfail = (uint16_t)(fail - prev_fail); // uint16 でラップ安全
     prev_fail = fail;
-    printf("[BNO055] status: i2c_fail=+%u (%u tot) recover=%u reinit=%u calib=0x%02X\n",
+    log::printf("[BNO055] status: i2c_fail=+%u (%u tot) recover=%u reinit=%u calib=0x%02X\n",
            (unsigned)dfail, (unsigned)fail, (unsigned)rec.payload[4],
            (unsigned)rec.payload[5], (unsigned)g_last_calib);
     break;
@@ -226,7 +227,7 @@ static void dispatch_record(const core_ring::record_t &rec) {
     memcpy(&reads, &rec.payload[2], 2);
     memcpy(&ffff, &rec.payload[4], 2);
     unsigned pm = reads ? (unsigned)((uint32_t)ffff * 1000u / reads) : 0;
-    printf("[BNO055] 0xFFFF diag: mode=%s reject=%u reads=%u ffff=%u (%u.%u%%)\n",
+    log::printf("[BNO055] 0xFFFF diag: mode=%s reject=%u reads=%u ffff=%u (%u.%u%%)\n",
            rec.payload[0] ? "split" : "block", (unsigned)rec.payload[1],
            (unsigned)reads, (unsigned)ffff, pm / 10, pm % 10);
     break;

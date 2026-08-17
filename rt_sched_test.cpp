@@ -40,6 +40,7 @@
 #include <obj_api.hpp>
 #include <object_id.hpp>
 #include <pico/stdlib.h>
+#include <log.hpp>
 
 namespace shizu {
 namespace {
@@ -117,7 +118,7 @@ void hog(uint32_t idx) {
 void reporter(uint32_t) {
   obj_api::sleep_us(3000000); // 他オブジェクト (BLE/センサ) の初期化完了を待つ
   g_armed = true;
-  printf("[RTTEST] armed: %lu victims + %lu hog(s) on core1, hog budget=%dus. "
+  log::printf("[RTTEST] armed: %lu victims + %lu hog(s) on core1, hog budget=%dus. "
          "PASS: core1 max_late bounded ~budget & ticks~exp; core0 near-zero; "
          "hog ADVANCING.\n",
          (unsigned long)NUM_VICTIMS, (unsigned long)HOG_COUNT,
@@ -136,7 +137,7 @@ void reporter(uint32_t) {
       uint32_t exp = WIN_US / VICTIMS[i].period_us;
       uint32_t wl = s.win_max_late_us;
       s.win_max_late_us = 0; // 窓リセット
-      printf("[RTTEST] %-9s late(win)=%luus late(max)=%luus overrun=%lu "
+      log::printf("[RTTEST] %-9s late(win)=%luus late(max)=%luus overrun=%lu "
              "ticks=%lu/%lu\n",
              VICTIMS[i].name, (unsigned long)wl, (unsigned long)s.max_late_us,
              (unsigned long)s.overruns, (unsigned long)d, (unsigned long)exp);
@@ -145,7 +146,7 @@ void reporter(uint32_t) {
       uint32_t cc = g_hog[h];
       uint32_t dh = cc - prev_hog[h];
       prev_hog[h] = cc;
-      printf("[RTTEST] hog%lu +%lu/2s %s\n", (unsigned long)h,
+      log::printf("[RTTEST] hog%lu +%lu/2s %s\n", (unsigned long)h,
              (unsigned long)dh, dh ? "ADVANCING" : "**STALLED**");
     }
   }

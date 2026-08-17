@@ -19,6 +19,7 @@
 #include <obj_api.hpp>
 #include <object_id.hpp>
 #include <pico/stdlib.h>
+#include <log.hpp>
 
 namespace shizu {
 namespace {
@@ -40,7 +41,7 @@ void reporter(uint32_t) {
   uint32_t prev[5] = {};
   while (true) {
     obj_api::sleep_us(2000000);
-    printf("[SMPSTRESS] c0=%lu,%lu c1=%lu,%lu mig=%lu %s\n",
+    log::printf("[SMPSTRESS] c0=%lu,%lu c1=%lu,%lu mig=%lu %s\n",
            (unsigned long)g_cnt[0], (unsigned long)g_cnt[1],
            (unsigned long)g_cnt[2], (unsigned long)g_cnt[3],
            (unsigned long)g_cnt[4],

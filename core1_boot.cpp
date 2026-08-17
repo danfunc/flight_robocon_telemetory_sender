@@ -97,7 +97,7 @@ void core1_kernel_launch() {
   idle.context->exc_return = 0xFFFFFFFD;        // 基本フレーム/PSP へ復帰
   idle.context->psplim = psplim;               // スタックオーバーフロー検出
   idle.context->control = CONTROL_PRIV_PSP; // カーネルオブジェクト (id=0) は常に特権
-  idle.call_stack.frames = kernel_arena_alloc_call_stack();
+  idle.call_stack.top = 0; // 退避先はスレッドスタック (事前確保なし)
   idle.call_stack.depth = 0;
   idle.affinity = AFFINITY_CORE1;
   idle.grant_budget_us = 0; // core1 idle もバトン組 (thread0 と同じ理由)

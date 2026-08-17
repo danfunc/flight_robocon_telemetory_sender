@@ -9,6 +9,8 @@
 #include <object_headers/FLIGHT_CONTROLLER.hpp>
 #include <object_headers/HELLO_WORLD.hpp>
 #include <object_headers/IO_CONTROLLER.hpp>
+#include <log.hpp>
+#include <object_headers/SHIZUKU_USB.hpp>
 #include <object_headers/LINE_SENSOR_DRIVER.hpp>
 #include <object_headers/TELEMETRY_SENDER.hpp>
 #include <object_headers/WS2812_DRIVER.hpp>
@@ -27,7 +29,32 @@ static uint32_t start_object(object_ids id, uintptr_t entry) {
 }
 
 void shizu::IO_CONTROLLER::main() {
-  printf("IO_CONTROLLER::init\n");
+  shizu::log::printf("IO_CONTROLLER::init\n");
+
+  // ---- ログ方針 (ここが唯一の決定点) ---------------------------------------
+  // 各ドライバは log::printf() を呼ぶだけで自分の出力先を知らない。どのオブジェクトの
+  // 出力をどこへ流すかは合成側であるここが決める — affinity/budget を async_call 側が
+  // 決めるのと同じ「機構はオブジェクト、方針は外」。再ビルドせずここ 1 箇所で
+  // 「うるさいドライバを黙らせる」「飛行中は BLE へ回す」等ができる。
+  //   USB    = 待たない (通常運転はこれ)
+  //   BLE    = 母艦へ。USB を挿せない飛行中用。接続前は届かない
+  //   PRINTK = ブロッキングで確実に出す。RT を壊すのでブート/切り分け専用
+  //   NONE   = 捨てる
+  // 既定 = Shizuku USB。全オブジェクトを明示的にそこへ向ける。
+  shizu::log::set_default_sink(shizu::log::sink::USB);
+  shizu::log::set_all_sinks(shizu::log::sink::USB);
+  // KERNEL_OBJECT だけ別扱い: カーネル自身の声 (call_error 等) は「排出スレッドが
+  // 生きていること」を前提にできない — その排出スレッドをスケジュールしているのが
+  // カーネルなので、スケジューラが怪しいときにこそ出したい。よって同期の PRINTK。
+  // ブロックしても上限は SDK クランプで ~1ms (CDC) + ~2ms (print_mutex) = budget 内。
+  shizu::log::set_sink((uint32_t)object_ids::KERNEL_OBJECT, shizu::log::sink::PRINTK);
+#if SHIZU_USB_DRIVER
+  // ★最初に起動する。printf のリング排出役なので、他オブジェクトが喋り始める前に
+  // 走っていてほしい (初回実行順 = スレッド番号昇順 = この async_call の順)。
+  // core0 既定 / budget 既定 (3ms) — 排出は 1 回あたり数百バイトで自発的に yield する
+  // ので、BLE のようなバトン組にする理由が無い (むしろ preempt できる方が安全)。
+  start_object(object_ids::SHIZUKU_USB, (uintptr_t)SHIZUKU_USB::main);
+#endif
   start_object(object_ids::WS2812_DRIVER, (uintptr_t)WS2812_DRIVER::init);
 
   // CYW43 の無線は排他利用のため、CYW43_BL_DRIVER (プロコン HID) と
@@ -58,7 +85,7 @@ void shizu::IO_CONTROLLER::main() {
   // Pico 2 (無印) テストビルド: BLE 無し。TELEMETRY の BLE_UART への call_method は
   // 対象未生成 = call_error::BAD_OBJECT で無害に返り (METHOD_CALL の型付きエラー化)、
   // TX ストリームは LOSSLESS 満杯 → メッセージ丸ごと破棄カウントで詰まらない。
-  printf("[IO] SHIZU_NO_BLE build: BLE_UART_DRIVER not started\n");
+  shizu::log::printf("[IO] SHIZU_NO_BLE build: BLE_UART_DRIVER not started\n");
 #endif
 
   // 飛行テレメトリ構成: BME280/BNO055 (I2C センサ) → TELEMETRY_SENDER が購読して融合し

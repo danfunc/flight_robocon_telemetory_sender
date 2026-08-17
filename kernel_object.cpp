@@ -304,20 +304,70 @@ static bool sched_pick_next(uint32_t self, uint32_t core, uint64_t now) {
 // メモリ API (SET/GET_OBJ_MEMORY) は obj_mem[呼び出し元 obj][slot] に格納するため、
 // オブジェクトごとに名前空間が分かれる (他オブジェクトのメモリは直接読めない)。
 // よってオブジェクト間のデータ受け渡しは「メソッド呼び出し + ポインタ渡し」で行う。
+#if SHIZU_SVC_DELEGATION
+// ---- svc ルート表 (サブシステムへの委譲) -----------------------------------
+// ★これは**カーネルではなくカーネルオブジェクト側**の表。カーネルは従来どおり
+//   「発行元が KERNEL_OBJECT か否か」しか判断しない (kernel.cpp 冒頭の不変条件)。
+//   svc 番号で経路を分けるのは「経路が決まった後の API 選択」= まさにここの仕事。
+// 別オブジェクトとして走らせる機構は新設しない — 既存の METHOD_CALL
+// (保護されたサブルーチン呼び出し) をそのまま使う。current object の張り替え/復元と
+// ネストは call_stack が既に担っているので、専用の戻り口も 2 枚 pop の非対称も要らない。
+struct svc_route_t {
+  uint16_t lo, hi;   // 担当する svc 番号の閉区間
+  uint8_t obj;       // 担当オブジェクト
+  bool used;
+  uint32_t entry;    // ハンドラ入口 (svc_handler_shim<F> のアドレス)
+};
+constexpr uint32_t SVC_ROUTES = 8;
+static svc_route_t g_svc_routes[SVC_ROUTES];
+uint32_t g_svc_route_hits = 0;
+#endif
+
+// 第 8 引数は shim の push 順から **r7** が届く (r12 ではない。svc_handler.hpp 参照)。
+// r7 = カーネルが打った「今のネスト数」= この活性化が走り出した時点の call_stack 深さ。
+// 以下の METHOD_EXIT は全てこれを arg3 に載せ返し、カーネル側の検算を通す。
 uint32_t kernel_obj_svc_handler(uint32_t r0, uint32_t r1, uint32_t r2,
                                 uint32_t r3, uint32_t r4, uint32_t r5,
-                                uint32_t r6, uint32_t r12) {
+                                uint32_t r6, uint32_t r7) {
   // printf("KERNEL_OBJ_SVC_HANDLER_ENTRY: r0=%lx, r1=%lx, r2=%lx, "
   //       "r3=%lx,r4=%lx,r5=%lx,r6=%lx\n",
   //       r0, r1, r2, r3, r4, r5, r6);
+#if SHIZU_SVC_DELEGATION
+  // ルート表に一致すれば担当オブジェクトのメソッドへ委譲する。呼び出しは通常の
+  // METHOD_CALL なので、担当オブジェクトとして走り、戻りも通常の METHOD_EXIT。
+  // ネストは call_stack がそのまま担う (このハンドラ自身が再入されるだけ)。
+  for (uint32_t i = 0; i < SVC_ROUTES; ++i) {
+    const svc_route_t &rt = g_svc_routes[i];
+    if (!rt.used || r4 < rt.lo || r4 > rt.hi)
+      continue;
+    // 担当オブジェクト自身が撃った syscall をそれ自身へ回すと無限ループになる。
+    if (rt.obj == r5)
+      break;
+    ++g_svc_route_hits;
+    // ★METHOD_CALL ではなく REDISPATCH_SVC。メソッド呼び出しにすると引数が 1 個に
+    // 潰れ、caller もカーネルオブジェクトに化けてしまう (= 誰が撃った syscall か
+    // 分からなくなる)。再ディスパッチならサブハンドラは r0..r3 と r4/r5/r6 を
+    // そのまま受け取り、ハンドラとして (in_handler=1) 走る。
+    result_t<uint32_t> rr =
+        ::svc<(uint32_t)shizu::kernel_object_svc_num::REDISPATCH_SVC>(
+            rt.entry, rt.obj, 0, 0);
+    // ★委譲そのものが失敗した場合 (対象不正 / call_stack 満杯) は r0 に理由が返り、
+    // r1 は書き換わっていない = 引数の残骸。そのまま値として流すと発行元には
+    // 「成功、戻り値は担当オブジェクト ID」に見えてしまうので、エラーとして透過する。
+    const uint32_t redispatch_err = (uint32_t)rr.result;
+    // サブハンドラの戻り値をそのまま呼び出し元へ返す (1 枚 pop で戻ってきている)。
+    svc<(uint32_t)shizu::kernel_object_svc_num::METHOD_EXIT>(
+        redispatch_err ? 0 : rr.value, 0, redispatch_err, r7, 0);
+  }
+#endif
   // 以下は臨時のset_md(4)
   if (r4 == 100) {
-    svc<(uint32_t)shizu::kernel_object_svc_num::METHOD_EXIT>(0, 0, 0, 0, 0);
+    svc<(uint32_t)shizu::kernel_object_svc_num::METHOD_EXIT>(0, 0, 0, r7, 0);
   }
   if (r4 == 255) {
     if (md_ok(r0, r1))
       md_table[r0][r1] = {r2, r3}; // 要改修
-    svc<(uint32_t)shizu::kernel_object_svc_num::METHOD_EXIT>(0, 0, 0, 0, 0);
+    svc<(uint32_t)shizu::kernel_object_svc_num::METHOD_EXIT>(0, 0, 0, r7, 0);
   }
 
   // API 番号のハイブリッド解釈: svc 命令の即値 (トランポリンが r4 に載せて渡す) が
@@ -350,7 +400,7 @@ uint32_t kernel_obj_svc_handler(uint32_t r0, uint32_t r1, uint32_t r2,
     uint32_t tid = shizu::FOR_KERNEL_OBJECT::async_call(
         r1 & 0x7Fu, (shizu::method_t)r2, r3, (r1 >> 8) & 0x3u,
         (r1 & (1u << 10)) ? 0u : shizu::BUDGET_KEEP);
-    svc<(uint32_t)shizu::kernel_object_svc_num::METHOD_EXIT>(tid, 0, 0, 0, 0);
+    svc<(uint32_t)shizu::kernel_object_svc_num::METHOD_EXIT>(tid, 0, 0, r7, 0);
     break;
   }
   case shizu::obj_api::svc_num::EXPORT_METHOD: {
@@ -360,7 +410,7 @@ uint32_t kernel_obj_svc_handler(uint32_t r0, uint32_t r1, uint32_t r2,
     break;
   }
   case shizu::obj_api::svc_num::EXIT_METHOD: {
-    svc<(uint32_t)shizu::kernel_object_svc_num::METHOD_EXIT>(r1, 1, 0, 0, 0);
+    svc<(uint32_t)shizu::kernel_object_svc_num::METHOD_EXIT>(r1, 1, 0, r7, 0);
     break;
   }
   case shizu::obj_api::svc_num::YIELD: {
@@ -413,7 +463,7 @@ uint32_t kernel_obj_svc_handler(uint32_t r0, uint32_t r1, uint32_t r2,
     svc<(uint32_t)shizu::kernel_object_svc_num::METHOD_EXIT>(
         (((uint32_t)grant_result.result & 0xFFFFu) << 16) |
             (grant_result.value & 0xFFFFu),
-        0, 0, 0, 0);
+        0, 0, r7, 0);
     break;
   }
   case shizu::obj_api::svc_num::SET_THREAD_BUDGET: {
@@ -423,6 +473,32 @@ uint32_t kernel_obj_svc_handler(uint32_t r0, uint32_t r1, uint32_t r2,
       shizu::thread_table[r1].grant_budget_us = r2;
     break;
   }
+#if SHIZU_SVC_DELEGATION
+  case shizu::obj_api::svc_num::SET_SVC_DELEGATE: {
+    // r1 = (lo<<16)|hi, r2 = (obj<<16)|method。担当オブジェクトは**明示指定**する
+    // (発行元から導出しない — 方針を持つのは合成側であってドライバ自身ではない)。
+    // カーネルへは降りない: この表はカーネルオブジェクトの持ち物。
+    const uint16_t lo = (uint16_t)(r1 >> 16), hi = (uint16_t)(r1 & 0xFFFFu);
+    const uint8_t obj = (uint8_t)(r2 & 0xFF);
+    const uint32_t entry = r3; // ハンドラ入口
+    uint32_t rc = 1;
+    if (lo <= hi) {
+      int slot = -1;
+      for (uint32_t i = 0; i < SVC_ROUTES; ++i)
+        if (g_svc_routes[i].used && g_svc_routes[i].lo == lo &&
+            g_svc_routes[i].hi == hi) { slot = (int)i; break; }
+      if (slot < 0)
+        for (uint32_t i = 0; i < SVC_ROUTES; ++i)
+          if (!g_svc_routes[i].used) { slot = (int)i; break; }
+      if (slot >= 0) {
+        g_svc_routes[slot] = {lo, hi, obj, true, entry};
+        rc = 0;
+      }
+    }
+    svc<(uint32_t)shizu::kernel_object_svc_num::METHOD_EXIT>(0, 0, rc, r7, 0);
+    break;
+  }
+#endif
   case shizu::obj_api::svc_num::SET_AFFINITY: {
     // r1=tid, r2=マスク (bit0=core0/bit1=core1)。u32 一語の advisory 書き込みで、
     // 確定は claim (try_claim) の CAS 側 — 反映は対象が次に READY になって
@@ -462,13 +538,13 @@ uint32_t kernel_obj_svc_handler(uint32_t r0, uint32_t r1, uint32_t r2,
                (unsigned long)r2);
     }
     svc<(uint32_t)shizu::kernel_object_svc_num::METHOD_EXIT>(
-        r.value, 0, (uint32_t)r.result, 0, 0);
+        r.value, 0, (uint32_t)r.result, r7, 0);
     break;
   }
   case shizu::obj_api::svc_num::CALL_METHOD_VIA_MD: {
     if (!md_ok(r1, r2)) {
       svc<(uint32_t)shizu::kernel_object_svc_num::METHOD_EXIT>(
-          0, 0, (uint32_t)shizu::call_error::BAD_OBJECT, 0, 0);
+          0, 0, (uint32_t)shizu::call_error::BAD_OBJECT, r7, 0);
       break;
     }
     result_t<uint32_t> r =
@@ -477,7 +553,7 @@ uint32_t kernel_obj_svc_handler(uint32_t r0, uint32_t r1, uint32_t r2,
     if ((uint32_t)r.result != 0)
       ++g_call_errors;
     svc<(uint32_t)shizu::kernel_object_svc_num::METHOD_EXIT>(
-        r.value, 0, (uint32_t)r.result, 0, 0);
+        r.value, 0, (uint32_t)r.result, r7, 0);
     break;
   }
   case shizu::obj_api::svc_num::SET_OBJECT_MD: {
@@ -486,7 +562,7 @@ uint32_t kernel_obj_svc_handler(uint32_t r0, uint32_t r1, uint32_t r2,
     break;
   }
   case shizu::obj_api::svc_num::GET_CURRENT_OBJ_ID: {
-    svc<(uint32_t)shizu::kernel_object_svc_num::METHOD_EXIT>(r5, 0, 0, 0, 0);
+    svc<(uint32_t)shizu::kernel_object_svc_num::METHOD_EXIT>(r5, 0, 0, r7, 0);
     break;
   }
   case shizu::obj_api::svc_num::SET_OBJ_MEMORY: {
@@ -496,7 +572,7 @@ uint32_t kernel_obj_svc_handler(uint32_t r0, uint32_t r1, uint32_t r2,
   }
   case shizu::obj_api::svc_num::GET_OBJ_MEMORY: {
     svc<(uint32_t)shizu::kernel_object_svc_num::METHOD_EXIT>(
-        mem_ok(r5, r1) ? obj_mem[r5][r1] : 0, 0, 0, 0, 0);
+        mem_ok(r5, r1) ? obj_mem[r5][r1] : 0, 0, 0, r7, 0);
     break;
   }
   // ---- ストリーム制御プレーン (include/stream.hpp)
@@ -519,7 +595,7 @@ uint32_t kernel_obj_svc_handler(uint32_t r0, uint32_t r1, uint32_t r2,
       stream_table[id].consumer_obj = NO_OBJ;
     }
     svc<(uint32_t)shizu::kernel_object_svc_num::METHOD_EXIT>((uint32_t)err, 0,
-                                                             0, 0, 0);
+                                                             0, r7, 0);
     break;
   }
   case shizu::obj_api::svc_num::OPEN_STREAM: {
@@ -528,7 +604,7 @@ uint32_t kernel_obj_svc_handler(uint32_t r0, uint32_t r1, uint32_t r2,
     stream::stream_desc_t *d =
         (id < stream::MAX_STREAMS) ? stream_table[id].desc : nullptr;
     svc<(uint32_t)shizu::kernel_object_svc_num::METHOD_EXIT>(
-        (uint32_t)(uintptr_t)d, 0, 0, 0, 0);
+        (uint32_t)(uintptr_t)d, 0, 0, r7, 0);
     break;
   }
   case shizu::obj_api::svc_num::BIND_STREAM: {
@@ -557,7 +633,7 @@ uint32_t kernel_obj_svc_handler(uint32_t r0, uint32_t r1, uint32_t r2,
       }
     }
     svc<(uint32_t)shizu::kernel_object_svc_num::METHOD_EXIT>((uint32_t)err, 0,
-                                                             0, 0, 0);
+                                                             0, r7, 0);
     break;
   }
   case shizu::obj_api::svc_num::CONNECT_STREAM: {
@@ -566,7 +642,7 @@ uint32_t kernel_obj_svc_handler(uint32_t r0, uint32_t r1, uint32_t r2,
     // コピー無しで dst へ流れる。戻り r1=stream::error (他の stream SVC と同規約)。
     stream::error err = connect_streams(r1, r2);
     svc<(uint32_t)shizu::kernel_object_svc_num::METHOD_EXIT>((uint32_t)err, 0,
-                                                             0, 0, 0);
+                                                             0, r7, 0);
     break;
   }
   case shizu::obj_api::svc_num::STREAM_WAIT:
@@ -574,21 +650,30 @@ uint32_t kernel_obj_svc_handler(uint32_t r0, uint32_t r1, uint32_t r2,
     // ブロッキング (空で SUSPEND → producer が push 後に wake) は claim/wake
     // 機構が 要るので後実装。現状はポーリングフォールバック: 即戻る (consumer
     // は while(pop()) + yield で回す)。
-    svc<(uint32_t)shizu::kernel_object_svc_num::METHOD_EXIT>(0, 0, 0, 0, 0);
+    svc<(uint32_t)shizu::kernel_object_svc_num::METHOD_EXIT>(0, 0, 0, r7, 0);
     break;
   }
   default: {
-    printf("undefined obj_svc_num\n"
-           "called_obj_svc_num: %lx\n",
-           r0);
+    // ★ここは**一般オブジェクト**からの呼び出し。未知の番号で panic すると
+    // 「任意のオブジェクトが svc 1 発で系を落とせる」ことになるので、
+    // **必ずエラーで返す** (§14 / I-9)。ただし**黙って捨てない** — 戻り値の
+    // エラーコードと印字の両方で発行元に見えるようにする。
+    printf("[OBJAPI] unknown svc num=%lu (r0=%lx) from obj=%lu thread=%lu\n",
+           (unsigned long)r4, (unsigned long)r0, (unsigned long)r5,
+           (unsigned long)r6);
+    svc<(uint32_t)shizu::kernel_object_svc_num::METHOD_EXIT>(
+        0, 0, (uint32_t)shizu::call_error::UNKNOWN_API, r7, 0);
     break;
   }
   }
 
-  svc<(uint32_t)shizu::kernel_object_svc_num::METHOD_EXIT>(0, 0, 0, 0, 0);
+  svc<(uint32_t)shizu::kernel_object_svc_num::METHOD_EXIT>(0, 0, 0, r7, 0);
   return 0;
 }
 
+// svc ハンドラの ABI シム (include/svc_handler.hpp と同一実装)。第 5..8 引数は
+// [sp+0/4/8/12] から取られるので、届くのは r4, r5, r6, **r7** (r12 ではない)。
+// r7 = カーネルが打った「今のネスト数」。
 template <auto T>
   requires std::invocable<decltype(T), uint32_t, uint32_t, uint32_t, uint32_t,
                           uint32_t, uint32_t, uint32_t, uint32_t>
@@ -639,6 +724,20 @@ void kernel_object_main() {
 #if SHIZU_RT_SCHED_TEST
   // RT スケジューラ検証 (合成周期 victim + hog + reporter)。締切ジッタを device 側で測る。
   shizu::rt_sched_test_launch();
+#endif
+#if SHIZU_UNPRIV_PROBE
+  // 非特権実行の最小プローブ (グローバル/stdlib 無し、状態はヒープ)。
+  shizu::unpriv_probe_launch();
+#endif
+#if SHIZU_SVC_DELEGATION && SHIZU_SVC_DELEGATE_TEST
+  // svc 委譲 (指定オブジェクトが syscall を捌く) の 2 段ネスト実証。
+  // ★カーネルの委譲経路 (トランポリン判定 / REDISPATCH / svc_trace) と、この
+  //   テストオブジェクト群を切り分けるために別トグルにしてある。委譲 ON のまま
+  //   ここだけ OFF にして起動すれば、無言ハングの原因がどちら側かが 1 回で決まる:
+  //     起動する → 犯人はテスト側 (2 段ネストの往復)
+  //     固まる   → 犯人はカーネルの委譲経路そのもの
+  //   cmake -DSHIZU_SVC_DELEGATION=ON -DSHIZU_SVC_DELEGATE_TEST=OFF
+  shizu::svc_delegate_test_launch();
 #endif
   // スレッド 0 (カーネルオブジェクト) は以降 round-robin のアイドル/スケジューラ心拍。
   // 次の runnable スレッドへ切替え、誰も居なければ (全員 sleep 中/未生成) スピンする。

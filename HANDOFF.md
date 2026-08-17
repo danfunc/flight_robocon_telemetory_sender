@@ -156,6 +156,155 @@ never-yield ホグ (core1, 既定 budget 3ms) を BLE と同居させ、代表�
 
 ---
 
+## 0.9 2026-08-10 追加分: BLE 接続時フリーズの実測原因 (cyw43 ではなく printf) + SHIZUKU_USB + ログ経路の外出し
+
+### 結論: 「BLE を接続するとフリーズする」の原因は printf だった
+実機 A/B (pico2_w, RT_SCHED_TEST 併用, BLE 接続/切断を各 n=3, シリアル非接続で計測):
+
+| 構成 | 単発 `cyw43_arch_poll` 最大 | RT `late(max)` |
+|---|---|---|
+| Stage1 + stdio 既定 | 1.006 / 1.006 / 1.005 s | 1.008 / 1.008 / 1.031 s |
+| Stage1 + stdio 非ブロック | 0.038 / 0.038 / 0.038 s | 0.056 / 0.046 / 0.046 s |
+
+値が常に **~1.005s と一定**なのが手がかりで、これは `PICO_STDIO_DEADLOCK_TIMEOUT_MS`=1000 そのもの。
+cyw43 SDK の `do_ioctl timeout` / `STALL` / `could not bring bus up` 警告は**全ログで一度も
+出ていない** = 無線側は正常だった。ドライバの printf の大半は btstack コールバック =
+`cyw43_arch_poll()` の**中**で出るため、これが「1 秒の LONG poll」に化けて cyw43 のせいだと
+誤認していた。
+
+### 待ちは 2 段ある (片方だけでは直らない)
+- **(外)** `pico_stdio` の `print_mutex` … `mutex_enter_block_until` は **WFE スピン**で
+  `PICO_STDIO_DEADLOCK_TIMEOUT_MS` (既定 1000ms) までコアを握る。**Shizuku の yield を
+  通らないのでスケジューラから手が出せない**。実測の 1.0s/2.0s はこれ。
+- **(内)** `pico_stdio_usb` の `out_chars` … CDC 満杯で `PICO_STDIO_USB_STDOUT_TIMEOUT_US`
+  (既定 500ms) まで `tud_task()` をビジー回し。
+
+`printf` は linker `--wrap` で pico_stdio に固定されており外側を差し替える口が無いので、
+外側は待ち時間そのものを 2ms へ詰めて潰す。**リングと組にして初めて安全** (リングのおかげで
+mutex 保持が memcpy 数µs になり 2ms タイムアウトはまず発火しない = 出力を落とさない)。
+リングだけ入れた中間状態は **1.015s のまま**だったので、両輪を必ず一組で有効化すること
+→ 有効化は CMake の `option(SHIZU_USB_DRIVER ... ON)` 1 箇所に集約し、`kernel.hpp` の
+`#ifndef` 既定は 0 のままにしてある。
+
+### 実装 (SHIZUKU_USB, object id 7)
+| 機能 | 実体 | 要点 |
+|---|---|---|
+| **非ブロッキング printf** | `SHIZUKU_USB.cpp` / `include/object_headers/SHIZUKU_USB.hpp` | 自前 `stdio_driver_t` がリング (8KB, .bss) へ積んで即 return。排出スレッドが `tud_cdc_write_available()` の**空き分だけ**を SDK の `stdio_usb.out_chars` へ渡すのでブロッキング分岐に構造的に入らない。tinyusb は据え置き (`tud_task()` は SDK の低優先度 IRQ が回すので干渉しない) |
+| **USB デバイス名の固有化** | CMakeLists `USBD_MANUFACTURER`/`USBD_PRODUCT` | ホストから product `Shizuku USB` / manufacturer `Shizuku` で見える。**VID/PID (0x2E8A:0x0009) は変えないこと** — `picotool` の reset-via-baud がこれで探すので `load -f` が壊れる。ホスト側ツールは製品名でポートを特定できる |
+| **ログ経路の外出し** | `include/log.hpp` / `log.cpp` / `IO_CONTROLLER.cpp` | `sink::{USB, BLE, PRINTK, NONE}`。**ドライバは出力先を知らないし選べない** (呼び出し元の識別は `get_current_obj_id()` = SVC なので名乗って迂回できない)。割り当ては合成側 (IO_CONTROLLER) の 1 箇所だけ。affinity/budget を `async_call` 側が決めるのと同じ「機構はオブジェクト、方針は外」 |
+
+**シンクの保証はそれぞれ違う** (用途で選ぶこと):
+
+| sink | 待つか | スケジューラ起動前 | 溢れたら |
+|---|---|---|---|
+| `USB` | 待たない | 溜めて後から排出 | 新しい方を破棄 |
+| `BLE` | 待たない | 不可 (接続が要る) | メッセージ破棄 |
+| `PRINTK` | **待つ** | 可 | 待って出す |
+| `NONE` | — | — | 捨てる (整形ごと省略) |
+
+`log::sink::USB` は `shizuku_usb_push()` でリングへ直接積むので **pico_stdio を通らない** =
+`print_mutex` を構造的に踏まない。生 `printf` より速く RT に安全。
+
+### 現在の割り当て (IO_CONTROLLER)
+全オブジェクト → `USB`、`KERNEL_OBJECT` だけ `PRINTK`。カーネル自身の声は「排出スレッドが
+生きていること」を前提にできない (その排出スレッドをスケジュールしているのがカーネル) ため。
+**ただし現状このエントリは不発** — `kernel.cpp`/`kernel_object.cpp`/`main.cpp`/`core1_boot.cpp`/
+`core1_io.cpp` は意図的に生 `printf` のまま (それでもリング経由で非ブロッキング)。理由:
+`log::printf` は `get_current_obj_id()` = SVC を撃つので、**IRQ 文脈 / SVC ハンドラ内 /
+Shizuku 起動前 / SENSOR_IO (svc は sleep_us のみ許可) では使えない**。カーネル側が採用する
+なら SVC を撃たない `log::printf_to(sink::PRINTK, ...)` を使うこと。
+
+### 実機検証 (すべて pico2_w)
+- **凍結解消**: シリアル接続状態 3/3 で単発 poll 0.038〜0.039s / RT `late(max)` 0.046〜0.047s /
+  1s 超ゼロ (修正前 1.006〜2.009s)。**ホストがポートを開いたまま読まない**最も厳しい条件でも
+  2/2 で 0.039〜0.041s (修正前 1.011s)。既定ビルド (フラグ無し) でも 0.038s。
+- **出力欠落 0 バイト** (`[USB] dropped` 未発火)。ログ行数はむしろ 342 → 397 行に増加
+  (従来はタイムアウト経路で printf が捨てられていた)。
+- **ログ経路の外出し**: ドライバのソースは同一のまま、合成側の割り当てを変えるだけで
+  `[BNO055]` の周期ログが 0 行 (`NONE`) / 20 行 (`USB`) / 20 行 (`PRINTK`) と切り替わることを確認。
+- **全ドライバ移行後**も healthy (`RT late(max)`=0.004s、`[CALL]`/`[PANIC-RING]` 沈黙)。
+
+### Stage 2 (独自 host-wake IRQ + cyw43 サービススレッド) について
+`SHIZU_CYW43_SVC_THREAD` は実装済み・実機で host-wake IRQ が動くことも確認したが、
+**この問題は解かない** (秒級ストールが残り、1 試行では 4.0s の RT フリーズと悪化)。
+既定 OFF のまま残してある。原因が printf だったので、cyw43 側の対処は不要だった。
+
+### 未検証で残っているもの
+- **リング溢れ (drop) 経路**: macOS が USB エンドポイントを吸い続けるためホスト側から
+  CDC を満杯にできず、`[USB] dropped` を一度も発火させられていない。起動時に 32KB を
+  一気に吐く自己テストを足せば潰せる。
+- **`sink::BLE`**: 母艦接続 + 認可が要るので未確認 (経路自体は既存の互換 `send_buf` と同じ)。
+  BLE_UART の TX ストリームは SPSC なので、複数オブジェクトが同時に流すと壊れる →
+  非ブロッキングなトークンで直列化し、取れなければ**その行を捨てる**実装にしてある。
+
+### 検証ツール (ホスト側、スクラッチパッド)
+`trial.py` (リブート→シリアル捕捉→BLE 接続/切断→指標抽出)、`trial_stalled.py`
+(ホストが読まない条件)。ポートは製品名 `Shizuku*` で自動発見する。判定は
+`poll ever` (単発 poll の起動来最大) と RT `late(max)`、および 1s 超の窓数。
+
+## 0.10 2026-08-17 追加分: XIP (フラッシュ QSPI) クロックを clk_sys から導出
+
+**実測まとめは `docs/XIP_FLASH_CLOCK.md`。要点だけ:**
+
+* **`PICO_FLASH_SPI_CLKDIV` は死んだつまみだった。** SDK 2.2 の RP2350 既定ビルドに
+  boot2 は入っておらず (`main.elf` に `.boot2` 無し)、QMI の `M0_TIMING` は
+  **ブート ROM の固定値 (div=3 / rx=2)** のまま。§0.8 以前の「300MHz は div=4 にして
+  復旧した」という記述は誤りで、効いていたのは `CYW43_PIO_CLOCK_DIV_INT=4` だけ。
+* 分周比が固定 = **フラッシュ速度が clk_sys に比例して勝手に動いていた**。
+  150MHz ビルド → 50MHz (遅すぎ) / 300MHz ビルド → 100MHz (偶然当たっていた)。
+  CYW43 PIO と同じ「固定分周の連鎖」で、向きだけが逆 (黙って定格超過側へ倒れる)。
+* **対処**: `flash_clock.cpp` / `include/flash_clock.hpp`。目標周波数
+  `SHIZU_FLASH_TARGET_KHZ` (既定 100000) を宣言し、`div = ceil(clk_sys / target)` を
+  実行時に導出する。1 つの値で 150MHz→75MHz / 300MHz→100MHz と両方正しくなる。
+  `set_sys_clock_khz` の**前**にも「上げた後の clk_sys」で一度適用する
+  (先に分周比を上げておかないと、クロックが上がった瞬間だけ定格超過になる)。
+  `[CLK] sys=... peri=... flash=...` で実測を必ず印字。
+* **ベンチ**: `cmake -DSHIZU_XIP_BENCH=ON` → `[XIP]` スイープ (`xip_bench.cpp`)。
+  16KB の XIP キャッシュに載らないよう 64KB に散らした 512 関数をランダムに呼んで
+  命令フェッチのストールを測り、同時に rot-xor チェックサムで**読み違いを検出**する
+  (速すぎる設定は落ちずに静かに誤読する)。`tools/xip_bench_check.py` で main.bin
+  から再計算して突き合わせること — ファーム内比較だけでは基準自体の破損を見逃す。
+  危険な設定も RAM 常駐コードで「データ照合が通ってから命令を踏む」順に試すので、
+  定格外まで 1 ブートで舐めても BOOTSEL 送りにならない。
+* **効き**: 300MHz で 50→100MHz にして命令フェッチ 1144→628 ns/call (-45%)、
+  系全体では core0 util 6.15%→5.70% (-7%)。ホットパスの大半はキャッシュに載って
+  いるので系全体の伸びは小さい。core1 (BLE poll) はポーリング周期律速で不変。
+* **★2026-08-17 追記: 300MHz + フラッシュ 100MHz を既定にした。** 引数なしの `cmake` で
+  この構成。戻すには `-DSHIZU_SYS_CLK_KHZ=0` (クロック非変更 = 150MHz)。
+  同時に **CYW43 の PIO SPI 分周も導出化** (`SHIZU_CYW43_SPI_TARGET_KHZ`=75000 から
+  `ceil`)。従来の `4` 直書きは 300MHz でだけ正しく、`-DSHIZU_SYS_CLK_KHZ=150000` を
+  明示すると SPI が半速になる潜在バグだった。WS2812 は元から clk_sys 由来 (`ws2812.pio:42`)、
+  I2C/PWM は SDK 算出、clk_peri も **PLL_SYS から分周して 150MHz** に
+  引き上げた (`SHIZU_PERI_TARGET_KHZ`、既定 150000)。`set_sys_clock_khz` は clk_peri を
+  PLL_USB 48MHz へ落とし、それだと **SPI 上限が clk_peri/2 = 24MHz** になるため。
+  RP2350 の clk_peri は分周器付き (2bit) なので **CPU 300MHz のまま周辺 150MHz** が可能で、
+  150MHz は定格 sys と同値 = 周辺としても定格内 (SPI 上限 75MHz)。
+  → clk_sys 依存の固定分周はこれで全滅。
+* **RXDELAY は窓の全域 (0..7) を測って中心に置く。** 100MHz の窓は実測 **rx=1..6**。
+  0..4 だけ測った段階では rx=2 が妥当に見えたが、全域では下端の隣だった。
+  端を知らずにマージンを語ってはいけない。
+  さらに**段数を直書きすると「そのクロックでだけ正しい値」になる** (150MHz では窓が
+  0..3 なので 3 は上端)。→ `SHIZU_FLASH_RXDELAY_PS` (既定 5000) で**遅延 [ps] を宣言**し
+  `ps×2×clk_sys` で段数を導出する形に統一。300MHz→3 / 150MHz→2。
+  **コア電圧も `SHIZU_VREG_MV` (既定 1200) に外出し**。`[CLK]` 行が実効値を全部印字する:
+  `sys=300000000 peri=48000000 flash=100000000 rx=3 (5000 ps) vreg=1200 mV`
+* **ダイ温度を常時監視**: `[BEACON] ... die=39.3C` (`main.cpp` の `die_temp_x10`、
+  ADC 最終チャネル)。300MHz / vreg 1.20V / 室温・机上で 39℃ = 余裕あり。
+  触感は根拠にならないので数字で残す。
+* **CPU クロックの天井 (実測)**: **1.20V で 372MHz / 1.30V で 432MHz**、その上は
+  ハング。**600MHz は不可。** 既定 300MHz の余裕は 24% (室温・core0 単独)。
+  熱は律速しない (全負荷 120s で 40.2℃ 飽和)。★**1.30V の天井を常用余裕の根拠に
+  しないこと** — 出荷電圧で測ると 60MHz 低い。探索は `-DSHIZU_OC_PROBE=ON`
+  (`oc_probe.cpp`): WDT + noinit フラグで固まっても自動復帰し、登り直さないので
+  **BOOTSEL 押しゼロ**。PLL は VCO=clk_sys×postdiv が 12MHz 整数倍かつ 750-1600MHz
+  でないと作れない (350/440/550MHz は不可)。詳細は `docs/XIP_FLASH_CLOCK.md`。
+* **注意**: フラッシュ書き込み (BTstack のペアリング鍵保存) の後は ROM の
+  `flash_enter_cmd_xip()` で **ROM 既定へ戻る** (壊れないが黙って遅くなる)。
+  ビーコンが `[FLASH] timing drifted` で報告する。再設定するなら core1 が止まって
+  いる `flash_safe_execute` の中で。
+
+---
+
 ## 0. 一言でいうと
 
 RP2350 (Cortex-M33 デュアルコア) 上の自作協調型マイクロカーネル **Shizuku** と、その上の

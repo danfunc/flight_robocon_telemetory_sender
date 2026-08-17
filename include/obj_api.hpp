@@ -35,6 +35,10 @@ enum struct svc_num : uint32_t {
   SET_AFFINITY = 22, // r1=tid, r2=affinity マスク (bit0=core0/bit1=core1)。次の yield で移動
   CONNECT_STREAM = 23, // r1=src id, r2=dst id。src の consumer 端と dst の producer 端を
                        // カーネル専有 DMA ポンプで直結 → r1(戻)=stream::error
+  SET_SVC_DELEGATE = 25, // r1=(lo<<16)|hi, r2=(obj<<16)|method。svc 番号の閉区間を
+                         // 担当オブジェクトのメソッドへ回すルートを登録する。表を持つのは
+                         // **カーネルオブジェクト側** (カーネルは KERNEL_OBJECT か否かしか
+                         // 見ない)。→ r0=0 成功 / 1 失敗
   SET_OBJECT_UNPRIVILEGED = 24, // r1=obj_id。MPU Step1 プロトタイプ: 以後このオブジェクト
                                 // は CONTROL.nPRIV=1 で走る。対象の create_object 直後・
                                 // async_call/create_thread **より前**に呼ぶこと (生成時に
@@ -168,6 +172,20 @@ struct run_for_result_t {
 [[maybe_unused]] static void set_object_unprivileged(uint32_t obj_id) {
   svci<svc_num::SET_OBJECT_UNPRIVILEGED>(obj_id);
 }
+
+#if SHIZU_SVC_DELEGATION
+// svc 番号の閉区間 [lo,hi] を (obj, method) へ回すルートを登録する。
+// ★担当は**明示指定**する — 方針を持つのは合成側であってドライバ自身ではない。
+// 委譲先は通常の METHOD_CALL で呼ばれるので、担当オブジェクトは事前に
+// export_method(method) しておくこと。ハンドラは普通の export メソッドと同じ書き方
+// (引数 arg0 = 発行元の r1、戻り値は exit_method の戻り値) でよい。
+[[maybe_unused]] static uint32_t set_svc_route(uint32_t lo, uint32_t hi,
+                                               uint32_t obj, uintptr_t entry) {
+  auto r = svci<svc_num::SET_SVC_DELEGATE>((lo << 16) | (hi & 0xFFFFu),
+                                           obj & 0xFF, entry);
+  return (uint32_t)r.result;
+}
+#endif
 
 __always_inline static void yield_until(bool (*condition)()) {
   while (1) {

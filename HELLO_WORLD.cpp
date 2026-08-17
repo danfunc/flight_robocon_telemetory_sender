@@ -8,6 +8,7 @@
 #include <object_headers/HELLO_WORLD.hpp>
 #include <object_id.hpp>
 #include <pico/time.h> // time_us_64 (プロセッサ時間 = 起動からの経過 us)
+#include <log.hpp>
 
 namespace shizu {
 
@@ -70,7 +71,7 @@ static void handle_line() {
       clock_offset_us = (int64_t)v - (int64_t)time_us_64();
       clock_synced = true;
       int64_t wall = (int64_t)time_us_64() + clock_offset_us;
-      printf("[HELLO_WORLD] time synced, wall=%lu s\n",
+      log::printf("[HELLO_WORLD] time synced, wall=%lu s\n",
              (unsigned long)(wall / 1000000));
     }
     break;
@@ -99,7 +100,7 @@ static void handle_line() {
     blast_bytes = 0;
     blast_end_us = time_us_64() + (uint64_t)secs * 1000000ull;
     blast_active = true;
-    printf("[HELLO_WORLD] blast start %lu s\n", (unsigned long)secs);
+    log::printf("[HELLO_WORLD] blast start %lu s\n", (unsigned long)secs);
     break;
   }
 
@@ -149,7 +150,7 @@ static void blast_step(char *line, int cap) {
                      (unsigned long)blast_seq, (unsigned long)blast_bytes);
     ble_send(line, n);
     blast_active = false;
-    printf("[HELLO_WORLD] blast end seq=%lu bytes=%lu\n",
+    log::printf("[HELLO_WORLD] blast end seq=%lu bytes=%lu\n",
            (unsigned long)blast_seq, (unsigned long)blast_bytes);
     return;
   }
@@ -165,7 +166,7 @@ static void blast_step(char *line, int cap) {
 }
 
 void HELLO_WORLD::main() {
-  printf("HELLO_WORLD::main\n");
+  log::printf("HELLO_WORLD::main\n");
 
   // RX 経由のコマンドを受け取れるよう、自分の rx_byte を
   // BLE_UART の rx_sink に登録する。

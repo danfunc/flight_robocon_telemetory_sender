@@ -23,6 +23,7 @@
 #include <obj_api.hpp>
 #include <object_headers/BME280_DRIVER.hpp>
 #include <pico/time.h>
+#include <log.hpp>
 
 namespace shizu {
 
@@ -62,7 +63,7 @@ static void on_ground(uint32_t press_pa, int16_t temp_cc) {
   ground_hpa = press_pa / 100.0f;
   ground_temp_c = temp_cc / 100.0f;
   g_ground_ready = true;
-  printf("[BME280] ground pressure = %lu Pa\n", (unsigned long)press_pa);
+  log::printf("[BME280] ground pressure = %lu Pa\n", (unsigned long)press_pa);
 }
 
 static void on_baro(uint32_t press_pa, int16_t temp_cc, uint32_t t_us) {
@@ -114,14 +115,14 @@ static void method_rezero(uint32_t _a, uint32_t _b, uint32_t _c, uint32_t _d) {
   core_ring::cmd_rec_t c = {};
   c.op = core_ring::CMD_REZERO;
   core_ring::g_cmd_stream.hdl().push_mp(c); // MP_PROD (BNO055 と共有)
-  printf("[BME280] rezero requested (async, ~1s)\n");
+  log::printf("[BME280] rezero requested (async, ~1s)\n");
 }
 
 // ===========================================================================
 //  オブジェクトエントリ
 // ===========================================================================
 void BME280_DRIVER::init() {
-  printf("[BME280] init (core1 stream, conversion on core0)\n");
+  log::printf("[BME280] init (core1 stream, conversion on core0)\n");
   export_method<method_read_latest>(BME280_DRIVER::METHOD_IDs::read_latest);
   export_method<method_rezero>(BME280_DRIVER::METHOD_IDs::rezero);
   export_method<method_set_paused>(BME280_DRIVER::METHOD_IDs::set_paused);
