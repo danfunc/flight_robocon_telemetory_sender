@@ -8,10 +8,16 @@ picotool/cmake/ninja)を ~/.pico-sdk から自動検出して埋め込む。SDK 
 このスクリプトを再実行すれば .vscode が追従する(手編集は不要)。
 
 生成物:
-  settings.json   env 注入 + CMake 設定 + ステータスバー Build/Deploy ボタン
-  tasks.json      Compile / Deploy(USB) / Flash(SWD) / Regenerate .vscode
-  launch.json     F5 = ビルド→openocd→load→main で停止 (cortex-debug, 要SWDプローブ)
+  settings.json   env 注入 + CMake 設定 + ステータスバー Build/Deploy/OTA ボタン
+  tasks.json      Compile / Deploy(USB) / Flash(SWD) / Bazel / OTA / GDB橋 / 再生成
+  launch.json     Pico Debug   = ビルド→openocd→load→main で停止 (要 SWD プローブ)
+                  GDB over BLE = 橋を起こして attach (プローブ不要・無線だけ)
   extensions.json 推奨拡張
+
+★ビルド系が 2 本ある。CMake (build/main.elf) が従来の経路で、Bazel
+  (bazel-bin/firmware_bazel/xno_bringup) が OTA と GDB-over-BLE が使う経路。
+  混ぜないこと —— OTA で送る像と GDB に食わせるシンボルは同じ物でないと、
+  「行番号だけずれた嘘のデバッグ」になる。
 
 c_cpp_properties.json / cmake-kits.json は管理対象外(そのまま残す)。
 
@@ -22,6 +28,7 @@ _tasks() を arch で分岐させる。今は rp2350 (pico2_w) のみ。
 import glob
 import json
 import os
+import shutil
 import sys
 
 HOME = os.path.expanduser("~")
@@ -54,6 +61,7 @@ CHIP_UP = "RP2350"
 
 # VS Code / タスクが使う Python インタプリタ。
 PYTHON = "/opt/homebrew/bin/python3"
+BAZEL = shutil.which("bazel") or "/opt/homebrew/bin/bazel"
 
 # ~ を VS Code 変数で。版数は生成時に確定させる。
 P = "${userHome}/.pico-sdk"
@@ -66,6 +74,17 @@ GDB_BIN = f"{P}/toolchain/{TOOLCHAIN}/bin/arm-none-eabi-gdb"
 SVD = f"{P}/sdk/{SDK}/src/{CHIP}/hardware_regs/{CHIP_UP}.svd"
 ELF = "${workspaceFolder}/build/main.elf"
 UF2 = "${workspaceFolder}/build/main.uf2"
+
+# ---- Bazel 側 (OTA / GDB-over-BLE が使う) ----------------------------------
+BAZEL_TARGET = "//firmware_bazel:xno_bringup"
+BAZEL_ELF = "${workspaceFolder}/bazel-bin/firmware_bazel/xno_bringup"
+# ★ソースを引くのに要る。bazel の DWARF は execroot からの相対パス
+#   (`external/shizuku+/...`, `firmware_bazel/main.cpp`) なので、gdb に
+#   execroot を教えないと「No such file or directory」になる。
+BAZEL_EXECROOT = "${workspaceFolder}/bazel-" + os.path.basename(ROOT)
+OTA_SEND = "${workspaceFolder}/tools/ota_send.py"
+GDB_BRIDGE = "${workspaceFolder}/tools/gdb_ble_bridge.py"
+GDB_BLE_PORT = 3333
 
 
 def _env(home_var: str, sep: str) -> dict:
@@ -128,6 +147,15 @@ def settings() -> dict:
                     "color": "#88c0d0",
                     "command": f"picotool load {UF2} -fx",
                 },
+                {
+                    # ★USB を挿さずに焼き替える。転送 50 秒 + commit 6.5 秒。
+                    "name": "$(radio-tower) OTA",
+                    "tooltip": "BLE だけで焼き替える (bazel build → 転送 → commit)",
+                    "color": "#ebcb8b",
+                    "singleInstance": True,
+                    "command": (f"{BAZEL} build {BAZEL_TARGET} && "
+                                f"{PYTHON} -u {OTA_SEND} --commit"),
+                },
             ],
         },
     }
@@ -172,6 +200,65 @@ def tasks() -> dict:
                 "problemMatcher": [],
             },
             {
+                "label": "Build (Bazel)",
+                "type": "process",
+                "command": BAZEL,
+                "args": ["build", BAZEL_TARGET],
+                "options": {"cwd": "${workspaceFolder}"},
+                "group": "build",
+                "presentation": {"reveal": "always", "panel": "dedicated"},
+                "problemMatcher": "$gcc",
+            },
+            {
+                # ★OTA のワンライナー。ota_send.py が .elf をそのまま食えるので、
+                #   .bin へ落とす手順は要らない (中身を見て自分で変換する)。
+                "label": "OTA Deploy (BLE)",
+                "type": "process",
+                "dependsOn": ["Build (Bazel)"],
+                "dependsOrder": "sequence",
+                "command": PYTHON,
+                "args": ["-u", OTA_SEND, "--commit"],
+                "options": {"cwd": "${workspaceFolder}"},
+                "presentation": {"reveal": "always", "panel": "dedicated"},
+                "problemMatcher": [],
+            },
+            {
+                # 本体には触れず、ステージングへ置くだけ (commit は後から
+                # `--commit-only` でよい — デバイスは flash から読み直して
+                # 検証するので、別の接続でかまわない)。
+                "label": "OTA Stage only (BLE)",
+                "type": "process",
+                "dependsOn": ["Build (Bazel)"],
+                "dependsOrder": "sequence",
+                "command": PYTHON,
+                "args": ["-u", OTA_SEND],
+                "options": {"cwd": "${workspaceFolder}"},
+                "presentation": {"reveal": "always", "panel": "dedicated"},
+                "problemMatcher": [],
+            },
+            {
+                # ★launch の "GDB over BLE" が preLaunchTask に使う常駐タスク。
+                #   isBackground なので、endsPattern の行が出た時点で
+                #   VS Code はデバッガの起動へ進む (スキャンに 15 秒かかるため、
+                #   「待つ」ことを明示しないと attach が先走って失敗する)。
+                "label": "GDB BLE bridge",
+                "type": "process",
+                "command": PYTHON,
+                "args": ["-u", GDB_BRIDGE, "--port", str(GDB_BLE_PORT)],
+                "options": {"cwd": "${workspaceFolder}"},
+                "isBackground": True,
+                "presentation": {"reveal": "always", "panel": "dedicated"},
+                "problemMatcher": {
+                    "pattern": {"regexp": "^$", "file": 1, "location": 2,
+                                "message": 3},
+                    "background": {
+                        "activeOnStart": True,
+                        "beginsPattern": "^found: ",
+                        "endsPattern": "^listening on ",
+                    },
+                },
+            },
+            {
                 "label": "Regenerate .vscode",
                 "type": "process",
                 "command": PYTHON,
@@ -207,7 +294,32 @@ def launch() -> dict:
                     "monitor reset init",
                     f'load "{ELF}"',
                 ],
-            }
+            },
+            {
+                # ★プローブ無しで止めて覗く。SWD の halting debug と違って
+                #   DebugMonitor なので **止まるのは対象のスレッドだけ** ——
+                #   BLE も走り続ける (走り続けないと RSP を運べない)。
+                #   対象は main.cpp が stub に渡したスレッド (blink)。
+                "name": "GDB over BLE (attach)",
+                "preLaunchTask": "GDB BLE bridge",
+                "type": "cortex-debug",
+                "request": "attach",
+                "servertype": "external",
+                "gdbTarget": f"localhost:{GDB_BLE_PORT}",
+                "cwd": "${workspaceFolder}",
+                "gdbPath": GDB_BIN,
+                "executable": BAZEL_ELF,
+                "device": CHIP_UP,
+                "svdFile": SVD,
+                # ★`target extended-remote` を撃たせない。stub が喋るのは
+                #   素の remote プロトコルだけなので、既定の attach 手順に
+                #   任せず自分で並べる。
+                "overrideAttachCommands": [
+                    f'directory "{BAZEL_EXECROOT}"',
+                    f"target remote localhost:{GDB_BLE_PORT}",
+                ],
+                "overrideRestartCommands": [],
+            },
         ],
     }
 

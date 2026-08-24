@@ -1,0 +1,51 @@
+{
+    "version": [
+        1,
+        0
+    ],
+    "unpartitioned": {
+        "families": [
+            "absolute",
+            "data"
+        ],
+        "permissions": {
+            "secure": "rw",
+            "nonsecure": "rw",
+            "bootloader": "rw"
+        }
+    },
+    "partitions": [
+        {
+            "name": "A",
+            "id": 0,
+            "start": "8k",
+            "size": "1536k",
+            "families": [
+                "rp2350-arm-s"
+            ],
+            "permissions": {
+                "secure": "rw",
+                "nonsecure": "rw",
+                "bootloader": "rw"
+            }
+        },
+        {
+            "name": "B",
+            "id": 1,
+            "start": "1544k",
+            "size": "1536k",
+            "families": [
+                "rp2350-arm-s"
+            ],
+            "link": [
+                "a",
+                1
+            ],
+            "permissions": {
+                "secure": "rw",
+                "nonsecure": "rw",
+                "bootloader": "rw"
+            }
+        }
+    ]
+}

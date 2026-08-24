@@ -1,0 +1,41 @@
+# flight_robocon_telemetory_sender — Bazel ビルド (BLE core1化 + 接続フリーズ修正の
+# Shizuku 移植用。既存 CMake ビルドとは並存させる。詳細は
+# ~/.claude/plans/ancient-cuddling-adleman.md)。
+#
+# Shizuku (~/github/Shizuku) の MODULE.bazel をひな形にしている。
+module(
+    name = "flight_robocon_xno",
+    version = "0.1.0",
+)
+
+bazel_dep(name = "platforms", version = "0.0.9")
+bazel_dep(name = "bazel_skylib", version = "1.6.1")
+bazel_dep(name = "rules_cc", version = "0.0.10")
+bazel_dep(name = "pico-sdk", version = "2.2.0")
+
+local_path_override(
+    module_name = "pico-sdk",
+    # Shizuku 側と同じ SDK を指す。マシンが変わったらここを更新する。
+    path = "/Users/ishigakiyua/.pico-sdk/sdk/2.2.0",
+)
+
+bazel_dep(name = "shizuku", version = "0.1.0")
+
+local_path_override(
+    module_name = "shizuku",
+    # ★開発中は隣のワークツリーを直接指す。将来 git リモートに切り替える場合は
+    #   ここを git_override(module_name="shizuku", remote=..., commit=...) にする。
+    path = "/Users/ishigakiyua/github/Shizuku",
+)
+
+# pico-sdk のツールチェーンは dev_dependency 登録なので、利用側が明示的に登録する。
+register_toolchains(
+    "@pico-sdk//bazel/toolchain:mac-aarch64-rp2040",
+    "@pico-sdk//bazel/toolchain:mac-aarch64-rp2350",
+    "@pico-sdk//bazel/toolchain:mac-x86_64-rp2040",
+    "@pico-sdk//bazel/toolchain:mac-x86_64-rp2350",
+    "@pico-sdk//bazel/toolchain:linux-x86_64-rp2040",
+    "@pico-sdk//bazel/toolchain:linux-x86_64-rp2350",
+    "@pico-sdk//bazel/toolchain:linux-aarch64-rp2040",
+    "@pico-sdk//bazel/toolchain:linux-aarch64-rp2350",
+)

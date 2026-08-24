@@ -560,8 +560,9 @@ void export_method(uint32_t obj_num, uint32_t method_num, method_t entry) {
 // 「今のネスト数」。r7 をそのまま arg3 に載せるので、この経路の 1 段 pop も
 // カーネル側の検算を通る (旧実装は無検査で、段数がズレると無音でロックアップした)。
 // naked なのは r7 を確実に捕まえるため — 通常関数だとプロローグで壊され得る。
-__attribute__((naked)) void exit_method(uint32_t return_code) {
-  (void)return_code;
+// ★clang は naked 関数に非 asm 文を一切許さない (GCC は許す) ので、引数は
+// 名前を付けず (void)return_code; も書かない。値は r0 に載ったまま asm が使う。
+__attribute__((naked)) void exit_method(uint32_t /* return_code */) {
   asm volatile("mov  r1, #0\n"  // arg1 = 追加 pop 段数 0 → 1 枚だけ落とす
                "mov  r2, #0\n"  // arg2 = エラーコード (成功)
                "mov  r3, r7\n"  // arg3 = 申告する「今のネスト数」
@@ -580,8 +581,7 @@ __attribute__((naked)) void exit_method(uint32_t return_code) {
 // ★これが「一般オブジェクトに特権を渡さずに戻る」ための唯一の口。ここを exit_method
 // (生 201) にすると一般オブジェクトがカーネルプリミティブを叩けることになり、
 // SET_SVC_HANDLER 等のバイパスに繋がる。
-__attribute__((naked)) void delegate_exit_method(uint32_t return_code) {
-  (void)return_code;
+__attribute__((naked)) void delegate_exit_method(uint32_t /* return_code */) {
   asm volatile("mov  r1, r0\n"   // obj_api の引数は r1..r3 (r0 は予約)
                "mov  r0, #0\n"
                "mov  r2, #0\n"
