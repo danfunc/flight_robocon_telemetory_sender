@@ -198,9 +198,12 @@ uintptr_t poll_loop(uintptr_t, uintptr_t, uintptr_t, uintptr_t) {
   uint32_t since_report = 0;
   uint32_t fail_count = 0;
   while (true) {
+    // ★実験 (2026-08-26): 遅れている周回でも **必ず** SLEEP_US を通す。
+    //   関門 (停止中は抜けない) が sleep_us の中にあるので、呼ばない周回は
+    //   素通りしてしまう、という仮説の検証。
     const int64_t remaining = (int64_t)(next - BOARD::time_us());
-    if (remaining > 0)
-      api(shizuku::object_api::SLEEP_US, (uintptr_t)remaining);
+    api(shizuku::object_api::SLEEP_US,
+        (uintptr_t)(remaining > 0 ? remaining : 0));
     next += PERIOD_US;
 
     int16_t r[9];

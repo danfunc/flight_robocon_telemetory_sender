@@ -8,10 +8,17 @@
 **実機で完走**している。
 
 ```
-transfer done: 396644 bytes in 50.8s (7.6 kB/s)
-device: done: 396632 bytes crc=e406c5a0 OK (staged at 0x180000)
-RESULT: staged OK
+  deflate: 269611 bytes on the wire (67.2%)
+  device: ready
+transfer done: 269611 bytes in 9.1s (29.0 kB/s)
+  device: done: 401072 bytes crc=dc5d64e5 OK (staged at 0x180000)
+  device: time: 10182ms = erase 726 (7 blk) + program 881 + inflate 1541 + link 7034
+  device: commit: 401072 bytes -> 0x0 (7 blocks), no return
+  [  7.3s] device is back and talking
+RESULT: committed and rebooted (verified on attempt 2)
 ```
+
+**速度 (2026-08-24 に作業。転送 51.3s → 9.1s、全体 78.7s → 19.9s)**
 
 **commit (ステージング → 本体へコピーして再起動) も 2026-08-24 に実装し、
 実機で 2 回通した。** USB を一切挿さずに (AC アダプタ給電のまま) 焼き替わる。
@@ -186,6 +193,115 @@ arm-none-eabi-objdump -d --start-address=0x$ADDR \
 - BLE は commit 開始の時点で切れる。ホスト側は「`commit:` の行が出て、
   そのあと黙って切れる」を成功の合図にしている (`tools/ota_send.py`)。
 
+## 速度: どこに時間が行っているか (2026-08-24)
+
+| | 前 | 後 |
+|---|---|---|
+| 転送 | 51.3s (7.6 kB/s) | **9.2s** (28.5 kB/s) |
+| 全体 (焼き替え 1 回) | 78.7s | **20.1s** |
+
+デバイス側の内訳 (staging 3 回の中央値): 消去 745ms (7 ブロック) +
+書き込み 895ms + 展開 615ms + リンク 8050ms。**リンクが 8 割**。
+
+効いた順に 4 つ。**測ってから直した** —— 最初に効くと思った所は 2 番目だった。
+
+### 1. write with response をやめた (7.6 → 28.5 kB/s)
+
+応答付きは 1 write = 1 往復 ≒ 2 CI (30ms) で、244B/30ms = 8 kB/s が上限。
+非応答なら 1 つの接続イベントに複数パケットが載る。**ただし bleak は
+response=False を CoreBluetooth へ投げっぱなしにする** (backends の
+write_characteristic は非応答では何も待たない)。流量制御は
+`peripheral.canSendWriteWithoutResponse()` を自分で見て作る。
+
+★**28.5 kB/s が macOS 側の天井**。ゲートを外しても、オーバーシュートを
+2/4/8/16 パケット許しても変わらないことを実測で確認した (64KB を送り分けて
+比較)。ゲート無しで 4ms 間隔まで詰めると届かなくなる (= 空を撃っている)。
+**上げる手はもう無い。減らす方に行くしかない。**
+★2M PHY は CYW43 の BT ファームが非対応なので使えない (ユーザー確認済み)。
+
+### 2. 消去を 4KB セクタから 64KB ブロックへ (5.3s → 0.7s)
+
+消去は「バイトあたり」ではなく **「コマンドあたり」が重い**。4KB セクタ消去
+(20h) は 1 回 55ms で、98 回やると 5.4 秒。64KB ブロック消去 (D8h) なら
+7 回 0.7 秒。ROM の `flash_range_erase` は範囲がブロックに揃っていれば
+自動で D8h を使うので、**呼び方を変えるだけ**で済む。
+staging 側と commit 側の両方に効く。
+
+### 3. deflate で送るバイトを 67% に (13.6s → 9.2s)
+
+ARM の像は deflate で 67% に落ちる。展開はデバイス側 (`inflate.hpp`)。
+★セクタ差分は**測って捨てた** —— 1 関数だけ変えた 2 つのビルドで
+**98/98 セクタ全部が変わる** (コード配置がずれる) ので、意味が無い。
+
+### 4. 固定待ちを消した
+
+「判定を 5 秒待つ」「commit 後 20 秒待つ」をやめて、出た行と実際の再接続で
+判断する。★**スキャンで見つかったことを成功の合図にしない** —— macOS は
+一度見つけた相手を覚えていて、まだ焼いている最中でも即座に返す
+(実測: commit から 0.9 秒で「戻った」と出たが、消去と書き込みだけで 1.7 秒
+かかる)。繋いで喋らせるまで確かめる。
+
+### 5. 展開をテーブル引きに (1.54s → 0.62s)
+
+最初は puff.c と同じ「1 記号ずつビットを歩く」だけで書いたが、実機で
+0.9〜1.5 秒かかった。deflate の符号は圧倒的に 9 ビット以下なので、
+**9 ビットぶんの表 (512 語 = 1KB/表) を引けばほぼ 1 発で決まる**。
+表に載らない長い符号だけ元の歩く道へ落ちるので、**正しさの根拠は変わらない**
+(表はその手続きの答えを先に並べただけ)。
+
+★引く鍵は**符号を反転したもの**。deflate はビットを LSB 先頭で読むのに
+ハフマン符号は MSB 先頭で組まれている。ここを取り違えると「たまに合う」表に
+なり、化け方が入力依存になって一番追いにくい。
+
+★表を足したぶん作業領域が 3.3KB になったので、**スタックから .bss へ出した**
+(`tiny_inflate::state` を呼び出し側が持つ)。スレッドのスタックに 3.3KB 積むと
+静かに食い潰す。
+
+### まだ残っている (やっていない)
+
+- 起動に `sleep_ms(1000)` (USB CDC の列挙待ち) が入っていて、焼き替え 1 回
+  ごとに丸ごと乗る。
+- **リンクの 8.0s は 28.5 kB/s の天井そのもの**。これ以上は圧縮率でしか
+  動かない。LZMA なら 54% (deflate は 67%) まで行けるので 1.5 秒ぶん
+  縮むが、展開器は桁違いに重くなる。**割に合うかは未判断**。
+- commit 後の復帰確認に 7 秒かかっている。うち大半はデバイスの起動と
+  BLE が上がるまでで、こちらの待ち方 (5 秒スキャン + 1 秒リトライ) も
+  保守的。
+
+## ★踏んだ: 長い IRQ 停止が CYW43 を道連れにする (2026-08-24)
+
+**転送しながら 64KB ブロック消去 (105ms) をやると CYW43 が壊れる。**
+
+```
+got unexpected packet 0
+[CYW43] Bus error condition detected 0xb32f
+[CYW43] do_ioctl(2, 263, 16): timeout
+```
+
+そのまま commit まで行ったら、**再起動後に完全に沈黙した** —— USB は列挙
+されるのに CDC は 2 本とも無音、`picotool -f` の強制 BOOTSEL も効かない。
+BOOTSEL からの焼き直しでしか戻らなかった。
+
+理屈: `flash_safe_execute` は両コアを止めて IRQ を切る。その間 CYW43 を
+相手にする SPI/PIO の面倒を誰も見られない。転送速度が 4 倍になって
+パケット密度が上がった結果、停止が転送の途中に当たる確率も上がった。
+
+**対策 (両方入れてある)**:
+
+1. **消去は転送を始める前に済ませる**。ヘッダを受けた時点で必要な範囲を
+   全部消し、`ready` を返す。ホストはその行を見てから流し始める
+   (`tools/ota_send.py`)。転送中に止まるのは書き込みの ~9ms だけになる。
+2. **commit の前に BLE を切る**。commit は両コアを 1.7 秒止めるので、
+   繋いだままだと転送中の 16 倍の時間だけ CYW43 を放置することになる。
+   ★切るのを頼むだけにして、`gap_disconnect` は **ble_uart の poll ループ**
+   が呼ぶ (`REQUEST_DISCONNECT`)。呼び出し元スレッドから btstack を触ると
+   それ自体が CYW43 の SPI を壊す (ble_uart.hpp の SEND 廃止と同じ罠)。
+
+**中断された転送も捨てるようにした**。途中で切れると「残りを待つ」状態で
+居座り、**次の転送のヘッダをその続きとして食う** (実測: 前の実験の CRC を
+`want=` に出して MISMATCH になった)。5 秒バイトが来なければ捨てて待ち受けへ
+戻る。
+
 ## GDB を BLE で使う (2026-08-24 実装・実機で通した)
 
 OTA と同じ 1 本の BLE リンクで、**プローブ無しでデバッガが刺さる**。
@@ -203,6 +319,145 @@ arm-none-eabi-gdb bazel-bin/firmware_bazel/xno_bringup \
 VS Code からは **F5 → "GDB over BLE (attach)"**。橋は preLaunchTask
 (`GDB BLE bridge`) が起こす。
 
+### スレッドを選ぶには non-stop が要る — ただし **CLI 限定** (2026-08-25)
+
+**サーバは対応済み** (`qSupported` で `QNonStop+` を出し、`QNonStop:1` を受け、
+`%Stop` の非同期通知と `vStopped` まである。D53)。GDB は `set non-stop on`
+されていないと `QNonStop:1` を送らないので、**繋ぐ前に**立てる:
+
+```sh
+arm-none-eabi-gdb bazel-bin/firmware_bazel/xno_bringup \
+  -ex 'set non-stop on' \
+  -ex 'directory bazel-flight_robocon_telemetory_sender' \
+  -ex 'target remote :3333'
+```
+
+実測 (BLE 経由、2.1s、パケットエラー 0):
+
+```
+  Id   Target Id     Frame
+  1    Thread 1      (running)
+  2    Thread 2      (running)
+* 3    Thread 3      shizuku::archs::armv8m::syscall (...) at armv8m.hpp:383
+  4-13 Thread 4-13   (running)
+```
+
+13 本全部見え、`thread N` で切り替わる (`[Switching to thread 6]`)。
+
+### ★★VS Code では non-stop を使わない (表示が嘘になる)
+
+**DAP は単一プロセス内のスレッドを前提**にしていて、停止も再開もプロセス単位。
+Shizuku のスレッドは実質「別プロセス」なので、そもそも噛み合わない。実際に
+non-stop で繋ぐと、13 本は並ぶが **全部 running か全部 paused のどちらか**に
+なり、per-thread の状態が出ない (2026-08-25 実測)。
+
+→ **VS Code は all-stop** (`.vscode` の "GDB over BLE (cppdbg)")。all-stop なら
+スタブは**止まっているものだけ**を見せるので、対象 1 本だけが並び、他は GDB
+から見えないまま走り続ける。**嘘が無い**。13 本見たいときは CLI を使う。
+
+★**cortex-debug は使わない**。SWD プローブ + all-stop 前提の作りで、
+`overrideAttachCommands` を走らせる**前に自分で繋いでしまう**ため、接続前にしか
+変えられない設定 (`non-stop` / `mi-async`) を渡せない:
+
+```
+Cannot change this setting while the inferior is running.
+Failed to launch GDB: ... (from interpreter-exec console "set mi-async on")
+```
+
+素の `cppdbg` (ms-vscode.cpptools) なら `setupCommands` が確実に接続前に走る。
+`launchCompleteCommand: "None"` を付けて、繋いだあと run も continue も
+させないこと (既に走っている的なので)。
+
+### 覗く相手を実行時に選ぶ — `monitor` (2026-08-25 実装)
+
+all-stop では「止まっているものだけ」が GDB に見えるので、**対象を選べないと
+合成時に決めた 1 本しか触れない**。`qRcmd` を実装して選べるようにした。
+
+```
+(gdb) monitor list
+  1  root           running
+  3  blink          stopped   <- target
+  6  gdbserver      running
+  7  ble_uart       running   [transport: 止められない]
+ 10  telemetry      running
+ 11  flight_controller running
+ 12  bno055         running
+(gdb) monitor target 10
+target is now 10 (telemetry)
+```
+
+VS Code なら DEBUG CONSOLE に `-exec monitor target 10`。起動時に決め打ちに
+したければ `launch.json` の `postAttachCommands` に書く。
+
+**名前は `DECLARE_NAME` のもの**を出している (`qThreadExtraInfo` を実装した)。
+`info threads` にも出る:
+
+```
+* 1  Thread 3 (blink [stopped])                syscall (...) at armv8m.hpp:383
+  2  Thread 10 (telemetry [stopped] *target*)  syscall (...) at armv8m.hpp:383
+```
+
+★★**転送スレッドは選べない**。止めた瞬間に RSP を運ぶ者が居なくなり、
+**止めた本人が復旧できない** (無線だと電源再投入まで戻らない)。`ble_uart` が
+起動時に `gdb_link_protect_thread()` で申告し、stub が弾く:
+
+```
+(gdb) monitor target 7
+7 is the debug transport — 止めると自分が喋れなくなる
+```
+
+★★★**本来これは System Object が持つべき制約** (誰が誰を止めてよいか)。
+stub が自前の表で守るのは、資源の階層がまだ無いための繋ぎ。入ったら移すこと。
+
+### 未解決: 一時停止ボタンが必ず対象スレッドを止める
+
+VS Code で止めるボタンを押すと**必ず「今の対象」が止まる** (`monitor target`
+で変えられるようになったので実害は減ったが、選んだスレッドを止めているわけ
+ではない)。
+`vCont;t` はスレッド指定が無いと `resume_thread_id()` = 既定に倒れるため
+(`gdb_stub.cpp`)。RSP の仕様では「スレッドを書かないアクション = 他に
+書かれていない全スレッドへの既定動作」なので `vCont;t` 単独は本来
+「全部止めろ」だが、**この構成で全部止めると BLE の poll スレッドまで
+止まり、デバッガ自身が喋れなくなる**。直すなら「止めてよいスレッド」の
+線引きが要る。Shizuku 側 server の話。
+
+★調べる道具は用意してある: `tools/gdb_ble_bridge.py --log FILE` で RSP を
+そのまま記録できる (VS Code のデバッグタスクは常に
+`.vscode/rsp-last.txt` へ記録する)。
+
+### 未解決: 前のセッションの通知が次へ漏れる疑い
+
+non-stop のセッションのあとに all-stop で繋ぐと、GDB が
+
+```
+gdb/thread.c:1434: internal-error: switch_to_thread: Assertion `thr != NULL' failed.
+```
+
+で落ちたことが 1 度ある。別の機会に記録を取ったときには、**`QNonStop:1` の
+ネゴシエーションより前に** `%Stop:T05thread:3;` が飛んでいた。スタブ側に
+「握手が済むまで通知を送らない」判断はあるので (`g_notify_allowed`)、切断時の
+リセット漏れが疑わしい。**再現手順は未確定**。
+
+### ★踏んだ: 長い返事が BLE で欠ける (2026-08-25, 修正済み)
+
+D53 で `target.xml` (830 文字) を返すようになった瞬間に出た。症状は
+
+```
+Ignoring packet error, continuing...
+Ignoring packet error, continuing...
+⏱  224.232s        ← attach するだけで。前は 1.5 秒
+```
+
+原因は Shizuku 側 `gdb_stub.cpp` の `flush_out()` が満杯のまま `push()` して
+いたこと。**`stream::push` は LOSSLESS 旗が無ければ古いレコードを黙って
+上書きして `true` を返す**ので、欠けたことに誰も気付けない。リングは
+8 スロット x 64B = **512 バイト**しかなく、830 文字は**1 パケットが丸ごと
+入らない**ので、待たない限り必ず欠ける。
+
+同じ話の CDC 側 (`write_byte`) は先に直っていた。FIFO が大きいぶん露見しにくく、
+**転送をストリームに替えた側だけ取り残されていた**。CDC 側と対称に、空くまで
+上限付きで待って譲るようにした。
+
 - **止まるのは対象のスレッドだけ**。SWD の halting debug と違い DebugMonitor
   なので、BLE もテレメトリも走り続ける —— **走り続けないと RSP が運べない**
   ので、これは都合ではなく前提。対象は `main.cpp` が stub に渡したスレッド
@@ -215,8 +470,13 @@ VS Code からは **F5 → "GDB over BLE (attach)"**。橋は preLaunchTask
   launch.json は `overrideAttachCommands` で明示している。
 - 認可されていないリンクからの RSP はデバイス側で捨てる (fail-closed)。
   GDB は任意のメモリ読み書きとレジスタ操作そのものなので、ペアリング必須。
-- ★橋とテレメトリ/OTA は **同じ 1 接続を取り合う**。橋を上げている間は
-  `ota_send.py` は繋がらない。先に橋を落とすこと。
+- ★★**橋とテレメトリ/OTA は同じ 1 本の接続を取り合う**。橋が握っている間
+  デバイスは advertise しないので、`ota_send.py` は **「device not found」**
+  で落ちる —— これが「GDB の後は焼けない」の正体だった (2026-08-24 に再現)。
+  VS Code の background タスクはデバッグセッションが終わっても勝手には
+  止まらないので、**橋は GDB が切れたら自分から終わる** ようにしてある
+  (`--stay` で居座らせられる)。`ota_send.py` 側も、見つからないときは
+  橋が動いていないか調べて名指しする。
 
 実測 (2026-08-24, pico2_w, AC 給電・USB 未接続):
 
@@ -230,10 +490,40 @@ interval_ms(lr)=1200  step(r4)=-100
 ブレークポイント (FPB) も効く。上は OTA で入れた blink の掃引が実機で
 動いていることを、LED を目で見るのではなく**レジスタの値で**確かめたもの。
 
+### attach すると必ず `armv8m.hpp:383` で止まっているのはなぜか
+
+**ブレークポイントではない。** スタブは attach された瞬間に対象スレッドを
+止める (`kernel_instance.suspend(g_target_thread)`、「繋いできた側は止まって
+いることを期待している」)。対象は `main.cpp` が渡した **blink** で、blink は
+300〜1500ms の `SLEEP_US` でほぼ寝ているので、**捕まえると必ずその syscall の
+中にいる**。`armv8m.hpp:383` は `svc 0` の**直後の行** (`return {r0, r1};`) で、
+寝ているスレッドの PC が自然に居る場所。
+
+対象を変えたいなら `main.cpp` の `start_gdb_stub_over_stream()` に渡す
+スレッド番号を変える (non-stop なら他のスレッドは走ったまま見える)。
+
 ## 既知の未解決
 
-- 転送を中断すると、その後デバイスが advertise を再開しないことがある
-  (USB CDC は生きている)。要調査。いったん再起動すれば戻る。
-- スループット 7.6 kB/s は BLE の上限 (約 16 kB/s) の半分。`response=True` で
-  1 往復ごとに CI を待つため。上げるなら「`response=False` + ホスト側で明示的に
-  ペーシング + 受信リングを大きく」だが、流量制御を自前で持つことになる。
+- **advertise していないときは、控えたアドレスで直接繋ぐ** (2026-08-25 対策)。
+  BLE のリンクは 1 本しかなく、誰かが繋いでいる間デバイスは advertise しない。
+  ★**掴まれている相手でもアドレスが分かれば 0.7 秒で繋がる**ことを実測した。
+  `tools/shizuku_link.py` の `find_device()` が「スキャン → ダメなら控えた
+  アドレス」を面倒見る (`ota_send.py` / `gdb_ble_bridge.py` の両方が使う)。
+  控えは `$TMPDIR/shizuku_device.txt`。
+  ★接続ウォッチドッグ (ble_uart) は**この症状には効かない**。テレメトリが
+  流れている限り `ATT_EVENT_CAN_SEND_NOW` が来続け、**自分の送信を生存の
+  証拠に数えてしまう**ので 20 秒の無音が訪れない。かといって入力だけを
+  数えると、受信専用の購読者を切ってしまう。**未解決**。
+- **転送を中断すると、その後デバイスが advertise を再開しないことがある**
+  (USB CDC は生きていて、センサも回っている)。2026-08-24 にまた踏んだ ——
+  ホスト側のプロセスを殺しても `[BLE_UART] disconnected` が出ず、macOS が
+  リンクを掴んだままに見える。`picotool reboot -f -a` でも戻らず、
+  BOOTSEL からの焼き直しで復帰した。**要調査**。
+- 転送中にごく稀に `got unexpected packet 0` が出て、そのまま止まることが
+  ある (2026-08-24: 93% で停止)。ホスト側は 10 秒で諦めて「stalled」と
+  報告し、デバイス側は 5 秒で捨てて待ち受けに戻るので**どちらも無傷**だが、
+  原因は分かっていない。上の CYW43 の話と同根の可能性。
+- **GDB のブレークポイントは対象スレッドを選べない**。スタブは RSP に
+  スレッドを 1 本しか見せておらず (`thread:1;` 固定、`H` は受けるだけ)、
+  対象は `start_gdb_stub_over_stream()` に渡した番号で決め打ち
+  (いまは `main.cpp` が blink を渡している)。Shizuku 側の作りの話。

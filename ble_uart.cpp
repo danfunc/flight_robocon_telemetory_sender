@@ -146,6 +146,9 @@ uintptr_t g_gdb_from_stub_id = xno::NO_STREAM; // stub からここへ (GDB へ�
 shizuku::stream::handle<link_chunk> g_gdb_to_stub;
 shizuku::stream::handle<link_chunk> g_gdb_from_stub;
 bool gdb_notify_enabled = false;
+// notify のクレジット切れで出せなかった 1 個をここに留める (下の flush_gdb 参照)。
+link_chunk g_gdb_held{};
+bool g_gdb_held_valid = false;
 
 // ---- OTA 受信 ----------------------------------------------------------------
 // ★ここも**運ぶだけ**。中身 (ヘッダ/CRC/イメージ) は ota オブジェクトが見る。
@@ -161,8 +164,22 @@ uintptr_t g_ota_stream_id = 0;
 //   (fail-closed。RX コマンドと同じ扱い)。
 static uint32_t tx_pending(); // 下で定義 (GDB CCC 有効時の補填で先に要る)
 
+// ★★「デバッガが繋がっている」= notify 有効 + 認可済み + **実際に RSP が
+//   来ている**。3 つ目を足したのは 2026-08-24:
+//     macOS は bonding した相手の CCC を覚えていて、**こちらが購読して
+//     いなくても再接続で notify を張り直してくる**。OTA しかしていないのに
+//     `gdb notify enabled` が毎回出るのはこれ。
+//   これを「繋がった」と数えると、スタブは寝るのをやめて RSP を待つ空回りに
+//   入り (受信 → 失敗 → YIELD の繰り返し)、**core0 を BLE の poll と食い合う**。
+//   実測で OTA の転送が 29% で止まった。
+//   ★1 バイトでも RSP が来れば本物なので、それを条件にする。来る前は
+//     スタブが寝ているが、バイトはストリームに溜まるので取りこぼさない
+//     (スタブは起きたときに読む)。
+static bool gdb_saw_traffic = false;
+
 static void update_gdb_connected() {
-  shizuku::objects::gdb_link_set_connected(gdb_notify_enabled && cmd_authorized);
+  shizuku::objects::gdb_link_set_connected(gdb_notify_enabled &&
+                                           cmd_authorized && gdb_saw_traffic);
 }
 
 // ★このリングは **ble_uart 自身の行専用** (接続状態などの内部メッセージ)。
@@ -229,6 +246,32 @@ static void process_rx(const uint8_t *data, uint16_t len) {
 // 12 units = 15.00ms。Apple/macOS はこれ未満を要求すると数秒で強制切断する
 // (macos-ble-min-conn-interval-15ms の実測知見)。
 static constexpr uint16_t FORCED_CI = 12;
+// ---- 生存監視 (旧 BLE_UART_DRIVER から移植, 2026-08-24) --------------------
+// ★何を直しているか:
+//   (a) 相手が黙って消えると con_handle が生きたままになり、**再アドバタイズ
+//       しない**。ホスト側からは「device not found」に見え、OTA も GDB も
+//       繋がらない。実測で何度も踏んでいる。
+//   (b) それより悪い形として、CYW43 のコントローラごと無応答になることがある
+//       (`[CYW43] Bus error` を伴う)。この場合ローカルの掃除では戻らず、
+//       **チップの電源を入れ直す**しかない (HCI の OFF→ON では蘇生しないことを
+//       旧実装で実測済み)。
+// ★段を分ける理由: 掃除で戻るなら 2 秒止める必要は無いし、掃除で戻らない相手に
+//   掃除を繰り返しても永久に戻らない。「掃除 → 応答があるか見る → 無ければ
+//   電源」の順にすることで、**代償の大きい手を最後にだけ払う**。
+static uint32_t hci_event_count = 0;      // 何か HCI/SM イベントが来た印
+static uint64_t last_conn_activity_us = 0;
+static bool wd_recovery_pending = false;  // 掃除したので応答を見張っている
+static uint64_t wd_cleanup_us = 0;
+static uint32_t wd_evt_snapshot = 0;
+static bool restart_requested = false;    // 診断 CDC の 'R' から
+
+// ★接続中の無音をどれだけ許すか。テレメトリが流れている限り CAN_SEND_NOW が
+//   絶えず来るので、生きたリンクがここまで黙ることはない。GDB でブレーク
+//   したままでもテレメトリは動き続けるので、そこで誤爆はしない。
+static constexpr uint64_t CONN_IDLE_TIMEOUT_US = 20000000ull;
+// 掃除への応答をどれだけ待つか。ここを過ぎたらコントローラ無応答とみなす。
+static constexpr uint64_t WD_RECOVERY_TIMEOUT_US = 3000000ull;
+
 static uint8_t ci_nego_stage = 0; // 0=未要求 / 1=(12,12)要求済み / 2=フォールバック済み
 
 static void print_conn_interval(const char *tag) {
@@ -264,6 +307,9 @@ static uint16_t att_read_callback(hci_con_handle_t, uint16_t, uint16_t, uint8_t 
 static int att_write_callback(hci_con_handle_t connection_handle,
                               uint16_t att_handle, uint16_t, uint16_t,
                               uint8_t *buffer, uint16_t buffer_size) {
+  // ★書き込みも生存の証拠。OTA の転送中は notify がほとんど出ないので、
+  //   ここを数えないと「9 秒黙っている」ように見えてしまう。
+  last_conn_activity_us = BOARD::time_us();
   if (att_handle ==
       ATT_CHARACTERISTIC_6E400003_B5A3_F393_E0A9_E50E24DCCA9E_01_CLIENT_CONFIGURATION_HANDLE) {
     tx_notify_enabled =
@@ -331,6 +377,11 @@ static int att_write_callback(hci_con_handle_t connection_handle,
                          buffer_size);
       return 0;
     }
+    if (!gdb_saw_traffic) {
+      gdb_saw_traffic = true; // ★本物のデバッガが喋った
+      update_gdb_connected();
+      BOARD::diag_printf("[BLE_UART] gdb traffic seen — stub is live\n");
+    }
     if (!g_gdb_to_stub.valid())
       return 0;
     uint32_t offset = 0;
@@ -369,25 +420,51 @@ uint32_t tx_pending() {
     n += g_tx_in.available();
   if (g_gdb_from_stub.valid())
     n += g_gdb_from_stub.available();
+  // ★手元に留めている 1 個も「残り」に数える。数えないと poll ループが
+  //   CAN_SEND_NOW を要求しなくなり、**留めたまま二度と出ない**。
+  if (g_gdb_held_valid)
+    ++n;
   return n;
 }
 
 // GDB の返事を先に出す。★対話は 1 往復ごとに CI ぶん待つので、テレメトリの
 //   バルクに後ろへ回されると往復がそのまま伸びる (RSP は往復回数が多い)。
+// ★★★**取り出した以上、捨てない** (2026-08-25 に踏んだ)。
+//   以前はここで「pop してから notify、失敗したら break」としていた。
+//   `att_server_notify` はクレジットが無いと失敗するので、**その 1 個は
+//   リングから消えたまま二度と送られない**。コメントには「次の
+//   CAN_SEND_NOW で続きを出す」と書いてあったが、続きも何も、
+//   取り出した本人が落としていた。
+//   ★これが出るのは**長い返事のときだけ**。短い返事はクレジットに収まるので
+//     露見しない。D53 で target.xml (830B = 14 チャンク) を返すように
+//     なった瞬間に表面化し、GDB からは `Ignoring packet error` と、
+//     再送の繰り返しによる **attach 152 秒**として見えていた。
+//   ★スタブ側 (gdb_stub.cpp の flush_out) にも同じ形の穴があって、そちらは
+//     先に直した。**送り手と受け手の両方**を直さないと落ちなくならない。
+//   出せなかった 1 個は手元に置いて、次の機会に**それから**出す。
 static void flush_gdb() {
   if (con_handle == HCI_CON_HANDLE_INVALID || !gdb_notify_enabled)
     return;
   if (!g_gdb_from_stub.valid())
     return;
+  const uint16_t handle =
+      ATT_CHARACTERISTIC_6E401003_B5A3_F393_E0A9_E50E24DCCA9E_01_VALUE_HANDLE;
+  // 前回出せなかったものが先。順番を崩すと RSP は壊れる。
+  if (g_gdb_held_valid) {
+    if (att_server_notify(con_handle, handle, g_gdb_held.data,
+                          g_gdb_held.len) != 0)
+      return; // まだクレジットが無い。次の CAN_SEND_NOW で。
+    g_gdb_held_valid = false;
+  }
   link_chunk c{};
   while (g_gdb_from_stub.available() != 0) {
     if (!g_gdb_from_stub.pop(&c))
       break;
-    if (att_server_notify(
-            con_handle,
-            ATT_CHARACTERISTIC_6E401003_B5A3_F393_E0A9_E50E24DCCA9E_01_VALUE_HANDLE,
-            c.data, c.len) != 0)
-      break; // クレジット切れ。次の CAN_SEND_NOW で続きを出す
+    if (att_server_notify(con_handle, handle, c.data, c.len) != 0) {
+      g_gdb_held = c; // ★捨てない
+      g_gdb_held_valid = true;
+      return;
+    }
   }
 }
 
@@ -425,6 +502,9 @@ done:
 // ---- HCI / ATT イベント (旧実装から診断・ウォッチドッグ・PHY 系を落とした版) ----
 static void packet_handler(uint8_t packet_type, uint16_t, uint8_t *packet,
                            uint16_t) {
+  // ★「何か来た」印。ウォッチドッグはこの数字が動くかどうかだけを見る。
+  ++hci_event_count;
+  last_conn_activity_us = BOARD::time_us();
   if (packet_type != HCI_EVENT_PACKET)
     return;
   uint8_t event = hci_event_packet_get_type(packet);
@@ -489,6 +569,8 @@ static void packet_handler(uint8_t packet_type, uint16_t, uint8_t *packet,
     can_send_requested = false;
     cmd_authorized = false;
     gdb_notify_enabled = false; // 切断で GDB も落ちる (次の接続で張り直す)
+    gdb_saw_traffic = false;
+    g_gdb_held_valid = false;   // 前の接続の断片を次へ持ち越さない
     update_gdb_connected();
     ci_nego_stage = 0;
     nc_pending_handle = HCI_CON_HANDLE_INVALID;
@@ -506,6 +588,8 @@ static void packet_handler(uint8_t packet_type, uint16_t, uint8_t *packet,
 // ---- SM (ペアリング/暗号化) イベント ----------------------------------------
 static void sm_packet_handler(uint8_t packet_type, uint16_t, uint8_t *packet,
                               uint16_t) {
+  ++hci_event_count;
+  last_conn_activity_us = BOARD::time_us();
   if (packet_type != HCI_EVENT_PACKET)
     return;
   switch (hci_event_packet_get_type(packet)) {
@@ -574,6 +658,14 @@ uintptr_t method_get_ota_stream(uintptr_t, uintptr_t, uintptr_t, uintptr_t) {
   return g_ota_stream_id;
 }
 
+// ★旗を立てるだけ。btstack を触るのは poll ループの担当 (ble_uart.hpp の
+//   REQUEST_DISCONNECT のコメント)。
+volatile bool g_drop_link_requested = false;
+uintptr_t method_request_disconnect(uintptr_t, uintptr_t, uintptr_t, uintptr_t) {
+  g_drop_link_requested = true;
+  return 0;
+}
+
 uintptr_t method_set_gdb_streams(uintptr_t argument, uintptr_t, uintptr_t,
                                  uintptr_t) {
   g_gdb_to_stub_id = argument >> 16;
@@ -637,6 +729,50 @@ static void bt_stack_bringup() {
   hci_power_control(HCI_POWER_ON);
 }
 
+// ---- BT スタック解体 → チップ電源断 ----------------------------------------
+// ★上位層を**明示的に** deinit する。btstack の init 群は再初期化ガード付きで、
+//   deinit しないと次の init が黙って no-op になる (= 作り直したつもりで
+//   古い状態のまま走る、という一番たちの悪い形)。
+// ★cyw43_arch_deinit() は内部で hci_power_control(OFF) + hci_close + run loop の
+//   解体までやり、チップの電源も落とす。次の cyw43_arch_init でファームが
+//   再ロードされる = コアの完全リセット。
+static void bt_stack_teardown() {
+  att_server_deinit();
+  sm_deinit();
+  l2cap_deinit();
+  cyw43_arch_deinit();
+}
+
+// コントローラ完全無応答からの最終手段。★およそ 2 秒ブロックする。
+// ★★**この間 yield しない**のが肝。poll スレッドは budget-0 (バトン) なので、
+//   譲らなければ他のスレッドは走らない = 解体中の cyw43 を誰も触らない。
+//   LED (peripherals.cpp) も同じ core0 に居て cyw43 越しに光るので、ここで
+//   譲ると「チップが居ない瞬間に LED が書きに来る」窓ができる。
+//   旧実装はロックでこれを塞いでいたが、こちらはロックが無いぶん
+//   **譲らないことで塞ぐ**。
+static void bt_full_chip_restart() {
+  BOARD::diag_printf("[BLE_UART] full CYW43 chip reset...\n");
+  con_handle = HCI_CON_HANDLE_INVALID;
+  tx_notify_enabled = false;
+  can_send_requested = false;
+  cmd_authorized = false;
+  gdb_notify_enabled = false;
+  gdb_saw_traffic = false;
+  update_gdb_connected();
+  ci_nego_stage = 0;
+  nc_pending_handle = HCI_CON_HANDLE_INVALID;
+
+  bt_stack_teardown();
+  busy_wait_us(100000); // 電源断を落ち着かせる。★sleep ではない (譲らない)
+  if (cyw43_arch_init() != 0) {
+    BOARD::diag_printf("[BLE_UART] cyw43_arch_init FAILED after reset\n");
+    return;
+  }
+  bt_stack_bringup();
+  last_conn_activity_us = BOARD::time_us();
+  BOARD::diag_printf("[BLE_UART] chip reset done, waiting for HCI ready\n");
+}
+
 // ---- ポーリングスレッド (SPAWN で起こす。budget-0 = 主ループに戻す/戻される
 //   バトン渡し — cyw43/btstack 内部が preemption-safe でないため) ------------
 uintptr_t poll_loop(uintptr_t, uintptr_t, uintptr_t, uintptr_t) {
@@ -688,8 +824,29 @@ uintptr_t poll_loop(uintptr_t, uintptr_t, uintptr_t, uintptr_t) {
     }
   }
 
+  // ★★このスレッドは**止められては困る** (D56)。GDB の `monitor target` で
+  //   これを選べてしまうと、止めた瞬間に RSP を運ぶ者が居なくなり、
+  //   デバッガ自身が黙る = 止めた本人が復旧できない。無線だと電源再投入まで
+  //   戻らないので、「やってみて壊れる」に任せてよい種類の操作ではない。
+  //   ★本来は System Object が「誰が誰を止めてよいか」を持つべきで、
+  //     ここで申告するのは資源の階層がまだ無いための繋ぎ。
+  shizuku::objects::gdb_link_protect_thread(
+      shizuku::kernel_instance.current_thread_id());
+
+  uint64_t next_adv_ensure_us = 0;
+  last_conn_activity_us = BOARD::time_us();
   while (true) {
     cyw43_arch_poll();
+
+    // ★頼まれていたら切る。ここでやるのは、btstack を突いてよいのが
+    //   このループだけだから (ble_uart.hpp の REQUEST_DISCONNECT 参照)。
+    if (g_drop_link_requested) {
+      g_drop_link_requested = false;
+      if (con_handle != HCI_CON_HANDLE_INVALID) {
+        BOARD::diag_printf("[BLE_UART] dropping the link on request\n");
+        gap_disconnect(con_handle);
+      }
+    }
 
     // USB CDC (診断チャネル) からの 1 文字コマンドを覗く (非ブロッキング)。
     // NC 確認待ちなら y/n、そうでなければペアリング方式の切替コマンド。
@@ -711,12 +868,71 @@ uintptr_t poll_loop(uintptr_t, uintptr_t, uintptr_t, uintptr_t) {
         BOARD::diag_printf(
             "[BLE_UART] pairing mode -> AUTO (Just Works, no MITM). "
             "次の接続から有効\n");
+      } else if (c == 'R') {
+        // ★手で起こせるようにしておく。壊れてからしか通らない経路を
+        //   壊れる前に一度通しておかないと、いざという時に動く保証が無い。
+        BOARD::diag_printf("[BLE_UART] chip reset requested from the console\n");
+        restart_requested = true;
       } else if (c == 'S') {
         g_auto_pair = false;
         apply_security_mode();
         BOARD::diag_printf(
             "[BLE_UART] pairing mode -> SECURE (NC required). 次の接続から有効\n");
       }
+    }
+
+    // ---- 生存監視 (3 段) ----------------------------------------------
+    // 診断 CDC から 'R' で手動起動 (この経路を実機で試すため)。
+    if (restart_requested) {
+      restart_requested = false;
+      bt_full_chip_restart();
+      continue;
+    }
+
+    // ① 接続ウォッチドッグ: 相手が黙って消えた形を畳む。
+    //    ★これをやらないと con_handle が生きたままになり、**再アドバタイズ
+    //      しない** = ホストからは永久に見つからない。
+    if (con_handle != HCI_CON_HANDLE_INVALID &&
+        BOARD::time_us() - last_conn_activity_us > CONN_IDLE_TIMEOUT_US) {
+      BOARD::diag_printf("[BLE_UART] link idle %llums — force cleanup\n",
+                         (unsigned long long)((BOARD::time_us() -
+                                               last_conn_activity_us) / 1000));
+      gap_disconnect(con_handle); // 生きていれば正規に切れる。死んでいれば無害
+      con_handle = HCI_CON_HANDLE_INVALID;
+      tx_notify_enabled = false;
+      can_send_requested = false;
+      cmd_authorized = false;
+      gdb_notify_enabled = false;
+      gdb_saw_traffic = false;
+      update_gdb_connected();
+      ci_nego_stage = 0;
+      nc_pending_handle = HCI_CON_HANDLE_INVALID;
+      // ★掃除で戻れたかを見張り始める。この gap_disconnect と直後の広告
+      //   enable に対して**イベントが 1 つも返らない**なら、掃除では戻らない。
+      wd_recovery_pending = true;
+      wd_cleanup_us = BOARD::time_us();
+      wd_evt_snapshot = hci_event_count;
+      last_conn_activity_us = BOARD::time_us();
+    }
+
+    // ② エスカレーション: 掃除に応答が無ければコントローラごと無応答。
+    if (wd_recovery_pending) {
+      if (hci_event_count != wd_evt_snapshot) {
+        wd_recovery_pending = false; // 応答あり = 掃除で足りた
+      } else if (BOARD::time_us() - wd_cleanup_us > WD_RECOVERY_TIMEOUT_US) {
+        wd_recovery_pending = false;
+        BOARD::diag_printf("[BLE_UART] controller unresponsive — resetting CYW43\n");
+        bt_full_chip_restart();
+        continue;
+      }
+    }
+
+    // ③ 広告の保険: 未接続なのに広告が止まっている事態 (切断イベントの
+    //    取りこぼしや enable 失敗) を 1 秒ごとに埋める。enable は冪等。
+    if (con_handle == HCI_CON_HANDLE_INVALID &&
+        BOARD::time_us() >= next_adv_ensure_us) {
+      gap_advertisements_enable(1);
+      next_adv_ensure_us = BOARD::time_us() + 1000000ull;
     }
 
     // notify 有効でストリームに残りがあるのに要求未発なら補填。
@@ -749,6 +965,8 @@ uintptr_t ble_uart_main(uintptr_t, uintptr_t, uintptr_t, uintptr_t) {
   failures += export_method(method::SET_TX_STREAM, (uintptr_t)&method_set_tx_stream);
   failures += export_method(method::SET_GDB_STREAMS,
                             (uintptr_t)&method_set_gdb_streams);
+  failures += export_method(method::REQUEST_DISCONNECT,
+                            (uintptr_t)&method_request_disconnect);
   failures += export_method(method::GET_OTA_STREAM,
                             (uintptr_t)&method_get_ota_stream);
   failures += export_method(method::POLL, (uintptr_t)&poll_loop);

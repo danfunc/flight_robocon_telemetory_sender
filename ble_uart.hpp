@@ -43,6 +43,13 @@ enum struct method : uintptr_t {
   // そのまま流す (中身は解釈しない)。★向きは RX と同じ —
   // **ble_uart が producer**、ota が consumer。
   GET_OTA_STREAM = 5,
+  // リンクを切ってほしい、という**要求だけ**を置く。実際に gap_disconnect を
+  // 呼ぶのは poll ループ。★ここで直接 btstack を突いてはいけない —
+  // 呼び出し元スレッドから触ると poll ループと再入して CYW43 の SPI バスを
+  // 壊す (下の SEND 廃止と同じ理由)。
+  // ★用途: OTA の commit。両コアを 1.7 秒止めて flash を焼く間、BLE を
+  //   繋いだままにしておくと CYW43 が道連れになる。
+  REQUEST_DISCONNECT = 6,
 };
 
 // ★かつて SEND (同期 CALL_METHOD で 1 メッセージ積む) を export していたが

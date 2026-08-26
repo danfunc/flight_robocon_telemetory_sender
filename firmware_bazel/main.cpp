@@ -37,8 +37,8 @@ uintptr_t blink_main(uintptr_t, uintptr_t, uintptr_t, uintptr_t) {
                                  (uintptr_t)"blink");
   shizuku::objects::led_request request{0};
   // 点灯/消灯それぞれの長さ (= トグル間隔)。端に着いたら向きを変える。
-  constexpr int32_t MIN_MS = 300;
-  constexpr int32_t MAX_MS = 2000;
+  constexpr int32_t MIN_MS = 200;
+  constexpr int32_t MAX_MS = 1500;
   constexpr int32_t STEP_MS = 100;
   int32_t interval_ms = MIN_MS;
   int32_t step_ms = STEP_MS;

@@ -14,9 +14,11 @@
 """
 
 import asyncio
+import os
 import queue
 import struct
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -80,6 +82,54 @@ ELEV_STR = {0: "NEUTRAL", 1: "UP ▲", 2: "DOWN ▼"}
 
 
 # ---- フレーム解析 ----------------------------------------------------------
+# ---- デバイスの見つけ方 ----------------------------------------------------
+# ★★スキャンだけに頼らない。BLE のリンクは 1 本しかなく、**誰かが繋いでいる間
+#   デバイスは advertise しない**ので、スキャンでは見つからない。しかも
+#   macOS はプロセスが死んでもリンクを掴んだままにすることがあり、その状態
+#   から自力では戻れない (実測: kill -9 の 40 秒後もデバイス側に切断が
+#   届いていない)。
+# ★**アドレスを覚えておけば直接繋げる** — 掴まれている相手でも 0.7 秒で
+#   繋がることを実測した。繋いでから切れば、掴みっぱなしも解放できる。
+_DEVICE_CACHE = os.path.join(tempfile.gettempdir(), "shizuku_device.txt")
+
+
+def remember_device(device) -> None:
+    """見つけたアドレスを控える。次にスキャンで見つからないときに使う。"""
+    try:
+        with open(_DEVICE_CACHE, "w", encoding="utf-8") as f:
+            f.write(str(device.address))
+    except OSError:
+        pass
+
+
+def cached_address():
+    try:
+        with open(_DEVICE_CACHE, encoding="utf-8") as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
+
+
+async def find_device(timeout: float = 15.0, verbose: bool = True):
+    """スキャン → ダメなら控えたアドレス。BleakClient にそのまま渡せるものを返す。
+
+    戻り値は BLEDevice かアドレス文字列 (bleak はどちらも受ける)。見つからなければ
+    None。★アドレスで返した場合、それが**本当に繋がるか**はここでは確かめない
+    (確かめるには繋ぐしかなく、それは呼び出し側の仕事)。
+    """
+    device = await BleakScanner.find_device_by_name(DEVICE_NAME, timeout=timeout)
+    if device is not None:
+        remember_device(device)
+        return device
+    address = cached_address()
+    if address is None:
+        return None
+    if verbose:
+        print(f"  advertise していないので、控えたアドレスで直接繋ぎます "
+              f"({address})", flush=True)
+    return address
+
+
 def crc16_ccitt(data: bytes) -> int:
     """CRC16-CCITT (poly 0x1021, init 0xFFFF)。firmware の実装と一致。"""
     crc = 0xFFFF
