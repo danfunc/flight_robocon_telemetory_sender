@@ -224,11 +224,6 @@ uintptr_t poll_loop(uintptr_t, uintptr_t, uintptr_t, uintptr_t) {
 
     if (++since_report >= REPORT_EVERY) {
       since_report = 0;
-      BOARD::diag_printf("[BNO055] EUL=%d,%d,%d LIA=%d,%d,%d GRV=%d,%d,%d "
-                         "(fail=%lu drop=%lu glitch=%lu)\n",
-                         r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8],
-                         (unsigned long)fail_count, (unsigned long)g_dropped,
-                         (unsigned long)g_glitches);
     }
   }
   return 0;

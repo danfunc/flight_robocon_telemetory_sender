@@ -307,7 +307,7 @@ async def main(path: str, do_upload: bool, do_commit: bool,
             while not peripheral.canSendWriteWithoutResponse():
                 if time.perf_counter() > deadline:
                     return False
-                await asyncio.sleep(0.0005)
+                await asyncio.sleep(0.002)
             return True
 
         t0 = time.perf_counter()
@@ -327,6 +327,7 @@ async def main(path: str, do_upload: bool, do_commit: bool,
                 OTA_RX_UUID, payload[offset : offset + CHUNK],
                 response=with_response,
             )
+            await asyncio.sleep(0.003)
             sent += min(CHUNK, len(payload) - offset)
             if offset % (CHUNK * 200) == 0:
                 elapsed = time.perf_counter() - t0

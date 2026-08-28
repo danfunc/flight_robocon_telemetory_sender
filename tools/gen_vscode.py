@@ -145,18 +145,25 @@ def settings() -> dict:
                 },
                 {
                     "name": "$(cloud-upload) Deploy",
-                    "tooltip": "USB(BOOTSEL) で書き込み→実行 (picotool -fx)",
+                    "tooltip": "USB で書き込み (bazel run //firmware_bazel:flash)",
                     "color": "#88c0d0",
-                    "command": f"picotool load {UF2} -fx",
+                    "command": f"{BAZEL} run //firmware_bazel:flash",
                 },
                 {
-                    # ★USB を挿さずに焼き替える。転送 50 秒 + commit 6.5 秒。
+                    # ★USB を挿さずに焼き替える (Bazel でビルド→BLE転送→commit)。
                     "name": "$(radio-tower) OTA",
-                    "tooltip": "BLE だけで焼き替える (bazel build → 転送 → commit)",
+                    "tooltip": "BLE だけで焼き替える (bazel run //firmware_bazel:ota)",
                     "color": "#ebcb8b",
                     "singleInstance": True,
-                    "command": (f"{BAZEL} build {BAZEL_TARGET} && "
-                                f"{PYTHON} -u {OTA_SEND} --commit"),
+                    "command": f"{BAZEL} run //firmware_bazel:ota",
+                },
+                {
+                    # ★単一オブジェクトだけをコンパイルして実機SRAMへ瞬時注入 (0.03秒・再起動なし)
+                    "name": "$(zap) Hot-Reload",
+                    "tooltip": "単一オブジェクトを実機SRAMへ動的注入・即時実行 (0.03秒・再起動なし)",
+                    "color": "#b48ead",
+                    "singleInstance": True,
+                    "command": f"{PYTHON} -u ${{workspaceFolder}}/tools/shizuku_hot_reload.py ${{workspaceFolder}}/modules_dyn/fast_blink.cpp",
                 },
             ],
         },
@@ -180,10 +187,9 @@ def tasks() -> dict:
             {
                 "label": "Deploy (USB)",
                 "type": "process",
-                "dependsOn": ["Compile Project"],
-                "dependsOrder": "sequence",
-                "command": PICOTOOL_BIN,
-                "args": ["load", UF2, "-fx"],
+                "command": BAZEL,
+                "args": ["run", "//firmware_bazel:flash"],
+                "options": {"cwd": "${workspaceFolder}"},
                 "presentation": {"reveal": "always", "panel": "dedicated"},
                 "problemMatcher": [],
             },
@@ -212,30 +218,20 @@ def tasks() -> dict:
                 "problemMatcher": "$gcc",
             },
             {
-                "label": "Shizuku: 焼く",
-                "type": "shell",
-                "dependsOn": [
-                    "Build (Bazel)"
-                ],
-                "command": f"{PICOTOOL_BIN} load {BAZEL_ELF}.uf2 -fx && sleep 3 && diag=$(ls /dev/cu.usbmodem* | head -1) && gdb=$(ls /dev/cu.usbmodem* | tail -1) && ln -sf $diag /tmp/shizuku-diag-port && ln -sf $gdb /tmp/shizuku-gdb-port && echo 'USB mapped'",
-                "options": {
-                    "cwd": "${workspaceFolder}"
-                },
-                "presentation": {
-                    "reveal": "always",
-                    "panel": "dedicated"
-                },
-                "problemMatcher": []
+                "label": "Shizuku: 焼く (USB)",
+                "type": "process",
+                "command": BAZEL,
+                "args": ["run", "//firmware_bazel:flash"],
+                "options": {"cwd": "${workspaceFolder}"},
+                "presentation": {"reveal": "always", "panel": "dedicated"},
+                "problemMatcher": [],
             },
             {
-                # ★OTA のワンライナー。ota_send.py が .elf をそのまま食えるので、
-                #   .bin へ落とす手順は要らない (中身を見て自分で変換する)。
+                # ★OTA のワンライナー (Bazel ターゲットを実行)。
                 "label": "OTA Deploy (BLE)",
                 "type": "process",
-                "dependsOn": ["Build (Bazel)"],
-                "dependsOrder": "sequence",
-                "command": PYTHON,
-                "args": ["-u", OTA_SEND, "--commit"],
+                "command": BAZEL,
+                "args": ["run", "//firmware_bazel:ota"],
                 "options": {"cwd": "${workspaceFolder}"},
                 "presentation": {"reveal": "always", "panel": "dedicated"},
                 "problemMatcher": [],
@@ -261,12 +257,12 @@ def tasks() -> dict:
                 #   「待つ」ことを明示しないと attach が先走って失敗する)。
                 "label": "GDB BLE bridge",
                 "type": "process",
-                "command": PYTHON,
-                # ★RSP を毎回記録する。VS Code / cppdbg が実際に何を撃つかは
-                #   仕様を読んでも分からない (アダプタの実装次第) ので、
-                #   常に残しておいて後から読む。上書きなので溜まらない。
-                "args": ["-u", GDB_BRIDGE, "--port", str(GDB_BLE_PORT),
-                         "--log", "${workspaceFolder}/.vscode/rsp-last.txt"],
+                "command": BAZEL,
+                "args": [
+                    "run", "//firmware_bazel:gdb_bridge", "--",
+                    "--port", str(GDB_BLE_PORT),
+                    "--log", "${workspaceFolder}/.vscode/rsp-last.txt",
+                ],
                 "options": {"cwd": "${workspaceFolder}"},
                 "isBackground": True,
                 "presentation": {"reveal": "always", "panel": "dedicated"},
@@ -279,6 +275,19 @@ def tasks() -> dict:
                         "endsPattern": "^listening on ",
                     },
                 },
+            },
+            {
+                "label": "Hot-Reload Object (RAM)",
+                "type": "process",
+                "command": PYTHON,
+                "args": [
+                    "-u",
+                    "${workspaceFolder}/tools/shizuku_hot_reload.py",
+                    "${workspaceFolder}/modules_dyn/fast_blink.cpp",
+                ],
+                "options": {"cwd": "${workspaceFolder}"},
+                "presentation": {"reveal": "always", "panel": "dedicated"},
+                "problemMatcher": [],
             },
             {
                 "label": "Regenerate .vscode",
@@ -336,7 +345,7 @@ def launch() -> dict:
                 ],
             },
             {
-                "name": "Shizuku: 自己ホストデバッグ (プローブ不要)",
+                "name": "Shizuku: GDB over USB (プローブ不要)",
                 "type": "cppdbg",
                 "request": "launch",
                 "program": BAZEL_ELF,
@@ -347,26 +356,18 @@ def launch() -> dict:
                 "launchCompleteCommand": "None",
                 "stopAtConnect": True,
                 "externalConsole": False,
-                "preLaunchTask": "Shizuku: 焼く",
+                "preLaunchTask": "Shizuku: 焼く (USB)",
                 "setupCommands": [
                     {"text": "set remotetimeout 30"},
-                    {"text": f'directory "{BAZEL_EXECROOT}"'},
+                    {"text": f"directory {BAZEL_EXECROOT}"},
+                    {"text": f"source ${{workspaceFolder}}/tools/shizuku.gdb"},
                 ],
                 "postAttachCommands": [
                     "monitor target ${input:debugTarget}",
                 ],
             },
             {
-                # ★★**まずこれを試す** (2026-08-25)。cortex-debug をやめた版。
-                #   cortex-debug は SWD プローブ + all-stop 前提の作りで、
-                #   **overrideAttachCommands を走らせる前に自分で繋いでしまう**。
-                #   `non-stop` / `mi-async` は接続後には変えられないので
-                #   ("Cannot change this setting while the inferior is running")
-                #   そこへ書いても間に合わない。こちらは素の GDB/MI 前面なので
-                #   `setupCommands` が**確実に接続前**に走る。
-                # ★`launchCompleteCommand: "None"` が肝: 既に走っている的に
-                #   繋ぐだけなので、繋いだあと run も continue もさせない。
-                "name": "GDB over BLE (cppdbg)",
+                "name": "Shizuku: GDB over BLE (無線デバッグ)",
                 "preLaunchTask": "GDB BLE bridge",
                 "type": "cppdbg",
                 "request": "launch",
@@ -378,30 +379,11 @@ def launch() -> dict:
                 "launchCompleteCommand": "None",
                 "stopAtConnect": True,
                 "externalConsole": False,
-                # ★★**non-stop にしない** (2026-08-25 実測で判断)。
-                #   スタブは non-stop なら 13 本全部見せられるが、**VS Code の
-                #   UI は「一部だけ止まっている」を表現できない** — 全部
-                #   running か全部 paused のどちらかになり、**表示が嘘になる**。
-                #   DAP は単一プロセス内のスレッドを前提にしていて、停止も
-                #   再開もプロセス単位。Shizuku のスレッドは実質「別プロセス」
-                #   なので、そもそも噛み合わない。
-                #   all-stop ならスタブは**止まっているものだけ**を見せるので、
-                #   対象 1 本だけが並び、他は GDB から見えないまま走り続ける。
-                #   **嘘が無い方**を選ぶ。
-                #   ★13 本全部を見て切り替えたいときは **CLI の GDB** を使う
-                #     (`set non-stop on`。OTA_HANDOFF.md 参照)。CLI なら
-                #     per-thread の状態が正しく出る。
                 "setupCommands": [
                     {"text": "set remotetimeout 30"},
-                    {"text": f'directory "{BAZEL_EXECROOT}"'},
+                    {"text": f"directory {BAZEL_EXECROOT}"},
+                    {"text": f"source ${{workspaceFolder}}/tools/shizuku.gdb"},
                 ],
-                # ★★F5 のたびに「どのオブジェクトを覗くか」を聞く (D54)。
-                #   all-stop では止まっているものだけが GDB に見えるので、
-                #   **ここで選んだ 1 本が call stack に出る**。
-                #   ★名前で指定している — スレッド番号は起こす順で決まるので
-                #     ビルドが変われば動くが、名前は動かない。
-                #   ★あとから変えたいときは DEBUG CONSOLE で
-                #     `-exec monitor target bno055` / `-exec monitor list`。
                 "postAttachCommands": [
                     "monitor target ${input:debugTarget}",
                 ],
@@ -430,10 +412,10 @@ def launch() -> dict:
                 #   continue した瞬間に死ぬ。**上の non-stop を使うこと**。
                 #   直るまで残してあるのは切り分け用 (Shizuku 側 server の話)。
                 "preAttachCommands": [
-                    f'directory "{BAZEL_EXECROOT}"',
+                    f"directory {BAZEL_EXECROOT}",
                 ],
                 "overrideAttachCommands": [
-                    f'directory "{BAZEL_EXECROOT}"',
+                    f"directory {BAZEL_EXECROOT}",
                     f"target remote localhost:{GDB_BLE_PORT}",
                 ],
                 "overrideRestartCommands": [],

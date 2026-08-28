@@ -3,7 +3,8 @@
 // ===========================================================================
 //  設計の理由は ota.hpp 冒頭。
 #include "ota.hpp"
-#include "ble_uart.hpp"
+#include "blink.hpp"
+#include "shizuku/objects/ble_uart.hpp"
 #include "inflate.hpp"
 #include "shizuku/kernel.hpp"
 #include "shizuku/object_api.hpp"
@@ -370,6 +371,9 @@ void reject_commit(const char *why) {
   if (snprintf(line, sizeof(line), "commit rejected: %s\n", why) > 0)
     say(line);
   g_state = state::FAILED;
+  api(shizuku::object_api::CALL_METHOD, blink::OBJECT,
+      (uintptr_t)blink::method::SET_PATTERN,
+      (uintptr_t)blink::pattern_id::DYNAMIC_SWEEP);
 }
 
 uint32_t sectors_for(uint32_t bytes) {
@@ -427,8 +431,8 @@ void begin_commit() {
   //   (2026-08-24 実機、電源を抜くまで復帰せず) —— 1.7 秒はその 16 倍。
   //   ★切るのを頼むだけ。実際に gap_disconnect を呼ぶのは ble_uart の
   //     poll ループ (呼び出し元スレッドから btstack を触ると壊れる)。
-  api(shizuku::object_api::CALL_METHOD, ble_uart::OBJECT,
-      (uintptr_t)ble_uart::method::REQUEST_DISCONNECT, 0);
+  api(shizuku::object_api::CALL_METHOD, xno_object_id::ble_uart,
+      (uintptr_t)shizuku::objects::ble_uart::method::REQUEST_DISCONNECT, 0);
   api(shizuku::object_api::SLEEP_US, 300000);
 
   commit_op op{STAGING_OFFSET,
@@ -473,6 +477,10 @@ void begin_transfer(bool compressed) {
   if (!erase_staging(g_total))
     return;
   g_state = compressed ? state::ZLEN : state::DATA;
+  // ★OTA 転送中は LED を高速ストロボ (Pattern 4) にして受信中であることを視覚化
+  api(shizuku::object_api::CALL_METHOD, blink::OBJECT,
+      (uintptr_t)blink::method::SET_PATTERN,
+      (uintptr_t)blink::pattern_id::FAST_STROBE);
   say("ready\n"); // ホストはこれを見てから流す
 }
 
@@ -483,6 +491,9 @@ void finish_transfer() {
   char line[128];
   if (crc != g_expect_crc) {
     g_state = state::FAILED;
+    api(shizuku::object_api::CALL_METHOD, blink::OBJECT,
+        (uintptr_t)blink::method::SET_PATTERN,
+        (uintptr_t)blink::pattern_id::DYNAMIC_SWEEP);
     if (snprintf(line, sizeof(line),
                  "CRC MISMATCH got=%08lx want=%08lx — 本体は無傷\n",
                  (unsigned long)crc, (unsigned long)g_expect_crc) > 0)
@@ -490,6 +501,10 @@ void finish_transfer() {
     return;
   }
   g_state = state::DONE;
+  // ★ステージング完了時はトリプルフラッシュ (Pattern 2) で検証合格を通知
+  api(shizuku::object_api::CALL_METHOD, blink::OBJECT,
+      (uintptr_t)blink::method::SET_PATTERN,
+      (uintptr_t)blink::pattern_id::TRIPLE_BEACON);
   if (snprintf(line, sizeof(line),
                "done: %lu bytes crc=%08lx OK (staged at 0x%lx)\n",
                (unsigned long)g_received, (unsigned long)crc,

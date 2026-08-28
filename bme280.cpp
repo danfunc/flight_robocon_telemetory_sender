@@ -214,9 +214,6 @@ uintptr_t poll_loop(uintptr_t, uintptr_t, uintptr_t, uintptr_t) {
 
     if (++since_report >= REPORT_EVERY) {
       since_report = 0;
-      BOARD::diag_printf("[BME280] PRESS=%lu TEMP=%ld (fail=%lu drop=%lu)\n",
-                         (unsigned long)press_pa, (long)temp_cc,
-                         (unsigned long)fail_count, (unsigned long)g_dropped);
     }
   }
   return 0;

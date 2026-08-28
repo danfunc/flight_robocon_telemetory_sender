@@ -93,7 +93,8 @@ def _port_is_served(port: int) -> bool:
     """
     probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
-        probe.bind(("127.0.0.1", port))  # SO_REUSEADDR は付けない
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        probe.bind(("127.0.0.1", port))
         return False
     except OSError:
         return True
@@ -120,16 +121,16 @@ async def run(port: int, stay: bool, log_path: str | None) -> int:
                   f"(pid {beat['pid']}, {beat['age']:.1f}s前に心拍) — "
                   f"そちらを使うのでこのプロセスは終了します", flush=True)
             return 0
-        print(f"port {port} is held but the bridge looks dead — 退かせます",
-              flush=True)
-        subprocess.run(["pkill", "-f", "gdb_ble_bridge.py"], check=False)
-        await asyncio.sleep(2.0)
+        my_pid = os.getpid()
+        cmd = f"lsof -t -i:{port} | grep -v '^{my_pid}$' | xargs kill -9 2>/dev/null"
+        subprocess.run(cmd, shell=True, check=False)
+        await asyncio.sleep(1.0)
         if _port_is_served(port):
             print("まだ掴まれています。手で落としてください: "
-                  "pkill -f gdb_ble_bridge.py", flush=True)
+                  f"lsof -i:{port}", flush=True)
             return 1
 
-    device = await find_device(timeout=15.0)
+    device = await find_device(timeout=3.0)
     if device is None:
         print("device not found", flush=True)
         print("  ★他に BLE で繋いでいるものが無いか確認 (リンクは 1 本しか無く、"
@@ -159,6 +160,7 @@ async def run(port: int, stay: bool, log_path: str | None) -> int:
                       f"{_printable(data)}\n")
             log.flush()
 
+        loop = asyncio.get_running_loop()
         def on_notify(_handle, data: bytearray):
             record("dev->gdb", bytes(data))
             writer = state["writer"]
@@ -166,6 +168,10 @@ async def run(port: int, stay: bool, log_path: str | None) -> int:
                 pending.extend(data)
                 return
             writer.write(bytes(data))
+            try:
+                loop.create_task(writer.drain())
+            except Exception:
+                pass
 
         await client.start_notify(GDB_TX_UUID, on_notify)
         print("subscribed to the GDB characteristic", flush=True)

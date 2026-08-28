@@ -4,7 +4,7 @@
 //   バイナリタイプはそれを一括で満たすが、その分 text が RAM を食う。
 //   ここでは「センサ/テレメトリ/GDB を落とした BLE だけの像」の text+bss を測り、
 //   RP2350 の SRAM 520KB に対して現実的かを判断する材料にする。
-#include "ble_uart.hpp"
+#include "shizuku/objects/ble_uart.hpp"
 #include "pico/stdlib.h"
 #include "shizuku/app_entry.hpp"
 #include "shizuku/kernel.hpp"
@@ -16,8 +16,8 @@
 void shizuku::app_entry() {
   shizuku::kernel_instance.set_recovery_thread(0);
   shizuku::objects::register_peripherals();
-  ble_uart::register_ble_uart();
-  ble_uart::start_ble_uart();
+  shizuku::objects::ble_uart::register_ble_uart(xno_object_id::ble_uart);
+  shizuku::objects::ble_uart::start_ble_uart(xno_object_id::ble_uart);
   while (true)
     shizuku::KERNEL::ARCH::syscall((uintptr_t)shizuku::object_api::YIELD);
 }
