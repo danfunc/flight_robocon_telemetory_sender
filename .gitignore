@@ -1,0 +1,6 @@
+build*
+# ★場所を限定しない。.pyc には __file__ の絶対パス (= $HOME = 実名) が
+#   埋まるので、公開リポジトリに入れてよいものではない。
+__pycache__/
+*.pyc
+.vscode/rsp-last.txt

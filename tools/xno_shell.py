@@ -18,12 +18,30 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import glob
 import os
 import subprocess
 import sys
 import tempfile
 import time
+
+# ---- ホスト依存のパス -------------------------------------------------------
+# ★絶対パスを直書きしない。**公開リポジトリに $HOME (= ユーザー名) が載る**のと、
+#   他のマシンで動かなくなるのが同じ 1 つの原因から来ている。環境変数で
+#   上書きでき、無ければ既定値へ落とす形にしておけば両方まとめて消える。
+SHIZUKU = os.environ.get(
+    "SHIZUKU_ROOT",
+    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                 os.pardir, "Shizuku"),
+)
+SHIZUKU = os.path.normpath(SHIZUKU)
+PICO_SDK_ROOT = os.environ.get(
+    "PICO_SDK_ROOT", os.path.expanduser("~/.pico-sdk"))
+# Bazel の出力ベースはユーザー名を含む (_bazel_<user>)。getuser() から組み立てる。
+BAZEL_TMP = os.environ.get(
+    "BAZEL_TMP", "/private/var/tmp/_bazel_" + getpass.getuser())
+
 
 try:
     import serial
@@ -44,12 +62,12 @@ def find_serial_port(preferred: str | None = None) -> str:
 def compile_cpp_to_bin(src_path: str, out_bin: str) -> int:
     """C++ ソースを PIC/PIE Thumb-2 バイナリへコンパイル"""
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    include_dyn = "/Users/ishigakiyua/github/Shizuku/internal_headers"
-    include_pico = "/Users/ishigakiyua/github/Shizuku/modules/pico_sdk_support/internal_headers"
-    source_dir = "/Users/ishigakiyua/github/Shizuku/source"
+    include_dyn = SHIZUKU + "/internal_headers"
+    include_pico = SHIZUKU + "/modules/pico_sdk_support/internal_headers"
+    source_dir = SHIZUKU + "/source"
 
     gxx_candidates = [
-        "/Users/ishigakiyua/.pico-sdk/toolchain/14_2_Rel1/bin/arm-none-eabi-g++",
+        PICO_SDK_ROOT + "/toolchain/14_2_Rel1/bin/arm-none-eabi-g++",
         "/opt/homebrew/bin/arm-none-eabi-g++",
         "arm-none-eabi-g++",
     ]
@@ -62,7 +80,7 @@ def compile_cpp_to_bin(src_path: str, out_bin: str) -> int:
         ld_path = tmp_ld.name
 
     gen_ids_dirs = glob.glob(
-        "/private/var/tmp/_bazel_ishigakiyua/*/execroot/_main/bazel-out/darwin_arm64-fastbuild/bin/external/shizuku+/generated_object_ids"
+        BAZEL_TMP + "/*/execroot/_main/bazel-out/darwin_arm64-fastbuild/bin/external/shizuku+/generated_object_ids"
     ) + glob.glob(os.path.join(repo_root, "bazel-bin/external/shizuku+/generated_object_ids"))
     gen_ids = gen_ids_dirs[0] if gen_ids_dirs else ""
 
@@ -97,7 +115,7 @@ def compile_cpp_to_bin(src_path: str, out_bin: str) -> int:
         sys.exit(f"コンパイルエラー:\n{res.stderr}")
 
     objcopy_candidates = [
-        "/Users/ishigakiyua/.pico-sdk/toolchain/14_2_Rel1/bin/arm-none-eabi-objcopy",
+        PICO_SDK_ROOT + "/toolchain/14_2_Rel1/bin/arm-none-eabi-objcopy",
         "/opt/homebrew/bin/arm-none-eabi-objcopy",
         "arm-none-eabi-objcopy",
     ]
