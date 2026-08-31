@@ -3,6 +3,9 @@
 // ===========================================================================
 //  設計の理由は telemetry.hpp 冒頭。
 #include "telemetry.hpp"
+#include "flight_controller.hpp"
+#include "fw_version.hpp"
+#include "shizuku/objects/ota.hpp"
 #include "shizuku/kernel.hpp"
 #include "shizuku/object_api.hpp"
 #include "shizuku/stream.hpp"
@@ -72,6 +75,13 @@ inline int32_t eul_to_cdeg(int32_t raw) { return raw * 100 / 16; }
 inline int32_t acc_to_mm_s2(int32_t raw) { return raw * 10; }
 
 void push_line(const char *text, uint32_t len) {
+  // ★★焼いている最中は BLE へ何も積まない。消去・書き込みは IRQ を止めて
+  //   走るので、その間の BLE トラフィックは CYW43 の SPI/PIO を壊す。
+  //   テレメトリは 20ms 周期で最も量が多い口なので、ここを塞ぐのが一番効く。
+  //   ★捨てた行は g_lost_out に数えず黙って落とす —— 数えると「取りこぼし」に
+  //     見えるが、これは仕様として止めているので別物。
+  if (shizuku::objects::ota::flash_busy())
+    return;
   frame_t f{};
   if (len > sizeof(f.data))
     len = sizeof(f.data);
@@ -82,11 +92,42 @@ void push_line(const char *text, uint32_t len) {
 }
 
 // ---- 1 行組み立て (tools/shizuku_link.py の TELEMETRY_FIELDS 順) --------------
+// 走っている像の素性を 1 行流す。
+//  ★"PICO," 行に列を足さないこと。ホスト側 (tools/shizuku_link.py) は
+//    列数が合わない PICO 行を捨てるので、足した瞬間にテレメトリが全部消える。
+//    別種の行にすれば、知らないホストは黙って無視できる。
+//  ★1 回だけでなく時々流す。ホストが後から繋いだときに見逃さないため
+//    (値は控えてあるので、流すこと自体は安い)。
+// 何行に 1 回、素性を挟むか。★毎行は無駄、1 回きりだと後から繋いだホストが
+//   見逃す。テレメトリが 20ms 周期なら 200 行 = およそ 4 秒に 1 回。
+constexpr uint32_t VERSION_EVERY = 200;
+uint32_t g_since_version = 0;
+
+void emit_version() {
+  const auto &id = xno::firmware_id();
+  char line[64];
+  const int written = snprintf(line, sizeof(line), "PICOVER,%lu,%08lx\n",
+                               (unsigned long)id.bytes, (unsigned long)id.crc32);
+  if (written > 0)
+    push_line(line, (uint32_t)written);
+}
+
 void emit_line() {
   // まだ何も測れていないなら送らない (0 だけの行を流さない)。
   if (!g_have_imu && !g_have_baro)
     return;
   const int32_t alt_mm = altitude_mm(g_press_pa);
+
+  // flight_controller から最新の制御状態を取ってくる。
+  //  ★★グローバルを直に読まないこと。以前は flight_controller が公開した
+  //    ミラー変数を参照していたが、それは (1) オブジェクト境界を越えた素の
+  //    メモリ参照で、FLIGHT_CONTROLLER を非特権 + per-object arena へ移した
+  //    瞬間に fault し、(2) 本体の値とミラーの二重管理でいつでもズレうる。
+  //    メソッドで訊けば、答える側が唯一の持ち主のままでいられる。
+  ::flight_controller::control_state cs{};
+  api(shizuku::object_api::CALL_METHOD, ::flight_controller::OBJECT,
+      (uintptr_t)::flight_controller::method::GET_CONTROL_STATE, (uintptr_t)&cs);
+
   char line[256];
   const int written = snprintf(
       line, sizeof(line),
@@ -97,9 +138,9 @@ void emit_line() {
       (long)g_temp_cc,                             // temp   (x100 degC)
       (long)g_press_pa,                            // press  (Pa; /100 = hPa)
       (long)alt_mm,                                // alt_baro (mm)
-      (long)0,                                     // alt_fused — 融合はまだ無い
-      (long)0,                                     // vel      — 同上
-      (long)0,                                     // speed    — 源が無い
+      (long)(cs.h_est * 1000.0f),                  // alt_fused (mm)
+      (long)(cs.v_est * 1000.0f),                  // vel (mm/s)
+      (long)0,                                     // speed
       (long)acc_to_mm_s2(g_lia[2]),                // az ≒ LIA z
       (long)acc_to_mm_s2(g_lia[0]),                // lax
       (long)acc_to_mm_s2(g_lia[1]),                // lay
@@ -110,12 +151,12 @@ void emit_line() {
       (long)eul_to_cdeg(g_eul[0]),                 // heading
       (long)eul_to_cdeg(g_eul[2]),                 // roll  (BNO055: eul[2])
       (long)eul_to_cdeg(g_eul[1]),                 // pitch (BNO055: eul[1])
-      (long)0,                                     // calib — CALIB_STAT 未読
-      (long)0,                                     // vstate
-      (long)0,                                     // elev
+      (long)0,                                     // calib
+      (long)cs.vstate,                             // vstate
+      (long)(cs.elevator * 100.0f),                // elev (x100 deg)
       (long)0,                                     // servo
-      (long)0,                                     // rudder
-      (long)0);                                    // throttle
+      (long)(cs.rudder * 100.0f),                  // rudder (x100 deg)
+      (long)(cs.throttle * 1000.0f));              // throttle (x1000: 0..1000)
   if (written > 0)
     push_line(line, (uint32_t)written);
 }
@@ -209,6 +250,14 @@ uintptr_t poll_loop(uintptr_t, uintptr_t, uintptr_t, uintptr_t) {
 
     if ((int64_t)(BOARD::time_us() - next_emit) >= 0) {
       next_emit += g_period_us;
+      // ★素性は最初の 1 回と、以後たまに。★★最初の 1 回はここで払う —
+      //   CRC は像を丸ごとなめるので数ミリ秒かかり、割り当てを 1 回はみ出す。
+      //   起動経路 (BLE を上げる前) でこれをやると、その分だけ BLE の
+      //   立ち上がりが遅れるので、周期スレッドが回り始めてからにしている。
+      if (g_since_version == 0)
+        emit_version();
+      if (++g_since_version >= VERSION_EVERY)
+        g_since_version = 0;
       emit_line();
     }
   }

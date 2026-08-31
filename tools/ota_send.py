@@ -48,6 +48,7 @@ from bleak import BleakClient, BleakScanner  # noqa: E402
 from shizuku_link import DEVICE_NAME, NUS_TX_UUID, find_device  # noqa: E402
 
 OTA_RX_UUID = "6e402002-b5a3-f393-e0a9-e50e24dcca9e"
+NUS_RX_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
 # ★1 回の write に載せられるのは ATT MTU - 3。MTU は 247 に頭打ちしてある
 #   (btstack_config.h の HCI_ACL_PAYLOAD_SIZE=(247+4))。
 CHUNK = 244
@@ -282,7 +283,7 @@ async def main(path: str, do_upload: bool, do_commit: bool,
                 break
             if any(("reject" in x) or ("failed" in x) for x in lines):
                 print("RESULT: device rejected the transfer")
-                await client.stop_notify(NUS_TX_UUID)
+                await quiet_stop(client)
                 return 1
         else:
             # ★古いファームは "ready" を出さない。待ち続けずに進む。
@@ -327,7 +328,7 @@ async def main(path: str, do_upload: bool, do_commit: bool,
                 OTA_RX_UUID, payload[offset : offset + CHUNK],
                 response=with_response,
             )
-            await asyncio.sleep(0.003)
+            await asyncio.sleep(0.005)
             sent += min(CHUNK, len(payload) - offset)
             if offset % (CHUNK * 200) == 0:
                 elapsed = time.perf_counter() - t0
@@ -347,14 +348,46 @@ async def main(path: str, do_upload: bool, do_commit: bool,
         await asyncio.sleep(0.3)  # 内訳の行が続くので少しだけ待つ
 
         staged = any("OK (staged" in line for line in lines)
-        print("RESULT:", "staged OK" if staged else "not confirmed")
+        if staged:
+            print("RESULT: staged OK")
+        elif any("MISMATCH" in line for line in lines):
+            print("RESULT: CRC mismatch during staging (本体は無傷)")
+        elif any("failed" in line for line in lines):
+            print("RESULT: flash write failed during staging (本体は無傷)")
+        else:
+            print("RESULT: not confirmed (no ACK received from device)")
+
         if not staged:
-            await client.stop_notify(NUS_TX_UUID)
+            dump_tail(lines)
+            await quiet_stop(client)
             return 1
         if not do_commit:
-            await client.stop_notify(NUS_TX_UUID)
+            await quiet_stop(client)
             return 0
         return await commit(client, commit_cmd, lines)
+
+
+async def quiet_stop(client) -> None:
+    """通知を止める。★失敗しても黙って進む。
+
+    ここで例外を出すと、**その時点までに集めた診断が全部消える**。実際
+    「転送は途中まで進んでいたのに、後始末の disconnected で traceback だけが
+    残り、どこで死んだのか分からない」が 2 回起きた。切断は起こる前提の経路
+    なので、後始末は結果に影響させない。
+    """
+    try:
+        await quiet_stop(client)
+    except Exception as e:  # noqa: BLE001
+        print(f"  (stop_notify は無視: {type(e).__name__}: {e})")
+
+
+def dump_tail(lines: list, n: int = 12) -> None:
+    """デバイスから最後に届いた行を出す。どこまで進んだかの唯一の手掛かり。"""
+    print(f"--- デバイスからの最後の {min(n, len(lines))} 行 ---")
+    for line in lines[-n:]:
+        print(f"  | {line}")
+    if not lines:
+        print("  | (1 行も届いていない)")
 
 
 async def commit(client, commit_cmd: bytes, lines: list) -> int:
@@ -401,37 +434,66 @@ async def commit(client, commit_cmd: bytes, lines: list) -> int:
         pass
     phase("disconnected, waiting for the device to advertise again")
 
-    # ★「スキャンで見つかった」を成功の合図にしない。macOS は一度見つけた
-    #   ペリフェラルを覚えていて、**まだ焼いている最中でも即座に返してくる**
-    #   (実測: commit 確認から 0.9 秒で「戻った」と出たが、消去と書き込みだけで
-    #   1.7 秒かかるのだから戻れるはずがない)。実際に**繋いで、喋ることを
-    #   確かめる** — これなら再起動して BLE が上がりきったことの証拠になる。
+    expected_size, expected_crc = struct.unpack("<II", commit_cmd[4:12])
+    print(f"  expected post-OTA firmware: {expected_size} bytes, crc32={expected_crc:08x}")
+
     for attempt in range(8):
         device = await find_device(timeout=5.0, verbose=False)
         if device is None:
             continue
         try:
             async with BleakClient(device) as check:
-                heard = asyncio.Event()
+                heard_crc = asyncio.Event()
+                verified = [False]
+                got_crc = [0]
+                got_size = [0]
+                rx_buf = bytearray()
 
-                def on_line(_h, _data):
-                    heard.set()
+                def on_line(_h, data):
+                    rx_buf.extend(data)
+                    while b"\n" in rx_buf:
+                        idx = rx_buf.index(b"\n")
+                        line_str = bytes(rx_buf[:idx]).decode(errors="replace").strip()
+                        del rx_buf[:idx + 1]
+                        if line_str.startswith("VER:"):
+                            # VER: size=... crc=...
+                            parts = line_str.split()
+                            for p in parts[1:]:
+                                if p.startswith("crc="):
+                                    got_crc[0] = int(p.split("=")[1], 16)
+                                elif p.startswith("size="):
+                                    got_size[0] = int(p.split("=")[1])
+                            if got_crc[0] == expected_crc:
+                                verified[0] = True
+                            heard_crc.set()
 
                 await check.start_notify(NUS_TX_UUID, on_line)
-                try:
-                    await asyncio.wait_for(heard.wait(), timeout=6.0)
-                except asyncio.TimeoutError:
-                    print("  (connected but heard nothing; retrying)")
-                    continue
-                await check.stop_notify(NUS_TX_UUID)
+                # Send 'version' command to the shell to query running image CRC
+                for _ in range(3):
+                    await check.write_gatt_char(NUS_RX_UUID, b"version\n", response=False)
+                    try:
+                        await asyncio.wait_for(heard_crc.wait(), timeout=2.0)
+                        break
+                    except asyncio.TimeoutError:
+                        await asyncio.sleep(0.5)
+
+                await quiet_stop(check)
+
+                if verified[0]:
+                    phase(f"verified running firmware: size={got_size[0]}B, crc32={got_crc[0]:08x} (matches uploaded image!)")
+                    # ★最終行だけを見て判断されることがあるので、ここにも値を載せる。
+                    #   「verified」の一語より、突き合わせた数字が出ているほうが強い。
+                    print(f"RESULT: commit verified "
+                          f"(size={got_size[0]}B crc32={got_crc[0]:08x}, "
+                          f"rebooted + running new image, attempt {attempt + 1})")
+                    return 0
+                elif heard_crc.is_set():
+                    print(f"RESULT: commit mismatch (running crc {got_crc[0]:08x} != expected {expected_crc:08x})")
+                    return 1
         except Exception as e:  # noqa: BLE001 — 焼いている最中は繋がらない
-            print(f"  (not up yet: {type(e).__name__}); retrying")
+            print(f"  (not up yet: {type(e).__name__}: {e}); retrying")
             await asyncio.sleep(1.0)
             continue
-        phase("device is back and talking")
-        print(f"RESULT: committed and rebooted (verified on attempt "
-              f"{attempt + 1})")
-        return 0
     print("RESULT: committed, but the device never answered again — "
           "USB CDC を見ること")
     return 1
@@ -447,8 +509,13 @@ if __name__ == "__main__":
         raise SystemExit(2)
     image_path = positional[0] if positional else DEFAULT_IMAGE
     if not os.path.exists(image_path):
-        raise SystemExit(f"イメージがありません: {image_path}\n"
-                         "  bazel build //firmware_bazel:xno_bringup")
+        if os.path.exists(image_path + ".elf"):
+            image_path = image_path + ".elf"
+        elif os.path.exists(image_path + ".uf2"):
+            image_path = image_path + ".uf2"
+        else:
+            raise SystemExit(f"イメージがありません: {image_path}\n"
+                             "  bazel build //...")
     commit_only = "--commit-only" in flags
     raise SystemExit(asyncio.run(main(
         image_path,

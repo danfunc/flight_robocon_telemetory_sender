@@ -234,6 +234,9 @@ class TelemetryRx:
 
     def __init__(self):
         self._buf = bytearray()
+        # 板が名乗った像の素性 (bytes, crc32 の 16 進)。まだ来ていなければ None。
+        # ★OTA が本当に入れ替わったかは、焼いた側の申告ではなくこれで確かめる。
+        self.firmware = None
 
     def feed(self, chunk: bytes):
         self._buf += chunk
@@ -253,6 +256,20 @@ class TelemetryRx:
                     v = parse_csv_line(line)
                     if v is not None:
                         samples.append(v)
+                elif line.startswith("PICOVER,"):
+                    # 走っている像の素性。★テレメトリ行とは別種にしてある —
+                    #   "PICO," 行へ列を足すと、列数を見ている parse_csv_line が
+                    #   全行を捨ててテレメトリが丸ごと消えるため。
+                    parts = line.split(",")
+                    if len(parts) == 3:
+                        try:
+                            found = (int(parts[1]), parts[2].strip())
+                        except ValueError:
+                            found = None
+                        if found and found != self.firmware:
+                            self.firmware = found
+                            texts.append(
+                                f"firmware: {found[0]} bytes, crc={found[1]}")
                 else:
                     texts.append(line)
         return samples, texts

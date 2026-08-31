@@ -1,22 +1,43 @@
 // ===========================================================================
-//  shizuku_shell.cpp — Shizuku OS 対話型管理シェル (CLI)
+//  shizuku_shell.cpp — Shizuku OS 対話型・ワイヤレス管理シェル (CLI / BLE /
+//  CDC)
 // ===========================================================================
-#include "flash_fs.hpp"
+#include "shizuku_shell.hpp"
+#include "blink.hpp"
+#include "flight_controller.hpp"
+#include "hardware/gpio.h"
+#include "hardware/uart.h"
+#include "hardware/watchdog.h"
+#include "pico/stdlib.h"
+#include "fw_version.hpp"
+#include "props.hpp"
+#include "shizuku/kernel.hpp"
 #include "shizuku/object_api.hpp"
-#include "shizuku/objects/usb_cdc.hpp"
-#include "shizuku_loader.hpp"
+#include "shizuku/objects/ble_uart.hpp"
+#include "shizuku/objects/flash_fs.hpp"
+#include "shizuku/objects/ota.hpp"
+#include "shizuku/stream.hpp"
+#include "telemetry.hpp"
+#include "tx_frame.hpp"
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
-#include "pico/stdlib.h"
-#include "hardware/sync.h"
 
-extern "C" void rom_reset_usb_boot(uint32_t usb_activity_gpio_pin_mask,
-                                   uint32_t disable_interface_mask);
+extern "C" {
+void rom_reset_usb_boot(uint32_t usb_activity_gpio_pin_mask,
+                        uint32_t disable_interface_mask);
+extern const uint8_t __flash_binary_start[];
+extern const uint8_t __flash_binary_end[];
+}
 
 namespace xno::shell {
 namespace {
+
+using ARCH = shizuku::KERNEL::ARCH;
+using BOARD = shizuku::KERNEL::BOARD;
+using frame_t = xno::tx_frame;
 
 struct api_result {
   uintptr_t error;
@@ -38,378 +59,689 @@ api(shizuku::object_api number, uintptr_t a1 = 0, uintptr_t a2 = 0,
   return {r0, r1};
 }
 
-// I/O 出力ヘルパー (Pico SDK stdio 経由で完全一元化)
-void cdc_print(const char *str) {
-  printf("%s", str);
+uintptr_t export_method(method m, uintptr_t entry) {
+  return api(shizuku::object_api::EXPORT_METHOD, (uintptr_t)m, entry).error;
+}
+
+// ---- ハードウェア UART 定義 (Pico 2 W GP0:TX, GP1:RX) -----------------------
+#define SHELL_UART uart0
+constexpr uint32_t SHELL_UART_BAUD = 115200;
+constexpr uint SHELL_UART_TX_PIN = 0;
+constexpr uint SHELL_UART_RX_PIN = 1;
+
+// ---- 出力ストリーム (logger 経由 BLE TX notify)
+// ------------------------------
+shizuku::stream::storage<frame_t, 16> g_out;
+uintptr_t g_out_id = 0;
+
+// ---- 入力ストリーム (ble_uart の RX)
+// -----------------------------------------
+uintptr_t g_rx_id = xno::NO_STREAM;
+shizuku::stream::handle<frame_t> g_rx;
+
+// ---- UART バイナリブリッジ (XIAO 経由の OTA、BLE の代替経路) ---------------
+//  ★UART0 の読み手は shizuku_shell だけ (二人読みにしない)。バイナリ転送中は
+//    「行として読んでコマンド解釈する」代わりに「そのまま ota の入力ストリームへ
+//    積む」へモードを切り替える。持ち主(UART0 のリーダー)は変えず、
+//    バイトの行き先だけを変える設計。
+shizuku::stream::storage<frame_t, 4> g_uart_ota;
+uintptr_t g_uart_ota_id = 0;
+// ブリッジ終了後に ota の入力を戻す先。★0 で初期化しないこと —
+//   **ストリーム番号 0 は正当な番号**なので、0 を「未配線」の印に使うと、
+//   配線に失敗したまま「0 番へ戻す」= 無関係のストリームへ ota を繋いでしまう。
+uintptr_t g_ble_ota_stream_id = xno::NO_STREAM;
+bool g_uart_bridge_active = false;
+uint32_t g_uart_bridge_remaining = 0;
+// 中継中に 1 バイトも来ない時間がこれを超えたら抜ける (XIAO 側の 3 秒より長く
+// 取る: 先に向こうが諦めて ABORT を送れるようにし、両方が同時に切れるのを避ける)。
+constexpr uint64_t UART_BRIDGE_IDLE_US = 5000000;
+uint64_t g_uart_bridge_last_us = 0;
+
+// ★中継中でも聞こえる「やめろ」の合言葉 (XIAO 側と一致させること)。
+//   ブリッジ中はバイトを全部イメージとして飲むので、"UBRIDGE_ABORT\n" のような
+//   文字列は届かない (データと区別が付かない)。長い固定並びだけが聞き取れる。
+//   ★代償は偽陽性 — イメージ中に偶然この 8 バイトが並ぶと中断する。8 バイトなら
+//     2^-64 で無視でき、当たっても結果は「CRC が合わずに再送」。**取りこぼすより
+//     誤検出するほうが安全側**なのでこの交換を選んでいる。
+constexpr uint8_t BRIDGE_ABORT_MAGIC[8] = {0x55, 0xA5, 'U', 'B', 'R', 'K',
+                                           0x5A, 0xAA};
+uint8_t g_abort_window[sizeof(BRIDGE_ABORT_MAGIC)] = {};
+uint32_t g_abort_filled = 0;
+
+// 直近 8 バイトが合言葉と一致したか。★1 バイトずつずらして見る (窓)。
+bool abort_magic_seen(uint8_t b) {
+  for (uint32_t i = 1; i < sizeof(g_abort_window); ++i)
+    g_abort_window[i - 1] = g_abort_window[i];
+  g_abort_window[sizeof(g_abort_window) - 1] = b;
+  if (g_abort_filled < sizeof(g_abort_window)) {
+    ++g_abort_filled;
+    return false;
+  }
+  for (uint32_t i = 0; i < sizeof(g_abort_window); ++i)
+    if (g_abort_window[i] != BRIDGE_ABORT_MAGIC[i])
+      return false;
+  return true;
+}
+frame_t g_uart_bridge_frame{};
+
+void uart_bridge_push_byte(uint8_t b) {
+  g_uart_bridge_frame.data[g_uart_bridge_frame.len++] = b;
+  if (g_uart_bridge_frame.len >= sizeof(g_uart_bridge_frame.data)) {
+    g_uart_ota.hdl().push(g_uart_bridge_frame);
+    g_uart_bridge_frame = frame_t{};
+  }
+}
+
+void uart_bridge_flush() {
+  if (g_uart_bridge_frame.len > 0) {
+    g_uart_ota.hdl().push(g_uart_bridge_frame);
+    g_uart_bridge_frame = frame_t{};
+  }
+}
+
+void begin_uart_bridge(uint32_t total_bytes) {
+  using shizuku::objects::ota::method;
+  api(shizuku::object_api::CALL_METHOD, xno_object_id::ota,
+      (uintptr_t)method::SET_INPUT_STREAM, g_uart_ota_id);
+  g_uart_bridge_remaining = total_bytes;
+  g_uart_bridge_frame = frame_t{};
+  g_uart_bridge_active = true;
+  g_uart_bridge_last_us = BOARD::time_us();
+  g_abort_filled = 0; // 前の中継の名残りで即座に誤爆させない
+  uart_puts(SHELL_UART, "UBRIDGE_READY\n");
+}
+
+void end_uart_bridge() {
+  using shizuku::objects::ota::method;
+  uart_bridge_flush();
+  g_uart_bridge_active = false;
+  // ★★戻す前に**流し切るのを待つ**。ota は自分のスレッドで非同期に汲むので、
+  //   押し込んだ直後に入力を差し替えると、まだ汲まれていない末尾が宙に浮いて
+  //   そのまま捨てられる (環は 4 枠 = 976 バイトしかない)。像の最後だけが
+  //   欠ける形になり、CRC は弾いてくれるが原因は分かりにくい。
+  for (uint32_t spin = 0; spin < 2000 && g_uart_ota.hdl().available() > 0;
+       ++spin)
+    api(shizuku::object_api::YIELD);
+  if (g_ble_ota_stream_id != xno::NO_STREAM) {
+    api(shizuku::object_api::CALL_METHOD, xno_object_id::ota,
+        (uintptr_t)method::SET_INPUT_STREAM, g_ble_ota_stream_id);
+  } else {
+    // 配線されていないなら**戻さない**。適当な番号へ繋ぐより、BLE OTA が
+    // 効かないまま次の再起動を待つほうが安全 (回復手段を壊さない)。
+    uart_puts(SHELL_UART, "UBRIDGE_WARN no ble ota stream to restore\n");
+  }
+  uart_puts(SHELL_UART, "UBRIDGE_DONE\n");
+}
+
+// ---- シェル応答送信用ヘルパー (BLE TX notify & UART0) -----------------------
+void shell_send_frame(const frame_t &f) {
+  // ★焼いている最中は BLE へ何も積まない。上の読み飛ばしで大半は塞げるが、
+  //   出口でも止めておく (経路が増えたときに片方だけ直し忘れるため)。
+  if (shizuku::objects::ota::flash_busy())
+    return;
+  g_out.hdl().push(f);
+}
+
+void shell_printf(const char *fmt, ...) {
+  char buf[64];
+  va_list args;
+  va_start(args, fmt);
+  int len = vsnprintf(buf, sizeof(buf), fmt, args);
+  va_end(args);
+  if (len > 0) {
+    frame_t f{};
+    f.len = (uint16_t)(len < 64 ? len : 63);
+    memcpy(f.data, buf, f.len);
+    shell_send_frame(f);
+    if (uart_is_enabled(SHELL_UART)) {
+      uart_puts(SHELL_UART, buf);
+    }
+  }
+  printf("%s", buf);
   fflush(stdout);
 }
 
-void cdc_printf(const char *fmt, ...) {
-  char buf[256];
-  va_list args;
-  va_start(args, fmt);
-  vsnprintf(buf, sizeof(buf), fmt, args);
-  va_end(args);
-  cdc_print(buf);
-}
-
-// 1文字入力 (非ブロッキング/タイムアウト付き: stdio 経由)
-int get_char_nonblock(uint32_t timeout_us = 1000) {
-  int c = getchar_timeout_us(timeout_us);
-  return (c == PICO_ERROR_TIMEOUT || c == PICO_ERROR_NO_DATA) ? -1 : c;
-}
-
-// コマンドハンドラ群
-void cmd_help() {
-  cdc_print("\n=== Shizuku Interactive Shell ===\n");
-  cdc_print("ファイル管理:\n");
-  cdc_print("  ls                    Flash FS 内のファイル一覧\n");
-  cdc_print("  cat <file>            ファイル内容の表示 (Hex / ASCII)\n");
-  cdc_print("  rm <file>             ファイル削除\n");
-  cdc_print("  upload <path> <size>  ファイルを Flash FS へアップロード\n");
-  cdc_print("  format                Flash FS を初期化\n\n");
-  cdc_print("プロセス / オブジェクト管理:\n");
-  cdc_print("  ps                    実行中スレッド / 動的オブジェクト一覧\n");
-  cdc_print("  load <path> [core]    Flash FS からバイナリをロード・起動\n");
-  cdc_print("  swap <tgt> <path> [c] 動的オブジェクトを停止し新モジュールに差替\n");
-  cdc_print("  unload <id|name>      オブジェクトの停止・解放\n");
-  cdc_print("  call <id> <m> [arg]   オブジェクトメソッド実行\n\n");
-  cdc_print("システム:\n");
-  cdc_print("  mem                   メモリ・Flash FS 使用量表示\n");
-  cdc_print("  reboot                システム再起動\n");
-  cdc_print("  help / ?              ヘルプ表示\n\n");
-}
-
-void cmd_ls() {
-  fs::stat_t entries[16];
-  size_t count = fs::list_files(entries, 16);
-  cdc_print("\nNAME                     SIZE(B)    CRC32        XIP_ADDR    \n");
-  cdc_print("----------------------------------------------------------------\n");
-  for (size_t i = 0; i < count; ++i) {
-    cdc_printf("%-24s %-10lu 0x%08lx   0x%08lx\n",
-               entries[i].name,
-               (unsigned long)entries[i].size,
-               (unsigned long)entries[i].crc32,
-               (unsigned long)entries[i].xip_address);
-  }
-  cdc_printf("\n合計: %lu 件 (使用中: %lu KB / 空き: %lu KB)\n\n",
-             (unsigned long)count,
-             (unsigned long)(fs::used_space() / 1024),
-             (unsigned long)(fs::free_space() / 1024));
-}
-
-void cmd_cat(const char *path) {
-  uint8_t buf[256];
-  size_t actual = 0;
-  if (!fs::read_file(path, buf, sizeof(buf), &actual)) {
-    cdc_printf("エラー: ファイルを開けません: %s\n", path);
+// ---- fs コマンド -----------------------------------------------------------
+//  ★flash FS は「たまに書いて、ずっと読む」ための媒体。ここから **書く** 系を
+//    出すのは、シェルが「止まってよい経路」だから — 消去は 1 セクタ約 33ms、
+//    その間 XIP が止まる = 系全体が止まる。周期スレッドから触れる口は出さない。
+void handle_fs_command(const char *argument) {
+  using shizuku::objects::flash_fs_method;
+  using shizuku::objects::FLASH_FS_OBJECT;
+  const auto fs = [](flash_fs_method method, uintptr_t a) {
+    return api(shizuku::object_api::CALL_METHOD, FLASH_FS_OBJECT,
+               (uintptr_t)method, a);
+  };
+  if (!xno::props::available()) {
+    shell_printf("fs: unavailable (flash fs が登録されていない)\n");
     return;
   }
-  cdc_printf("\n=== %s (%lu bytes, 表示最大 256 bytes) ===\n", path, (unsigned long)actual);
-  for (size_t i = 0; i < actual; i += 16) {
-    cdc_printf("%04lx: ", (unsigned long)i);
-    for (size_t j = 0; j < 16; ++j) {
-      if (i + j < actual) cdc_printf("%02x ", buf[i + j]);
-      else cdc_print("   ");
+  if (argument[0] == '\0' || strcmp(argument, "ls") == 0) {
+    shizuku::objects::flash_entry entry{};
+    uint32_t shown = 0;
+    for (uint32_t index = 0; index < 64; ++index) {
+      entry = shizuku::objects::flash_entry{};
+      entry.index = index;
+      if (fs(flash_fs_method::LIST, (uintptr_t)&entry).value == 0)
+        break;
+      shell_printf("  %-24s %6lu B  @%p\n", entry.name,
+                   (unsigned long)entry.bytes, (void *)entry.address);
+      ++shown;
     }
-    cdc_print(" |");
-    for (size_t j = 0; j < 16; ++j) {
-      if (i + j < actual) {
-        char ch = (char)buf[i + j];
-        cdc_printf("%c", (ch >= 0x20 && ch < 0x7F) ? ch : '.');
-      }
-    }
-    cdc_print("|\n");
+    if (shown == 0)
+      shell_printf("  (empty)\n");
+    return;
   }
-  cdc_print("\n");
-}
-
-void cmd_rm(const char *path) {
-  if (fs::remove_file(path)) {
-    cdc_printf("削除成功: %s\n", path);
-  } else {
-    cdc_printf("エラー: 削除に失敗しました: %s\n", path);
+  if (strcmp(argument, "stat") == 0) {
+    shizuku::objects::flash_status status{};
+    fs(flash_fs_method::STATUS, (uintptr_t)&status);
+    shell_printf("fs: @%p %lu KiB, %lu files, used %lu B, free %lu B\n",
+                 (void *)status.region_address,
+                 (unsigned long)(status.region_bytes / 1024),
+                 (unsigned long)status.entries,
+                 (unsigned long)status.used_bytes,
+                 (unsigned long)status.free_bytes);
+    return;
   }
-}
-
-void cmd_format() {
-  cdc_print("Flash FS をフォーマット中...\n");
-  if (fs::format()) {
-    cdc_print("フォーマット完了。\n");
-  } else {
-    cdc_print("エラー: フォーマットに失敗しました\n");
-  }
-}
-
-void cmd_ps() {
-  cdc_print("\n[実行中スレッド一覧]\n");
-  cdc_print("TID  NAME               STATUS    \n");
-  cdc_print("------------------------------------\n");
-  for (uint32_t tid = 0; tid < 16; ++tid) {
-    char name_buf[32] = "(unknown)";
-    switch (tid) {
-      case 0: case 1: strcpy(name_buf, "root"); break;
-      case 2: strcpy(name_buf, "blink"); break;
-      case 3: case 4: strcpy(name_buf, "gdbagent"); break;
-      case 5: strcpy(name_buf, "gdbserver"); break;
-      case 6: strcpy(name_buf, "ble_uart"); break;
-      case 7: strcpy(name_buf, "logger"); break;
-      case 8: strcpy(name_buf, "ota"); break;
-      case 9: strcpy(name_buf, "telemetry"); break;
-      case 10: strcpy(name_buf, "flight_controller"); break;
-      case 11: strcpy(name_buf, "bno055"); break;
-      case 12: strcpy(name_buf, "bme280"); break;
-      case 13: strcpy(name_buf, "shell"); break;
-      default: strcpy(name_buf, "user_thread"); break;
-    }
-    cdc_printf("%-4lu %-18s RUNNING   \n", (unsigned long)tid, name_buf);
-  }
-
-  cdc_print("\n[ロード済み動的オブジェクト一覧]\n");
-  cdc_print("OBJ  TID  NAME           PATH               MODE      \n");
-  cdc_print("------------------------------------------------------------\n");
-  loader::loaded_info loaded[8];
-  size_t dyn_count = loader::list_loaded(loaded, 8);
-  for (size_t i = 0; i < dyn_count; ++i) {
-    if (loaded[i].is_active) {
-      cdc_printf("%-4lu %-4lu %-14s %-18s %-10s\n",
-                 (unsigned long)loaded[i].object_id,
-                 (unsigned long)loaded[i].thread_id,
-                 loaded[i].name,
-                 loaded[i].path,
-                 loaded[i].is_xip ? "XIP" : "RAM");
-    }
-  }
-  if (dyn_count == 0) {
-    cdc_print("(動的オブジェクトはありません)\n");
-  }
-  cdc_print("\n");
-}
-
-void cmd_load(const char *path, uint32_t core) {
-  cdc_printf("ロード中: %s (Core %lu)...\n", path, (unsigned long)core);
-  loader::loaded_info info{};
-  if (loader::load_object(path, core, true /* XIP */, &info)) {
-    cdc_printf("ロード成功: %s -> Object ID: %lu, Thread ID: %lu\n",
-               info.name, (unsigned long)info.object_id, (unsigned long)info.thread_id);
-  } else {
-    cdc_printf("エラー: ロードに失敗しました: %s\n", path);
-  }
-}
-
-void cmd_swap(const char *target, const char *new_path, uint32_t core) {
-  cdc_printf("ホットスワップ中: '%s' -> '%s' (Core %lu)...\n", target, new_path, (unsigned long)core);
-  loader::loaded_info info{};
-  if (loader::hot_swap(target, new_path, core, &info)) {
-    cdc_printf("ホットスワップ成功: '%s' に切り替え完了 (Obj: %lu)\n",
-               new_path, (unsigned long)info.object_id);
-  } else {
-    cdc_printf("エラー: ホットスワップに失敗しました: '%s'\n", target);
-  }
-}
-
-void cmd_unload(const char *arg) {
-  uint32_t obj_id = 0;
-  if (sscanf(arg, "%lu", (unsigned long *)&obj_id) == 1 && obj_id >= 20) {
-    if (loader::unload_object(obj_id)) {
-      cdc_printf("アンロード成功 (Object %lu)\n", (unsigned long)obj_id);
+  if (strncmp(argument, "cat ", 4) == 0) {
+    shizuku::objects::flash_lookup lookup{argument + 4, 0, 0};
+    fs(flash_fs_method::LOOKUP, (uintptr_t)&lookup);
+    if (lookup.address == 0) {
+      shell_printf("fs: '%s' not found\n", argument + 4);
       return;
     }
-  }
-  if (loader::unload_object_by_name(arg)) {
-    cdc_printf("アンロード成功 (%s)\n", arg);
-  } else {
-    cdc_printf("エラー: オブジェクト '%s' が見つかりません\n", arg);
-  }
-}
-
-void cmd_call(const char *arg) {
-  uint32_t obj_id = 0, method = 0, param = 0;
-  int n = sscanf(arg, "%lu %lu %lu", (unsigned long *)&obj_id,
-                 (unsigned long *)&method, (unsigned long *)&param);
-  if (n >= 2) {
-    const auto res = api(shizuku::object_api::CALL_METHOD, obj_id, method, param);
-    cdc_printf("CALL結果: error=%lu, value=%lu (0x%lx)\n",
-               (unsigned long)res.error, (unsigned long)res.value, (unsigned long)res.value);
-  } else {
-    cdc_print("使用法: call <obj_id> <method_id> [param]\n");
-  }
-}
-
-void cmd_mem() {
-  cdc_print("\n=== システムメモリ・Flash FS 使用量 ===\n");
-  cdc_printf("Flash FS: %lu KB 使用中 / %lu KB 空き (総容量: %lu KB)\n",
-             (unsigned long)(fs::used_space() / 1024),
-             (unsigned long)(fs::free_space() / 1024),
-             (unsigned long)(fs::FS_FLASH_SIZE / 1024));
-  cdc_print("\n");
-}
-
-void cmd_reboot() {
-  cdc_print("システムを再起動します...\n");
-  api(shizuku::object_api::SLEEP_US, 100000);
-  ::rom_reset_usb_boot(0, 0);
-}
-
-void cmd_upload(const char *path, size_t size) {
-  if (size == 0 || size > 65536) {
-    cdc_printf("エラー: 無効なファイルサイズです (%lu bytes)\n", (unsigned long)size);
+    // ★XIP なので写さずにそのまま読める。印字だけは長さで縛る (媒体には
+    //   1MB 置けるが、シェルの行に流してよい量ではない)。
+    constexpr uint32_t LIMIT = 192;
+    const uint32_t bytes = lookup.bytes < LIMIT ? lookup.bytes : LIMIT;
+    const uint8_t *data = (const uint8_t *)lookup.address;
+    shell_printf("fs: '%s' %lu B @%p\n", argument + 4,
+                 (unsigned long)lookup.bytes, (void *)lookup.address);
+    char hex[3 * 16 + 1];
+    for (uint32_t offset = 0; offset < bytes; offset += 16) {
+      uint32_t n = 0;
+      for (uint32_t i = 0; i < 16 && offset + i < bytes; ++i)
+        n += (uint32_t)snprintf(hex + n, sizeof(hex) - n, "%02x ",
+                                data[offset + i]);
+      shell_printf("  %04lx  %s\n", (unsigned long)offset, hex);
+    }
+    if (lookup.bytes > bytes)
+      shell_printf("  ... (%lu B 省略)\n",
+                   (unsigned long)(lookup.bytes - bytes));
     return;
   }
-  static uint8_t upload_buf[65536];
-
-  // 1. コマンド行末の残留改行 (\r, \n) をドレイン
-  int drain = -1;
-  while ((drain = get_char_nonblock(0)) >= 0) {
-    if (drain != '\r' && drain != '\n' && drain != ' ') {
-      upload_buf[0] = (uint8_t)drain;
-      break;
-    }
+  if (strncmp(argument, "rm ", 3) == 0) {
+    shell_printf(xno::props::remove(argument + 3) ? "fs: removed '%s'\n"
+                                                  : "fs: '%s' not found\n",
+                 argument + 3);
+    return;
   }
-
-  size_t received = (drain >= 0 && drain != '\r' && drain != '\n' && drain != ' ') ? 1 : 0;
-  cdc_printf("READY %lu\n", (unsigned long)size);
-
-  uint32_t idle_count = 0;
-  while (received < size) {
-    int c = get_char_nonblock(1000);
-    if (c < 0) {
-      api(shizuku::object_api::SLEEP_US, 1000); // 1ms
-      if (++idle_count > 10000) {               // 10秒タイムアウト
-        cdc_printf("\nエラー: アップロードがタイムアウトしました (%lu / %lu bytes)\n",
-                   (unsigned long)received, (unsigned long)size);
-        return;
-      }
-      continue;
-    }
-    upload_buf[received++] = (uint8_t)c;
-    idle_count = 0;
+  if (strcmp(argument, "format!") == 0) {
+    // ★'!' を要求する。FORMAT は**配ったアドレスを全部腐らせる**ので、
+    //   打ち間違いで走ってよい操作ではない。
+    fs(flash_fs_method::FORMAT, 0);
+    shell_printf("fs: formatted (置いてあったものは全部消えた)\n");
+    return;
   }
+  shell_printf("fs: unknown (ls | stat | cat <name> | rm <name> | format!)\n");
+}
 
-  if (fs::write_file(path, upload_buf, size)) {
-    cdc_printf("UPLOAD_OK %s (%lu bytes saved)\n", path, (unsigned long)size);
+// ---- ペアリング (numeric comparison / 施錠) の口 ---------------------------
+//  ★なぜシェルに置くか: 飛行前は USB を繋がない運用なので、ble_uart が持って
+//    いた「CDC で y/n」だけでは NC の承認ができない。UART0 (安全装置の XIAO)
+//    の読み書きを持っているのはこのシェルなので、承認の口もここに出す。
+//  ★ここから btstack は一切触らない。ble_uart のメソッドを呼んで**旗を立てる**
+//    だけで、実際の sm_* は ble_uart の poll スレッドが叩く
+//    ([[no-btstack-from-caller-thread]]: 呼び出し元スレッドから btstack に
+//    入ると CYW43 の SPI バスごと固まる)。
+namespace ble = shizuku::objects::ble_uart;
+
+api_result ble_call(ble::method m, uintptr_t a = 0) {
+  return api(shizuku::object_api::CALL_METHOD, xno_object_id::ble_uart,
+             (uintptr_t)m, a);
+}
+
+void print_pairing_state(const ble::pairing_state &s) {
+  shell_printf("NCSTAT: locked=%u bonds=%u pending=%u link=%u auth=%u\n",
+               s.locked, s.bonded, s.nc_pending, s.connected, s.authorized);
+  shell_printf("        strikes=%lu allow=%lus block=%lus\n",
+               (unsigned long)s.strikes, (unsigned long)s.allow_seconds_left,
+               (unsigned long)s.block_seconds_left);
+  if (s.nc_pending)
+    shell_printf("        待機中の番号 %06lu ('nc y' / 'nc n')\n",
+                 (unsigned long)s.nc_passkey);
+}
+
+void handle_nc_command(const char *argument) {
+  ble::pairing_state s{};
+  if (argument[0] == '\0' || strcmp(argument, "status") == 0) {
+    ble_call(ble::method::GET_PAIRING_STATE, (uintptr_t)&s);
+    print_pairing_state(s);
+    return;
+  }
+  if (strcmp(argument, "y") == 0 || strcmp(argument, "yes") == 0) {
+    const auto r = ble_call(ble::method::PAIRING_ANSWER, 1);
+    shell_printf(r.value ? "NC: confirmed\n" : "NC: 訊かれていない\n");
+    return;
+  }
+  if (strcmp(argument, "n") == 0 || strcmp(argument, "no") == 0) {
+    const auto r = ble_call(ble::method::PAIRING_ANSWER, 0);
+    shell_printf(r.value ? "NC: declined\n" : "NC: 訊かれていない\n");
+    return;
+  }
+  if (strcmp(argument, "lock") == 0) {
+    ble_call(ble::method::SET_PAIRING_LOCK, 1);
+    shell_printf("NC: locked (新規ペアリングを拒否)\n");
+    return;
+  }
+  if (strcmp(argument, "allow") == 0) {
+    // ★「解錠」ではなく**一回券**。ble_uart 側で時間切れとペアリング成立の
+    //   両方で失効する。戻し忘れを人の記憶に頼らないため。
+    ble_call(ble::method::SET_PAIRING_LOCK, 0);
+    ble_call(ble::method::GET_PAIRING_STATE, (uintptr_t)&s);
+    shell_printf("NC: 次の 1 回だけペアリングを許可 (残り %lus)\n",
+                 (unsigned long)s.allow_seconds_left);
+    return;
+  }
+  if (strcmp(argument, "forget!") == 0) {
+    // ★'!' を要求する。**打ち間違いで走ってよい操作ではない** —— 母艦との
+    //   ボンドが消えるので、次の接続は必ず NC のやり直しになる。fs format! と
+    //   同じ作法。
+    ble_call(ble::method::FORGET_BONDS);
+    shell_printf("NC: forgetting bonds (リンクを一度落とします)\n");
+    return;
+  }
+  shell_printf("nc: unknown (status | y | n | lock | allow | forget!)\n");
+}
+
+// ---- コマンド解釈ディスパッチャ
+// ----------------------------------------------
+void handle_command_line(char *line) {
+  while (*line && ((uint8_t)*line <= ' ' || (uint8_t)*line > 126))
+    ++line;
+  size_t len = strlen(line);
+  while (len > 0 && ((uint8_t)line[len - 1] <= ' ' || (uint8_t)line[len - 1] > 126)) {
+    line[--len] = '\0';
+  }
+  if (len == 0)
+    return;
+
+  // 1. システム制御 (REBOOT, BOOTSEL)
+  if (strcmp(line, "reboot") == 0 || strcmp(line, "RB") == 0) {
+    shell_printf("Rebooting system...\n");
+    sleep_ms(100);
+    watchdog_reboot(0, 0, 10);
+  } else if (strcmp(line, "bootsel") == 0 || strcmp(line, "BS") == 0) {
+    shell_printf("Rebooting into BOOTSEL mode...\n");
+    sleep_ms(100);
+    rom_reset_usb_boot(0, 0);
+  }
+  // 2. テレメトリレート・操縦 (R<ms>, STATUS, ARM, DISARM)
+  else if (line[0] == 'R' || line[0] == 'r') {
+    const uint32_t rate_ms = (uint32_t)strtoul(line + 1, nullptr, 10);
+    if (rate_ms >= 5 && rate_ms <= 10000) {
+      api(shizuku::object_api::CALL_METHOD, telemetry::OBJECT,
+          (uintptr_t)telemetry::method::SET_RATE, rate_ms);
+      shell_printf("RATE ok %lu ms\n", (unsigned long)rate_ms);
+    } else {
+      shell_printf("RATE err\n");
+    }
+  } else if (strncmp(line, "STATUS", 6) == 0 || strcmp(line, "status") == 0) {
+    // ★グローバル直読みをやめ、持ち主に訊く (telemetry.cpp 冒頭の理由と同じ)。
+    ::flight_controller::control_state cs{};
+    api(shizuku::object_api::CALL_METHOD, ::flight_controller::OBJECT,
+        (uintptr_t)::flight_controller::method::GET_CONTROL_STATE, (uintptr_t)&cs);
+    shell_printf(
+        "STATUS: armed=%u vstate=%u elev=%.1f rud=%.1f thr=%.1f h_est=%.1f\n",
+        cs.armed, cs.vstate, cs.elevator, cs.rudder, cs.throttle * 100.0f,
+        cs.h_est);
+  } else if (strncmp(line, "DISARM", 6) == 0) {
+    // ★DISARM を先に見る。"ARM" の前方一致で先に拾ってしまうと、DISARM が
+    //   ARM として通る (2 文字目以降を見ていないため)。
+    api(shizuku::object_api::CALL_METHOD, ::flight_controller::OBJECT,
+        (uintptr_t)::flight_controller::method::ARM, 0);
+    shell_printf("DISARM ok\n");
+  } else if (strncmp(line, "ARM", 3) == 0) {
+    // ★番号は enum から取る。3 と直書きしてあったが、3 は POLL で ARM は 7
+    //   だった (つまり ARM も DISARM も POLL を呼んでいた)。
+    api(shizuku::object_api::CALL_METHOD, ::flight_controller::OBJECT,
+        (uintptr_t)::flight_controller::method::ARM, 1);
+    shell_printf("ARM ok\n");
+  } else if (strncmp(line, "PITCH ", 6) == 0 ||
+             strncmp(line, "pitch ", 6) == 0) {
+    float deg = strtof(line + 6, nullptr);
+    int32_t cdeg = (int32_t)(deg * 100.0f);
+    api(shizuku::object_api::CALL_METHOD, ::flight_controller::OBJECT,
+        (uintptr_t)::flight_controller::method::SET_PITCH_REF, (uintptr_t)cdeg);
+    shell_printf("PITCH ref %.1f deg\n", deg);
+  } else if (strncmp(line, "HEAD ", 5) == 0 || strncmp(line, "head ", 5) == 0 ||
+             strncmp(line, "HEADING ", 8) == 0 ||
+             strncmp(line, "heading ", 8) == 0) {
+    const char *p =
+        (line[0] == 'H' && line[1] == 'E' && (line[4] == 'I' || line[4] == 'i'))
+            ? (line + 8)
+            : (line + 5);
+    float deg = strtof(p, nullptr);
+    int32_t cdeg = (int32_t)(deg * 100.0f);
+    api(shizuku::object_api::CALL_METHOD, ::flight_controller::OBJECT,
+        (uintptr_t)::flight_controller::method::SET_HEADING_REF,
+        (uintptr_t)cdeg);
+    shell_printf("HEADING ref %.1f deg\n", deg);
+  } else if (strncmp(line, "ALT ", 4) == 0 || strncmp(line, "alt ", 4) == 0) {
+    float alt_m = strtof(line + 4, nullptr);
+    int32_t mm = (int32_t)(alt_m * 1000.0f);
+    api(shizuku::object_api::CALL_METHOD, ::flight_controller::OBJECT,
+        (uintptr_t)::flight_controller::method::SET_ALT_REF, (uintptr_t)mm);
+    shell_printf("ALT ref %.1f m\n", alt_m);
+  } else if (strcmp(line, "version") == 0 || strcmp(line, "VER") == 0 ||
+             strcmp(line, "crc") == 0) {
+    // ★計算は fw_version へ寄せた。telemetry 側も同じ値を出す必要があり、
+    //   2 箇所に同じ CRC 実装を置くとズレたときに気づけない。
+    const auto &id = xno::firmware_id();
+    shell_printf("VER: size=%lu crc=%08lx\n", (unsigned long)id.bytes,
+                 (unsigned long)id.crc32);
+  } else if (strncmp(line, "fs", 2) == 0 &&
+             (line[2] == '\0' || line[2] == ' ')) {
+    handle_fs_command(line[2] == '\0' ? "" : line + 3);
+  } else if (strncmp(line, "nc", 2) == 0 &&
+             (line[2] == '\0' || line[2] == ' ')) {
+    handle_nc_command(line[2] == '\0' ? "" : line + 3);
+  } else if (strcmp(line, "PING") == 0 || strcmp(line, "ping") == 0) {
+    shell_printf("PONG\n");
+  } else if (strncmp(line, "SAFE", 4) == 0) {
+    // 外部安全装置 (Seeed XIAO) からの安全ハートビート / アラート。
+    // 必要に応じて安全インターロックの反映が可能。
+    // ★接頭辞を "SAFE" 4 文字だけで見る。以前は "SAFE," と "SAFE_" を
+    //   個別に並べていたが、XIAO の Rust 化で 2 行目 `SAFE2,...` が増えた
+    //   瞬間にどちらにも一致しなくなり、**10Hz で "unknown command" を
+    //   返し続ける**状態になった。返事は UART0 と BLE の両方へ出るので、
+    //   (1) 母艦の OTW スクリプトの drain() が永久に idle にならず固まる
+    //   (2) 焼いている最中の BLE トラフィックが CYW43 を壊す
+    //       (HANDOFF 2026-08-30 に「XIAO の定期送信で OTA が毎回死ぬ」として
+    //        記録済みの形) という二重の壊れ方をする。
+    // ★安全装置が名乗る行は**将来増える前提**で、種類ごとに列挙しない。
+    //   ここは「相手の近況報告には黙って頷く」場所であって、
+    //   語彙を検査する場所ではない。
+  } else if (strncmp(line, "UBRIDGE ", 8) == 0) {
+    // XIAO からの UART バイナリブリッジ開始要求 (BLE の代替 OTA 経路)。
+    // a1 = これから生バイトで流れてくる総バイト数 (ota.hpp のヘッダ+本体)。
+    const uint32_t total = (uint32_t)strtoul(line + 8, nullptr, 10);
+    if (total > 0) {
+      begin_uart_bridge(total);
+    }
+  } else if (strcmp(line, "help") == 0 || strcmp(line, "?") == 0) {
+    shell_printf(
+        "Commands: status, arm, disarm, pitch <deg>, head <deg>, alt <m>\n");
+    shell_printf("          r<ms>, version, reboot, bootsel, ping\n");
+    shell_printf("          fs [ls|stat|cat <name>|rm <name>|format!]\n");
+    shell_printf("          nc [status|y|n|lock|allow|forget!]\n");
   } else {
-    cdc_print("エラー: Flash FS への保存に失敗しました\n");
+    shell_printf("unknown command: %s (try 'help')\n", line);
   }
 }
 
-void parse_and_execute(char *line) {
-  while (*line != '\0' && (unsigned char)*line <= ' ') ++line;
-  char *end = line + strlen(line);
-  while (end > line && (unsigned char)*(end - 1) <= ' ') *(--end) = '\0';
-  if (*line == '\0') return;
-
-  char *cmd = line;
-  char *arg = strchr(line, ' ');
-  if (arg != nullptr) {
-    *arg++ = '\0';
-    while (*arg != '\0' && (unsigned char)*arg <= ' ') ++arg;
-  }
-
-  if (strcmp(cmd, "help") == 0 || strcmp(cmd, "?") == 0) {
-    cmd_help();
-  } else if (strcmp(cmd, "ls") == 0) {
-    cmd_ls();
-  } else if (strcmp(cmd, "cat") == 0 && arg) {
-    cmd_cat(arg);
-  } else if (strcmp(cmd, "rm") == 0 && arg) {
-    cmd_rm(arg);
-  } else if (strcmp(cmd, "format") == 0) {
-    cmd_format();
-  } else if (strcmp(cmd, "ps") == 0 || strcmp(cmd, "threads") == 0) {
-    cmd_ps();
-  } else if (strcmp(cmd, "load") == 0 || strcmp(cmd, "run") == 0) {
-    if (arg) {
-      char path[32];
-      uint32_t core = 0;
-      if (sscanf(arg, "%31s %lu", path, (unsigned long *)&core) >= 1) {
-        cmd_load(path, core);
-      }
-    } else {
-      cdc_print("使用法: load <path> [core]\n");
-    }
-  } else if (strcmp(cmd, "swap") == 0 || strcmp(cmd, "hotswap") == 0) {
-    if (arg) {
-      char target[32], path[32];
-      uint32_t core = 0;
-      if (sscanf(arg, "%31s %31s %lu", target, path, (unsigned long *)&core) >= 2) {
-        cmd_swap(target, path, core);
-      } else {
-        cdc_print("使用法: swap <target_name> <new_path> [core]\n");
-      }
-    } else {
-      cdc_print("使用法: swap <target_name> <new_path> [core]\n");
-    }
-  } else if (strcmp(cmd, "unload") == 0 && arg) {
-    cmd_unload(arg);
-  } else if (strcmp(cmd, "call") == 0 && arg) {
-    cmd_call(arg);
-  } else if (strcmp(cmd, "mem") == 0 || strcmp(cmd, "free") == 0) {
-    cmd_mem();
-  } else if (strcmp(cmd, "reboot") == 0) {
-    cmd_reboot();
-  } else if (strcmp(cmd, "upload") == 0 && arg) {
-    char path[32];
-    size_t size = 0;
-    if (sscanf(arg, "%31s %zu", path, &size) == 2) {
-      cmd_upload(path, size);
-    } else {
-      cdc_print("使用法: upload <path> <size_in_bytes>\n");
-    }
-  } else {
-    cdc_printf("不明なコマンド: '%s' ('help' でコマンド一覧を表示)\n", cmd);
-  }
+// Method 0: GET_STREAM
+uintptr_t method_get_stream(uintptr_t, uintptr_t, uintptr_t, uintptr_t) {
+  return g_out_id;
 }
 
-// ---- シェルメインループ (Core 0 固定) ------------------------------------------
-uintptr_t shell_loop(uintptr_t, uintptr_t, uintptr_t, uintptr_t) {
-  api(shizuku::object_api::DECLARE_NAME, (uintptr_t)"shell");
+// Method 1: SET_RX_STREAM
+uintptr_t method_set_rx_stream(uintptr_t stream_id, uintptr_t, uintptr_t,
+                               uintptr_t) {
+  g_rx_id = stream_id;
+  return 0;
+}
 
-  char line_buf[128];
-  size_t line_len = 0;
+// Method 2: PROCESS_CMD
+uintptr_t method_process_cmd(uintptr_t cmd_ptr, uintptr_t, uintptr_t,
+                             uintptr_t) {
+  if (cmd_ptr != 0) {
+    handle_command_line((char *)cmd_ptr);
+  }
+  return 0;
+}
 
-  cdc_print("\nshizuku> ");
+// Method 5: SET_BLE_OTA_STREAM
+uintptr_t method_set_ble_ota_stream(uintptr_t stream_id, uintptr_t, uintptr_t,
+                                    uintptr_t) {
+  g_ble_ota_stream_id = stream_id;
+  return 0;
+}
 
-  uint32_t idle_ticks = 0;
+// メインポーリングループ (Core 0: BLE ストリーム ＆ CDC ＆ UART0 を監視)
+uintptr_t poll_loop(uintptr_t, uintptr_t, uintptr_t, uintptr_t) {
+  char cdc_line[128] = "";
+  size_t cdc_pos = 0;
+  char uart_line[128] = "";
+  size_t uart_pos = 0;
+
+  // ハードウェア UART0 初期化 (外部安全装置・XIAO との通信)
+  uart_init(SHELL_UART, SHELL_UART_BAUD);
+  gpio_set_function(SHELL_UART_TX_PIN, GPIO_FUNC_UART);
+  gpio_set_function(SHELL_UART_RX_PIN, GPIO_FUNC_UART);
+  gpio_pull_up(SHELL_UART_RX_PIN);
+  gpio_pull_up(SHELL_UART_TX_PIN);
+  uart_set_hw_flow(SHELL_UART, false, false);
+  uart_set_format(SHELL_UART, 8, 1, UART_PARITY_NONE);
+  uart_set_fifo_enabled(SHELL_UART, true);
+
+  // 出力ストリーム (logger への応答) を PRODUCER としてバインド
+  if (g_out_id != 0) {
+    api(shizuku::object_api::STREAM_BIND, g_out_id,
+        (uintptr_t)shizuku::stream::role::PRODUCER);
+  }
+  // UART ブリッジ用ストリーム (ota への中継) も PRODUCER としてバインド
+  if (g_uart_ota_id != 0) {
+    api(shizuku::object_api::STREAM_BIND, g_uart_ota_id,
+        (uintptr_t)shizuku::stream::role::PRODUCER);
+  }
+
+  // BLE RX ストリームのオープン ＆ バインド (ポーリングスレッド内で実行)
+  if (g_rx_id != xno::NO_STREAM && !g_rx.valid()) {
+    const auto opened = api(shizuku::object_api::STREAM_OPEN, g_rx_id);
+    if (opened.error == 0 && opened.value != 0) {
+      g_rx = shizuku::stream::handle<frame_t>(
+          (shizuku::stream::descriptor *)opened.value);
+      api(shizuku::object_api::STREAM_BIND, g_rx_id,
+          (uintptr_t)shizuku::stream::role::CONSUMER);
+      BOARD::diag_printf("[SHELL] bound to BLE RX stream %lu\n",
+                         (unsigned long)g_rx_id);
+    }
+  }
+
+  // ペアリングの問いかけを取りこぼさないための追跡。★通し番号を覚えるのは、
+  //   「今 pending か」だけを見ていると、このループの周期 (最短 5ms、実際は
+  //   他の仕事に取られる) の隙間に出て消えた要求を一度も表示できないため。
+  uint32_t last_nc_generation = 0;
+  uint32_t last_block_seconds = 0;
+  uint64_t next_pairing_poll_us = 0;
 
   while (true) {
-    int c = get_char_nonblock(0);
-    if (c < 0) {
-      api(shizuku::object_api::SLEEP_US, 2000); // 2ms
-      // 500ms アイドルで未完了行をリセット (ゴミ文字蓄積防止)
-      if (++idle_ticks > 250 && line_len > 0) {
-        line_len = 0;
-      }
-      continue;
-    }
-    idle_ticks = 0;
+    bool did_work = false;
 
-    while (c >= 0) {
-      if (c == '\r' || c == '\n') {
-        if (line_len > 0) {
-          cdc_print("\n");
-          line_buf[line_len] = '\0';
-          parse_and_execute(line_buf);
-          line_len = 0;
-          cdc_print("shizuku> ");
+    // 0. ペアリング状態の見張り (200ms ごと)。
+    //    ★NC の番号を **UART0 へ自分から流す**のがここの仕事。ble_uart から
+    //      直接 UART へ書かせない理由は、UART0 に書き手が二人できると行が
+    //      混ざるため (読み手を一人に保っているのと同じ理由)。
+    //    ★焼いている最中はやらない。UART/BLE へ行を出すと、IRQ を止めている
+    //      最中の BLE トラフィックが CYW43 を壊す (下の flash_busy と同じ話)。
+    //    ★★中継中も**やらない**。ブリッジ中の UART0 は生のイメージが流れる
+    //      専用線で、ここから行を書くと XIAO 経由で母艦の画面へ割り込む
+    //      (向きが逆なので像は壊れないが、母艦の drain() を idle にさせない)。
+    //      「焼いている間は黙る」のと同じ理由で、経路ごとに書き忘れないこと。
+    if (BOARD::time_us() >= next_pairing_poll_us && !g_uart_bridge_active &&
+        !shizuku::objects::ota::flash_busy()) {
+      next_pairing_poll_us = BOARD::time_us() + 200000;
+      ble::pairing_state ps{};
+      if (ble_call(ble::method::GET_PAIRING_STATE, (uintptr_t)&ps).value != 0) {
+        if (ps.nc_generation != last_nc_generation) {
+          last_nc_generation = ps.nc_generation;
+          if (ps.nc_pending) {
+            did_work = true;
+            shell_printf("NC,%06lu\n", (unsigned long)ps.nc_passkey);
+            shell_printf("NC: 相手の表示と同じなら 'nc y'、違えば 'nc n'\n");
+          }
         }
-      } else if (c == 0x08 || c == 0x7F) { // Backspace / Delete
-        if (line_len > 0) --line_len;
-      } else if (c >= 0x20 && c < 0x7F) {
-        if (line_len + 1 < sizeof(line_buf)) {
-          line_buf[line_len++] = (char)c;
+        // クールダウンに入った/明けたことは黙っていると原因不明の
+        // 「見つからない」になるので、遷移だけ知らせる。
+        if ((ps.block_seconds_left != 0) != (last_block_seconds != 0)) {
+          shell_printf("NC: advertising %s\n",
+                       ps.block_seconds_left ? "OFF (pairing cooldown)" : "ON");
         }
+        last_block_seconds = ps.block_seconds_left;
       }
-      c = get_char_nonblock(0);
+    }
+
+    // 1. BLE RX ストリームからコマンドを受信
+    if (!g_rx.valid() && g_rx_id != xno::NO_STREAM) {
+      const auto opened = api(shizuku::object_api::STREAM_OPEN, g_rx_id);
+      if (opened.error == 0 && opened.value != 0) {
+        g_rx = shizuku::stream::handle<frame_t>(
+            (shizuku::stream::descriptor *)opened.value);
+        api(shizuku::object_api::STREAM_BIND, g_rx_id,
+            (uintptr_t)shizuku::stream::role::CONSUMER);
+      }
+    }
+
+    if (g_rx.valid()) {
+      frame_t f{};
+      uint32_t lost = 0;
+      while (g_rx.pop(&f, &lost)) {
+        did_work = true;
+        char cmd_buf[sizeof(f.data) + 1];
+        size_t copy_len = f.len < sizeof(f.data) ? f.len : sizeof(f.data) - 1;
+        memcpy(cmd_buf, f.data, copy_len);
+        cmd_buf[copy_len] = '\0';
+        char *nl = strpbrk(cmd_buf, "\r\n");
+        if (nl)
+          *nl = '\0';
+        handle_command_line(cmd_buf);
+      }
+    }
+
+    // 2. CDC (USB stdio) からの入力
+    int c = getchar_timeout_us(0);
+    if (c != PICO_ERROR_TIMEOUT && c != PICO_ERROR_NO_DATA && c >= 0) {
+      did_work = true;
+      if (c == '\r' || c == '\n') {
+        if (cdc_pos > 0) {
+          cdc_line[cdc_pos] = '\0';
+          printf("\r\n");
+          handle_command_line(cdc_line);
+          cdc_pos = 0;
+        }
+        printf("shizuku> ");
+        fflush(stdout);
+      } else if (c == 0x08 || c == 0x7F) { // Backspace
+        if (cdc_pos > 0) {
+          --cdc_pos;
+          printf("\b \b");
+          fflush(stdout);
+        }
+      } else if (cdc_pos + 1 < sizeof(cdc_line) && c >= 32 && c <= 126) {
+        cdc_line[cdc_pos++] = (char)c;
+        putchar(c);
+        fflush(stdout);
+      }
+    }
+
+    // 3. UART0 (Seeed XIAO 等の安全装置) からのコマンド受信
+    //    ★ブリッジ中は「行として解釈する」のをやめ、生バイトをそのまま
+    //      ota の入力ストリームへ積む (二人読みを避けるため、UART0 の
+    //      リーダーはここ一つのまま、バイトの行き先だけを切り替える)。
+    if (g_uart_bridge_active) {
+      while (g_uart_bridge_remaining > 0 && uart_is_readable(SHELL_UART)) {
+        did_work = true;
+        uint8_t b = (uint8_t)uart_getc(SHELL_UART);
+        if (abort_magic_seen(b)) {
+          // 相手が降りた。数え終わるのを待たずに畳む (待つと居座る)。
+          uart_puts(SHELL_UART, "UBRIDGE_ABORTED\n");
+          end_uart_bridge();
+          break;
+        }
+        uart_bridge_push_byte(b);
+        --g_uart_bridge_remaining;
+        g_uart_bridge_last_us = BOARD::time_us();
+      }
+      if (!g_uart_bridge_active)
+        goto bridge_done;
+      // ★★無通信で抜ける道を必ず持つこと。母艦や XIAO が途中で諦めると、
+      //   ここは「残りバイトを待ち続ける」ので永久に中継のまま居座る。
+      //   その間 UART はコマンドを受け付けず、しかも ota の入力が UART 側を
+      //   向いたままなので **BLE OTA も効かない** —— 回復手段を増やすための
+      //   機能が、失敗すると回復手段を全部塞ぐ (実際に踏んだ)。
+      //   抜けるときは end_uart_bridge() を必ず通し、入力を BLE へ戻す。
+      if (g_uart_bridge_remaining == 0) {
+        end_uart_bridge();
+      } else if (BOARD::time_us() - g_uart_bridge_last_us >
+                 (uint64_t)UART_BRIDGE_IDLE_US) {
+        uart_puts(SHELL_UART, "UBRIDGE_TIMEOUT\n");
+        end_uart_bridge();
+      }
+    bridge_done:;
+    } else if (shizuku::objects::ota::flash_busy()) {
+      // ★★焼いている間は UART の行を**解釈しない**。解釈すると知らない
+      //   コマンドへの返事が BLE の TX ストリームへ出て、IRQ を止めている
+      //   最中の BLE トラフィックが CYW43 を壊す (2026-08-30 に 3 回踏んだ:
+      //   安全装置 XIAO の定期送信がきっかけで OTA が毎回死んだ)。
+      //   捨てるのではなく**読み飛ばす**だけにして、FIFO の溢れも防ぐ。
+      while (uart_is_readable(SHELL_UART))
+        (void)uart_getc(SHELL_UART);
+      uart_pos = 0;
+    } else {
+      while (uart_is_readable(SHELL_UART)) {
+        did_work = true;
+        char ch = (char)uart_getc(SHELL_UART);
+        if (ch == '\r' || ch == '\n') {
+          if (uart_pos > 0) {
+            uart_line[uart_pos] = '\0';
+            handle_command_line(uart_line);
+            uart_pos = 0;
+          }
+        } else if (ch == 0x08 || ch == 0x7F) {
+          if (uart_pos > 0) {
+            --uart_pos;
+          }
+        } else if (uart_pos + 1 < sizeof(uart_line) && (uint8_t)ch >= 32 && (uint8_t)ch <= 126) {
+          uart_line[uart_pos++] = ch;
+        }
+        if (g_uart_bridge_active)
+          break; // UBRIDGE がこの行で発火した場合、残りは次周回でブリッジ経路へ
+      }
+    }
+
+    if (!did_work) {
+      api(shizuku::object_api::SLEEP_US, 5000); // 5ms
     }
   }
   return 0;
 }
 
 uintptr_t shell_main(uintptr_t, uintptr_t, uintptr_t, uintptr_t) {
-  api(shizuku::object_api::DECLARE_NAME, (uintptr_t)"shell");
-  api(shizuku::object_api::EXPORT_METHOD, 1 /* POLL */, (uintptr_t)&shell_loop);
-  return 0;
+  uintptr_t failures =
+      api(shizuku::object_api::DECLARE_NAME, (uintptr_t)"shizuku_shell").error;
+  failures += export_method(method::MAIN, (uintptr_t)&shell_main);
+  failures +=
+      export_method(method::SET_RX_STREAM, (uintptr_t)&method_set_rx_stream);
+  failures += export_method(method::GET_STREAM, (uintptr_t)&method_get_stream);
+  failures +=
+      export_method(method::PROCESS_CMD, (uintptr_t)&method_process_cmd);
+  failures += export_method(method::POLL, (uintptr_t)&poll_loop);
+  failures += export_method(method::SET_BLE_OTA_STREAM,
+                            (uintptr_t)&method_set_ble_ota_stream);
+
+  g_out.init();
+  const auto created =
+      api(shizuku::object_api::STREAM_CREATE, (uintptr_t)&g_out.desc);
+  failures += created.error;
+  g_out_id = created.value;
+
+  g_uart_ota.init();
+  const auto uart_ota_created =
+      api(shizuku::object_api::STREAM_CREATE, (uintptr_t)&g_uart_ota.desc);
+  failures += uart_ota_created.error;
+  g_uart_ota_id = uart_ota_created.value;
+  return failures;
 }
 
 } // namespace
@@ -418,13 +750,16 @@ uint32_t register_shell(uintptr_t obj_id) {
   const auto created =
       api(shizuku::object_api::CREATE_OBJECT, obj_id, (uintptr_t)&shell_main,
           shizuku::OBJECT_PRIVILEGED | shizuku::OBJECT_ON_CORE(0));
-  const auto exported = api(shizuku::object_api::CALL_METHOD, obj_id, 0, 0);
-  return (created.error == 0 && exported.error == 0) ? 0 : 1;
+  if (created.error != 0)
+    return 0;
+  const auto inited = api(shizuku::object_api::CALL_METHOD, obj_id, 0, 0);
+  return inited.error == 0 ? 1 : 0;
 }
 
 uint32_t start_shell(uintptr_t obj_id) {
-  const auto spawned = api(shizuku::object_api::SPAWN, obj_id, 1 /* POLL */, 0);
-  return (spawned.error == 0) ? 0 : 1;
+  const auto res =
+      api(shizuku::object_api::SPAWN, obj_id, (uintptr_t)method::POLL, 0);
+  return (uint32_t)res.value;
 }
 
 } // namespace xno::shell

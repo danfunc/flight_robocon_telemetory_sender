@@ -27,11 +27,16 @@ class BleShellClient:
         self.connected = False
 
     def _notification_handler(self, sender, data: bytearray):
+        print(f"DEBUG RAW: {data[:10]}")
         text = data.decode("utf-8", errors="replace")
-        # 1行ずつキューへ
+        # テレメトリ行 (PICO,...) を除外し、シェル応答行のみをキューに積む
         lines = text.splitlines(keepends=True)
         for line in lines:
-            self.rx_queue.put_nowait(line)
+            if line.startswith("PICO,"):
+                continue
+            if line.strip():
+                print(f"  [BLE NOTIFY NON-TELEM] {line.strip()}")
+                self.rx_queue.put_nowait(line)
 
     async def connect(self, timeout=12.0):
         print(f"🔍 BLE デバイス '{DEVICE_NAME}' をスキャン中...")
@@ -77,9 +82,8 @@ class BleShellClient:
         t0 = asyncio.get_event_loop().time()
         while asyncio.get_event_loop().time() - t0 < timeout:
             try:
-                line = await asyncio.wait_for(self.rx_queue.get(), timeout=0.2)
+                line = await asyncio.wait_for(self.rx_queue.get(), timeout=0.35)
                 lines.append(line)
-                # 応答が完了したかどうかの判定 (空行または特定トークン)
             except asyncio.TimeoutError:
                 if lines:
                     break
@@ -129,13 +133,25 @@ class BleShellClient:
             print(f"❌ FC コミット失敗: {resp.strip()}")
             return False
 
+def normalize_pico_path(path: str) -> str:
+    if not path:
+        return ""
+    p = path.strip()
+    if not p.startswith("/"):
+        p = f"/bin/{p}"
+    if not p.endswith(".bin"):
+        p = f"{p}.bin"
+    return p
+
 async def run_interactive(client: BleShellClient):
     print("\n========================================")
     print("  Shizuku OS — BLE Interactive Shell    ")
     print("  Commands: ls, format, upload, load,   ")
-    print("            swap, unload, ps, stats     ")
+    print("            swap, reload, unload, ps    ")
     print("  Type 'exit' to quit.                  ")
     print("========================================")
+
+    last_loaded_pico_path = "/bin/algo1.bin"
 
     while True:
         try:
@@ -143,7 +159,7 @@ async def run_interactive(client: BleShellClient):
             cmd = cmd.strip()
             if not cmd:
                 continue
-            if cmd in ("exit", "quit"):
+            if cmd.lower() in ("exit", "quit", "q"):
                 break
 
             parts = cmd.split()
@@ -156,17 +172,38 @@ async def run_interactive(client: BleShellClient):
                 print("Flash FS をフォーマット中...")
                 resp = await client.send_and_wait("FF", timeout=6.0)
                 print(resp, end="")
-            elif c == "upload" and len(parts) >= 3:
-                await client.upload_file(parts[1], parts[2])
+            elif c == "upload":
+                if len(parts) >= 3:
+                    dest = normalize_pico_path(parts[2])
+                    await client.upload_file(parts[1], dest)
+                elif len(parts) == 2:
+                    local_path = parts[1]
+                    base = os.path.basename(local_path)
+                    dest = normalize_pico_path(base.replace("_fast", "").replace("_slow", ""))
+                    await client.upload_file(local_path, dest)
+                else:
+                    print("使用法: upload <PC側のファイルパス> [Pico側のファイル名 (例: algo1)]")
+                    print("  例: upload bazel-bin/user_apps/algo1_fast.bin algo1")
+                    print("      upload bazel-bin/user_apps/algo1_fast.bin  (自動で /bin/algo1.bin に保存)")
             elif c == "load" and len(parts) >= 2:
+                pico_path = normalize_pico_path(parts[1])
                 core = parts[2] if len(parts) >= 3 else "0"
-                resp = await client.send_and_wait(f"LD {parts[1]} {core}")
+                last_loaded_pico_path = pico_path
+                resp = await client.send_and_wait(f"LD {pico_path} {core}")
                 print(resp, end="")
-            elif c == "swap" and len(parts) >= 2:
-                resp = await client.send_and_wait(f"SW {parts[1]}")
+            elif c in ("swap", "sw") and len(parts) >= 2:
+                pico_path = normalize_pico_path(parts[1])
+                last_loaded_pico_path = pico_path
+                resp = await client.send_and_wait(f"SW {pico_path}")
                 print(resp, end="")
-            elif c == "unload" and len(parts) >= 2:
-                resp = await client.send_and_wait(f"UN {parts[1]}")
+            elif c in ("reload", "rl"):
+                pico_path = normalize_pico_path(parts[1]) if len(parts) >= 2 else last_loaded_pico_path
+                print(f"⚡ ホットリロード実行: {pico_path}")
+                resp = await client.send_and_wait(f"SW {pico_path}")
+                print(resp, end="")
+            elif c in ("unload", "un"):
+                target = parts[1] if len(parts) >= 2 else ""
+                resp = await client.send_and_wait(f"UN {target}".strip())
                 print(resp, end="")
             elif c == "ps":
                 resp = await client.send_and_wait("PS")
@@ -175,13 +212,14 @@ async def run_interactive(client: BleShellClient):
                 resp = await client.send_and_wait("STATS")
                 print(resp, end="")
             elif c in ("help", "?"):
-                print("利用可能コマンド:")
+                print("利用可能コマンド (Pico側ファイル名は 'algo1', 'algo1.bin', '/bin/algo1.bin' どれでも可):")
                 print("  ls                           Flash FS 内のファイル一覧")
                 print("  format                       Flash FS を初期化")
-                print("  upload <local> <dest>        バイナリを BLE でアップロード")
-                print("  load <path> [core]           Flash FS から動的モジュールをロード")
-                print("  swap <new_path>              稼働中モジュールを新バイナリにホットスワップ")
-                print("  unload <name>                動的モジュールのアンロード")
+                print("  upload <local> [pico_name]   バイナリを BLE でアップロード")
+                print("  load <pico_name> [core]      モジュールをロード実行 (例: load algo1)")
+                print("  swap <pico_name>             別モジュールにホットスワップ (例: swap algo2)")
+                print("  reload [pico_name]           直前のモジュール(または指定モジュール)をホットリロード")
+                print("  unload [pico_name]           モジュールを強制停止・アンロード (例: unload / unload algo1)")
                 print("  ps                           稼働中動的モジュール一覧")
                 print("  stats                        システム統計 / 操縦状態")
             else:

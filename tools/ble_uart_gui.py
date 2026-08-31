@@ -399,6 +399,35 @@ class App:
         )
         self.tput_btn.pack(side=tk.LEFT, padx=6)
 
+        # 動的モジュール・ホットリロード操作パネル
+        mod_frame = ttk.LabelFrame(self.root, text="⚡ Shizuku 動的モジュール / ホットリロード")
+        mod_frame.pack(fill=tk.X, padx=6, pady=(4, 2))
+
+        ttk.Button(
+            mod_frame, text="⚡ algo1 (高速ストロボ) にスワップ",
+            command=lambda: self._send_cmd("SW /bin/algo1.bin")
+        ).pack(side=tk.LEFT, padx=4, pady=4)
+
+        ttk.Button(
+            mod_frame, text="⚡ algo2 (ゆったりビーコン) にスワップ",
+            command=lambda: self._send_cmd("SW /bin/algo2.bin")
+        ).pack(side=tk.LEFT, padx=4, pady=4)
+
+        ttk.Button(
+            mod_frame, text="⏹️ アンロード / 停止",
+            command=lambda: self._send_cmd("UN all")
+        ).pack(side=tk.LEFT, padx=4, pady=4)
+
+        ttk.Button(
+            mod_frame, text="📁 ファイル一覧 (FL)",
+            command=lambda: self._send_cmd("FL")
+        ).pack(side=tk.LEFT, padx=4, pady=4)
+
+        ttk.Button(
+            mod_frame, text="📊 プロセス (PS)",
+            command=lambda: self._send_cmd("PS")
+        ).pack(side=tk.LEFT, padx=4, pady=4)
+
         ttk.Button(bottom, text="クリア", command=self._clear).pack(
             side=tk.LEFT, padx=6
         )
@@ -422,6 +451,13 @@ class App:
             return
         self.connect_btn.config(state=tk.DISABLED)
         self.worker.submit(self.worker.connect(addr))
+
+    def _send_cmd(self, cmd_text: str):
+        if not self.connected:
+            self._append("log", "未接続です。先に接続してください。\n")
+            return
+        msg = cmd_text.strip() + "\r\n"
+        self.worker.submit(self.worker.send(msg.encode("utf-8")))
 
     def _on_send(self):
         msg = self.entry.get()

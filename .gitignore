@@ -4,3 +4,6 @@ build*
 __pycache__/
 *.pyc
 .vscode/rsp-last.txt
+
+# 実行時のテレメトリ記録。走らせるたびに増える実行成果物であってソースではない。
+telemetry_*.csv

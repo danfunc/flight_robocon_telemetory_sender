@@ -72,7 +72,7 @@ OPENOCD_SCRIPTS = f"{P}/openocd/{OPENOCD}/scripts"
 PICOTOOL_BIN = f"{P}/picotool/{PICOTOOL}/picotool/picotool"
 CMAKE_BIN = f"{P}/cmake/{CMAKE}/bin/cmake"
 NINJA_BIN = f"{P}/ninja/{NINJA}/ninja"
-GDB_BIN = f"{P}/toolchain/{TOOLCHAIN}/bin/arm-none-eabi-gdb"
+GDB_BIN = shutil.which("arm-none-eabi-gdb") or f"{P}/toolchain/{TOOLCHAIN}/bin/arm-none-eabi-gdb"
 SVD = f"{P}/sdk/{SDK}/src/{CHIP}/hardware_regs/{CHIP_UP}.svd"
 ELF = "${workspaceFolder}/build/main.elf"
 UF2 = "${workspaceFolder}/build/main.uf2"
@@ -158,12 +158,12 @@ def settings() -> dict:
                     "command": f"{BAZEL} run //firmware_bazel:ota",
                 },
                 {
-                    # ★単一オブジェクトだけをコンパイルして実機SRAMへ瞬時注入 (0.03秒・再起動なし)
+                    # ★動的モジュールをコンパイル ＆ BLE ホットスワップ (再起動なし・OTA と同等)
                     "name": "$(zap) Hot-Reload",
-                    "tooltip": "単一オブジェクトを実機SRAMへ動的注入・即時実行 (0.03秒・再起動なし)",
+                    "tooltip": "動的モジュール (algo1) をコンパイルして BLE でホットスワップ (bazel run //user_apps:hot_reload)",
                     "color": "#b48ead",
                     "singleInstance": True,
-                    "command": f"{PYTHON} -u ${{workspaceFolder}}/tools/shizuku_hot_reload.py ${{workspaceFolder}}/modules_dyn/fast_blink.cpp",
+                    "command": f"{BAZEL} run //user_apps:hot_reload",
                 },
             ],
         },
@@ -173,6 +173,18 @@ def settings() -> dict:
 def tasks() -> dict:
     return {
         "version": "2.0.0",
+        "inputs": [
+            {
+                "id": "reloadTarget",
+                "type": "pickString",
+                "description": "ホットリロードする動的モジュールを選択",
+                "options": [
+                    "algo1",
+                    "algo2",
+                ],
+                "default": "algo1",
+            },
+        ],
         "tasks": [
             {
                 "label": "Compile Project",
@@ -277,16 +289,57 @@ def tasks() -> dict:
                 },
             },
             {
-                "label": "Hot-Reload Object (RAM)",
+                "label": "Hot-Reload (選択したモジュールをスワップ)",
                 "type": "process",
-                "command": PYTHON,
-                "args": [
-                    "-u",
-                    "${workspaceFolder}/tools/shizuku_hot_reload.py",
-                    "${workspaceFolder}/modules_dyn/fast_blink.cpp",
-                ],
+                "command": BAZEL,
+                "args": ["run", "//user_apps:hot_reload_${input:reloadTarget}"],
                 "options": {"cwd": "${workspaceFolder}"},
                 "presentation": {"reveal": "always", "panel": "dedicated"},
+                "problemMatcher": [],
+            },
+            {
+                "label": "Hot-Reload: flight_controller (動的フライト制御)",
+                "type": "process",
+                "command": BAZEL,
+                "args": ["run", "//user_apps:hot_reload_fc"],
+                "options": {"cwd": "${workspaceFolder}"},
+                "presentation": {"reveal": "always", "panel": "dedicated"},
+                "problemMatcher": [],
+            },
+            {
+                "label": "Hot-Reload: algo1 (高速ストロボ)",
+                "type": "process",
+                "command": BAZEL,
+                "args": ["run", "//user_apps:hot_reload_algo1"],
+                "options": {"cwd": "${workspaceFolder}"},
+                "presentation": {"reveal": "always", "panel": "dedicated"},
+                "problemMatcher": [],
+            },
+            {
+                "label": "Hot-Reload: algo2 (ゆったりビーコン)",
+                "type": "process",
+                "command": BAZEL,
+                "args": ["run", "//user_apps:hot_reload_algo2"],
+                "options": {"cwd": "${workspaceFolder}"},
+                "presentation": {"reveal": "always", "panel": "dedicated"},
+                "problemMatcher": [],
+            },
+            {
+                "label": "Debug Prep: flight_controller",
+                "dependsOn": ["Hot-Reload: flight_controller (動的フライト制御)", "GDB BLE bridge"],
+                "dependsOrder": "sequence",
+                "problemMatcher": [],
+            },
+            {
+                "label": "Debug Prep: algo1",
+                "dependsOn": ["Hot-Reload: algo1 (高速ストロボ)", "GDB BLE bridge"],
+                "dependsOrder": "sequence",
+                "problemMatcher": [],
+            },
+            {
+                "label": "Debug Prep: algo2",
+                "dependsOn": ["Hot-Reload: algo2 (ゆったりビーコン)", "GDB BLE bridge"],
+                "dependsOrder": "sequence",
                 "problemMatcher": [],
             },
             {
@@ -304,8 +357,8 @@ def tasks() -> dict:
 # デバッグ対象に選べるオブジェクト。★`DECLARE_NAME` で付けた名前と一致させる
 #   (合わなければ `monitor list` が実機の一覧を出すので、それを見て直す)。
 DEBUG_TARGETS = [
-    "blink", "telemetry", "flight_controller", "bno055", "bme280",
-    "logger", "ota",
+    "blink", "dyn_fc", "algo1", "algo2", "shizuku_loader", "shizuku_shell",
+    "telemetry", "flight_controller", "bno055", "bme280", "logger", "ota",
 ]
 
 
@@ -367,7 +420,76 @@ def launch() -> dict:
                 ],
             },
             {
-                "name": "Shizuku: GDB over BLE (無線デバッグ)",
+                "name": "Shizuku: GDB over BLE (flight_controller をホットリロードしてデバッグ)",
+                "preLaunchTask": "Debug Prep: flight_controller",
+                "type": "cppdbg",
+                "request": "launch",
+                "program": BAZEL_ELF,
+                "cwd": "${workspaceFolder}",
+                "MIMode": "gdb",
+                "miDebuggerPath": GDB_BIN,
+                "miDebuggerServerAddress": f"localhost:{GDB_BLE_PORT}",
+                "launchCompleteCommand": "None",
+                "stopAtConnect": True,
+                "externalConsole": False,
+                "setupCommands": [
+                    {"text": "set remotetimeout 30"},
+                    {"text": f"directory {BAZEL_EXECROOT}"},
+                    {"text": f"source ${{workspaceFolder}}/tools/shizuku.gdb"},
+                    {"text": f"add-symbol-file ${{workspaceFolder}}/bazel-bin/user_apps/flight_controller.elf 0x10202000"},
+                ],
+                "postAttachCommands": [
+                    "monitor target dyn_fc",
+                ],
+            },
+            {
+                "name": "Shizuku: GDB over BLE (algo1 をホットリロードしてデバッグ)",
+                "preLaunchTask": "Debug Prep: algo1",
+                "type": "cppdbg",
+                "request": "launch",
+                "program": BAZEL_ELF,
+                "cwd": "${workspaceFolder}",
+                "MIMode": "gdb",
+                "miDebuggerPath": GDB_BIN,
+                "miDebuggerServerAddress": f"localhost:{GDB_BLE_PORT}",
+                "launchCompleteCommand": "None",
+                "stopAtConnect": True,
+                "externalConsole": False,
+                "setupCommands": [
+                    {"text": "set remotetimeout 30"},
+                    {"text": f"directory {BAZEL_EXECROOT}"},
+                    {"text": f"source ${{workspaceFolder}}/tools/shizuku.gdb"},
+                    {"text": f"add-symbol-file ${{workspaceFolder}}/bazel-bin/user_apps/algo1_fast.elf 0x10202000"},
+                ],
+                "postAttachCommands": [
+                    "monitor target algo1",
+                ],
+            },
+            {
+                "name": "Shizuku: GDB over BLE (algo2 をホットリロードしてデバッグ)",
+                "preLaunchTask": "Debug Prep: algo2",
+                "type": "cppdbg",
+                "request": "launch",
+                "program": BAZEL_ELF,
+                "cwd": "${workspaceFolder}",
+                "MIMode": "gdb",
+                "miDebuggerPath": GDB_BIN,
+                "miDebuggerServerAddress": f"localhost:{GDB_BLE_PORT}",
+                "launchCompleteCommand": "None",
+                "stopAtConnect": True,
+                "externalConsole": False,
+                "setupCommands": [
+                    {"text": "set remotetimeout 30"},
+                    {"text": f"directory {BAZEL_EXECROOT}"},
+                    {"text": f"source ${{workspaceFolder}}/tools/shizuku.gdb"},
+                    {"text": f"add-symbol-file ${{workspaceFolder}}/bazel-bin/user_apps/algo2_slow.elf 0x10202000"},
+                ],
+                "postAttachCommands": [
+                    "monitor target algo2",
+                ],
+            },
+            {
+                "name": "Shizuku: GDB over BLE (静的オブジェクトを選択してデバッグ)",
                 "preLaunchTask": "GDB BLE bridge",
                 "type": "cppdbg",
                 "request": "launch",
@@ -418,7 +540,9 @@ def launch() -> dict:
                     f"directory {BAZEL_EXECROOT}",
                     f"target remote localhost:{GDB_BLE_PORT}",
                 ],
-                "overrideRestartCommands": [],
+                "overrideRestartCommands": [
+                    "shizuku-reload",
+                ],
             },
         ],
     }

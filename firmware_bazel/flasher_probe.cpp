@@ -4,12 +4,13 @@
 //   バイナリタイプはそれを一括で満たすが、その分 text が RAM を食う。
 //   ここでは「センサ/テレメトリ/GDB を落とした BLE だけの像」の text+bss を測り、
 //   RP2350 の SRAM 520KB に対して現実的かを判断する材料にする。
-#include "shizuku/objects/ble_uart.hpp"
+#include "object_ids.hpp"
 #include "pico/stdlib.h"
 #include "shizuku/app_entry.hpp"
 #include "shizuku/kernel.hpp"
 #include "shizuku/kernel_object.hpp"
 #include "shizuku/object_api.hpp"
+#include "shizuku/objects/ble_uart.hpp"
 #include "shizuku/objects/peripherals.hpp"
 #include "shizuku/objects/usb_cdc.hpp"
 

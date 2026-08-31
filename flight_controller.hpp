@@ -24,6 +24,11 @@ enum struct method : uintptr_t {
   POLL = 3,
   ADD_SENSOR_STREAM = 4,
   GET_CONTROL_STATE = 5,
+  SET_CONTROL_STATE = 6,
+  ARM = 7,             // 1=arm, 0=disarm
+  SET_PITCH_REF = 8,   // a1: pitch_cdeg (deg * 100)
+  SET_HEADING_REF = 9, // a1: heading_cdeg (deg * 100)
+  SET_ALT_REF = 10,    // a1: alt_mm (m * 1000)
 };
 
 using frame_t = xno::tx_frame;

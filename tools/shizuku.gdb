@@ -51,3 +51,27 @@ define shizuku-call
     end
   end
 end
+
+define shizuku-reload
+  printf "⚡ [GDB] bazel run //user_apps:hot_reload を実行中...\n"
+  shell bazel run //user_apps:hot_reload
+  printf "✅ [GDB] ホットリロード完了\n"
+end
+
+define reload
+  shizuku-reload
+end
+
+define shizuku-swap
+  if $argc == 1
+    printf "⚡ [GDB] モジュールスワップ実行中: %s\n", "$arg0"
+    shell bazel run //user_apps:hot_reload_$arg0
+  else
+    printf "使用法: shizuku-swap <algo1|algo2>\n"
+  end
+end
+
+define shizuku-unload
+  printf "⏹️ [GDB] 動的モジュールをアンロード中...\n"
+  shell python3 -u tools/ble_shell.py --unload
+end

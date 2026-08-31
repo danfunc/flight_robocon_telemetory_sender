@@ -1,11 +1,11 @@
-#include <cstdint>
-#include <cstdio>
 #include "blink.hpp"
-#include "flash_fs.hpp"
 #include "object_ids.hpp"
+#include "props.hpp"
 #include "shizuku/object_api.hpp"
 #include "shizuku/objects/peripherals.hpp"
 #include "shizuku/objects/usb_cdc.hpp"
+#include <cstdint>
+#include <cstdio>
 
 namespace blink {
 namespace {
@@ -88,32 +88,46 @@ volatile uint8_t g_led_value = 0;
 volatile uint32_t g_thread_id = 0;
 } // namespace
 
+// ---- 保存する設定 ----------------------------------------------------------
+//  ★flash FS の上に置く (実体は Shizuku の flashfs オブジェクト)。
+//    名前は媒体側で 24 バイト固定なので、パス風の長い名前は付けられない。
+constexpr char CONFIG_NAME[] = "blink.cfg";
 constexpr uint32_t CONFIG_MAGIC = 0x4B4E4C42; // 'BLNK'
-constexpr const char *CONFIG_PATH = "/cfg/blink.conf";
+constexpr uint16_t CONFIG_VERSION = 1;
+
+// ★flash に焼く形。頭を付けるのは、ファーム更新で形が変わったときに
+//   「古い版を新しい構造体として読む」のを止めるため (props.hpp 参照)。
+struct persisted {
+  xno::props::header head;
+  uint8_t pattern_id;
+  uint8_t speed_pct;
+  uint16_t reserved;
+};
 
 void load_persisted_config() {
-  blink::config cfg{};
-  size_t actual = 0;
-  if (xno::fs::read_file(CONFIG_PATH, (uint8_t *)&cfg, sizeof(cfg), &actual)) {
-    if (actual >= sizeof(cfg) && cfg.magic == CONFIG_MAGIC) {
-      if (cfg.pattern_id < NUM_PATTERNS) {
-        g_pattern_id = cfg.pattern_id;
-      }
-      if (cfg.speed_pct >= 10 && cfg.speed_pct <= 300) {
-        g_speed_pct = cfg.speed_pct;
-      }
-    }
-  }
+  persisted cfg{};
+  if (!xno::props::load(CONFIG_NAME, CONFIG_MAGIC, CONFIG_VERSION, &cfg,
+                        sizeof(cfg)))
+    return; // 無い / 古い / 形が違う — どれも「既定値で始める」で同じ
+  // ★焼いてある値でも範囲は見る。媒体の中身は「前のファームが書いたもの」で、
+  //   そのファームの範囲が今と同じとは限らない。
+  if (cfg.pattern_id < NUM_PATTERNS)
+    g_pattern_id = cfg.pattern_id;
+  if (cfg.speed_pct >= 10 && cfg.speed_pct <= 300)
+    g_speed_pct = cfg.speed_pct;
 }
 
+// ★★点滅ループから呼ばないこと。1 セクタの消去に約 33ms かかり、その間
+//   XIP が止まる = 系全体が止まる。呼んでよいのはシェル経由 (SAVE_CONFIG)
+//   だけ。
 bool save_persisted_config() {
-  blink::config cfg{};
-  cfg.magic = CONFIG_MAGIC;
+  persisted cfg{};
+  cfg.head.magic = CONFIG_MAGIC;
+  cfg.head.version = CONFIG_VERSION;
+  cfg.head.bytes = (uint16_t)sizeof(cfg);
   cfg.pattern_id = g_pattern_id;
   cfg.speed_pct = g_speed_pct;
-  cfg.reserved = 0;
-  return xno::fs::write_file(CONFIG_PATH, (const uint8_t *)&cfg, sizeof(cfg),
-                             1);
+  return xno::props::store(CONFIG_NAME, &cfg, sizeof(cfg));
 }
 
 // ---- 点滅ループ (Core 0 固定) ----
@@ -128,9 +142,9 @@ uintptr_t poll_loop(uintptr_t, uintptr_t, uintptr_t, uintptr_t) {
   g_enabled = true;
   uint32_t step_index = 0;
 
-  constexpr int32_t MIN_MS = 100;
-  constexpr int32_t MAX_MS = 1400;
-  constexpr int32_t STEP_MS = 100;
+  constexpr int32_t MIN_MS = 1000;
+  constexpr int32_t MAX_MS = 2000;
+  constexpr int32_t STEP_MS = 10;
   int32_t sweep_interval_ms = MIN_MS;
   int32_t sweep_step_ms = STEP_MS;
 
