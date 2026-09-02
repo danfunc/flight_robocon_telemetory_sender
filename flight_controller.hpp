@@ -29,6 +29,11 @@ enum struct method : uintptr_t {
   SET_PITCH_REF = 8,   // a1: pitch_cdeg (deg * 100)
   SET_HEADING_REF = 9, // a1: heading_cdeg (deg * 100)
   SET_ALT_REF = 10,    // a1: alt_mm (m * 1000)
+  // a1 = 基準気圧 [Pa]。0 なら「次の起動時捕捉をやり直す」。
+  // ★★基準圧の意味づけがそのまま高度の意味になる (sensor_sample.hpp の
+  //   altitude_m を参照)。既定は起動時に測った離陸地点の気圧なので
+  //   **起動時 0m**、QNH を入れれば海抜高度になる。
+  SET_REF_PA = 11,
 };
 
 using frame_t = xno::tx_frame;

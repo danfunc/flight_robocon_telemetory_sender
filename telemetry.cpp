@@ -58,14 +58,19 @@ uint32_t g_lost_in = 0;
 uint32_t g_lost_out = 0;
 uint32_t g_period_us = 100000; // 既定 10Hz
 
-// 気圧高度 [mm]。国際標準大気の素直な式、海面基準 101325 Pa 固定。
-// ★QNH 補正は無い ので絶対高度としては信用しないこと (離陸地点との差分を見る用途)。
+// 高度の基準圧 [Pa]。0 = 未捕捉。★既定は起動時に測った離陸地点の気圧なので、
+//   **起動時の高度が 0** になる。QNH を入れれば海抜高度に変わる (同じ式で
+//   基準が違うだけ。sensor_sample.hpp の altitude_m を参照)。
+//   以前は 101325 Pa 固定だったので、QNH 補正の無い絶対高度もどきだった。
+float g_ref_pa = 0.0f;
+float g_ref_acc = 0.0f;
+uint32_t g_ref_n = 0;
+
+// 気圧高度 [mm]。基準圧からの相対。
 int32_t altitude_mm(int32_t press_pa) {
-  if (press_pa <= 0)
+  if (press_pa <= 0 || g_ref_pa <= 0.0f)
     return 0;
-  const float ratio = (float)press_pa / 101325.0f;
-  const float meters = 44330.0f * (1.0f - powf(ratio, 1.0f / 5.255f));
-  return (int32_t)(meters * 1000.0f);
+  return (int32_t)(xno::altitude_m((float)press_pa, g_ref_pa) * 1000.0f);
 }
 
 // BNO055 の生値 → クライアントの倍率へ。
@@ -173,6 +178,13 @@ void absorb(const sample_t &s) {
     break;
   case xno::sample_kind::BARO:
     g_press_pa = s.value[0];
+    // ★起動直後に基準圧を捕まえる。1 点で決めない (1 サンプルのノイズが
+    //   そのまま「地面の高さ」になる)。
+    if (g_ref_pa <= 0.0f && g_press_pa > 30000 && g_press_pa < 120000) {
+      g_ref_acc += (float)g_press_pa;
+      if (++g_ref_n >= xno::BARO_REF_SAMPLES)
+        g_ref_pa = g_ref_acc / (float)g_ref_n;
+    }
     g_temp_cc = s.value[1];
     g_have_baro = true;
     break;
@@ -192,6 +204,18 @@ uintptr_t method_add_input(uintptr_t argument, uintptr_t, uintptr_t, uintptr_t) 
 
 uintptr_t method_get_stream(uintptr_t, uintptr_t, uintptr_t, uintptr_t) {
   return g_out_id;
+}
+
+// 高度の基準圧を設定する。0 なら起動時と同じ捕捉をやり直す。
+uintptr_t method_set_ref_pa(uintptr_t pa, uintptr_t, uintptr_t, uintptr_t) {
+  if (pa == 0) {
+    g_ref_pa = 0.0f;
+    g_ref_acc = 0.0f;
+    g_ref_n = 0;
+  } else {
+    g_ref_pa = (float)(uint32_t)pa;
+  }
+  return 0;
 }
 
 uintptr_t method_set_rate(uintptr_t argument, uintptr_t, uintptr_t, uintptr_t) {
@@ -270,6 +294,7 @@ uintptr_t telemetry_main(uintptr_t, uintptr_t, uintptr_t, uintptr_t) {
   failures += export_method(method::ADD_INPUT, (uintptr_t)&method_add_input);
   failures += export_method(method::GET_STREAM, (uintptr_t)&method_get_stream);
   failures += export_method(method::SET_RATE, (uintptr_t)&method_set_rate);
+  failures += export_method(method::SET_REF_PA, (uintptr_t)&method_set_ref_pa);
   failures += export_method(method::POLL, (uintptr_t)&poll_loop);
 
   g_out.init();

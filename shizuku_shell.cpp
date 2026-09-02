@@ -713,6 +713,40 @@ void handle_command_line(char *line) {
         (uintptr_t)::flight_controller::method::SET_HEADING_REF,
         (uintptr_t)cdeg);
     shell_printf("HEADING ref %.1f deg\n", deg);
+  } else if (strncmp(line, "QNH", 3) == 0 || strncmp(line, "qnh", 3) == 0) {
+    // 高度の基準圧。★QFE (離陸地点基準) と QNH (海面更正) は**同じ式で基準が
+    //   違うだけ**なので、変数 1 本で両対応できる。
+    //     QNH        現在の設定を表示
+    //     QNH <hPa>  海面更正気圧を入れる → 高度は海抜になる
+    //     QNH auto   起動時と同じ捕捉をやり直す → 現在地が 0m になる
+    // ★★接地しているときに撃つこと。飛行中に auto を撃つと、その高度が
+    //   新しい 0 になり、高度保持の目標が黙ってずれる。
+    const char *arg = line + 3;
+    while (*arg == ' ')
+      ++arg;
+    uint32_t pa = 0;
+    if (*arg == '\0') {
+      shell_printf("QNH: 現在値の読み出しは未実装 (QNH <hPa> / QNH auto)\n");
+    } else {
+      if (strncmp(arg, "auto", 4) != 0 && strncmp(arg, "AUTO", 4) != 0) {
+        const uint32_t hpa = (uint32_t)strtoul(arg, nullptr, 10);
+        // 妥当な範囲だけ受ける。打ち間違いで高度が数千 m ずれるため。
+        if (hpa < 800 || hpa > 1100) {
+          shell_printf("QNH: 800-1100 hPa の範囲で指定すること\n");
+          return;
+        }
+        pa = hpa * 100u;
+      }
+      api(shizuku::object_api::CALL_METHOD, xno_object_id::flight_controller,
+          (uintptr_t)::flight_controller::method::SET_REF_PA, (uintptr_t)pa);
+      api(shizuku::object_api::CALL_METHOD, xno_object_id::telemetry,
+          (uintptr_t)::telemetry::method::SET_REF_PA, (uintptr_t)pa);
+      if (pa == 0)
+        shell_printf("QNH: auto (現在地を 0m として捕捉し直す)\n");
+      else
+        shell_printf("QNH: %lu hPa (高度は海抜になる)\n",
+                     (unsigned long)(pa / 100u));
+    }
   } else if (strncmp(line, "ALT ", 4) == 0 || strncmp(line, "alt ", 4) == 0) {
     float alt_m = strtof(line + 4, nullptr);
     int32_t mm = (int32_t)(alt_m * 1000.0f);

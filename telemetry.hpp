@@ -39,6 +39,11 @@ enum struct method : uintptr_t {
   // a0 = 送出周期 [ms]。0 は弾く (黙って止まると故障と区別できない)。
   SET_RATE = 3,
   POLL = 4,
+  // a0 = 高度の基準気圧 [Pa]。0 なら「起動時捕捉をやり直す」。
+  // ★flight_controller 側と**同じ値を入れること**。別々に持たせているのは
+  //   サンプルごとにオブジェクトを跨いで問い合わせないためで、意味が
+  //   分かれてよいという話ではない。シェルの QNH コマンドが両方へ配る。
+  SET_REF_PA = 5,
 };
 
 using frame_t = xno::tx_frame;

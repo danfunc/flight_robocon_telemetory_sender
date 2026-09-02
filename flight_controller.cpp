@@ -79,7 +79,16 @@ enum VState : uint8_t { ST_LEVEL = 0, ST_ASC = 1, ST_DESC = 2 };
 static uint8_t g_armed = 1;
 static float g_pitch_ref = 0.0f;
 static float g_heading_ref = 0.0f;
+// 目標高度 [m]。★★**離陸地点からの高度**であって絶対高度ではない
+//   (基準圧を起動時に測るため)。以前は海面基準 101325 Pa 固定の絶対高度と
+//   比較していたので、この 10.0 は「標高 10m」を意味してしまい、標高 50m の
+//   場所では地面より 40m 下を狙っていた。`alt <m>` で打つ値も同じ。
 static float g_alt_ref = 10.0f;
+// 高度の基準圧 [Pa]。0 = 未捕捉。既定は起動時に測った離陸地点の気圧 (QFE 相当)
+// なので、起動時の高度が 0 になる。QNH を入れれば海抜高度に変わる。
+static float g_ref_pa = 0.0f;
+static float g_ref_acc = 0.0f;
+static uint32_t g_ref_n = 0;
 static float g_throttle_base = 0.5f;
 
 static float g_pitch = 0.0f;
@@ -141,7 +150,15 @@ static void update_sensors() {
       } else if (s.kind == xno::sample_kind::BARO) {
         float p = (float)s.value[0]; // Pa
         if (p > 30000.0f && p < 120000.0f) {
-          g_pressure_alt = 44330.0f * (1.0f - powf(p / 101325.0f, 0.190295f));
+          // ★起動直後は基準圧を捕まえる。1 点で決めない — BME280 の 1 サンプル
+          //   ぶんのノイズがそのまま「地面の高さ」になるため。
+          if (g_ref_pa <= 0.0f) {
+            g_ref_acc += p;
+            if (++g_ref_n >= xno::BARO_REF_SAMPLES)
+              g_ref_pa = g_ref_acc / (float)g_ref_n;
+            continue; // 基準が決まるまで高度を作らない
+          }
+          g_pressure_alt = xno::altitude_m(p, g_ref_pa);
           if (!g_alt_init) {
             g_h_est = g_pressure_alt;
             g_v_est = 0.0f;
@@ -295,6 +312,19 @@ uintptr_t method_set_heading_ref(uintptr_t heading_cdeg, uintptr_t, uintptr_t, u
   return 0;
 }
 
+// Method 11: SET_REF_PA (a1 = 基準気圧 [Pa]、0 なら捕捉やり直し)
+uintptr_t method_set_ref_pa(uintptr_t pa, uintptr_t, uintptr_t, uintptr_t) {
+  if (pa == 0) {
+    g_ref_pa = 0.0f; // 次の BARO サンプルから捕まえ直す
+    g_ref_acc = 0.0f;
+    g_ref_n = 0;
+    g_alt_init = false;
+  } else {
+    g_ref_pa = (float)(uint32_t)pa;
+  }
+  return 0;
+}
+
 // Method 10: SET_ALT_REF (a1 = alt_mm)
 uintptr_t method_set_alt_ref(uintptr_t alt_mm, uintptr_t, uintptr_t, uintptr_t) {
   g_alt_ref = (float)(int32_t)alt_mm * 0.001f;
@@ -342,6 +372,7 @@ uintptr_t fc_main(uintptr_t, uintptr_t, uintptr_t, uintptr_t) {
   failures += export_method(method::SET_PITCH_REF, (uintptr_t)&method_set_pitch_ref);
   failures += export_method(method::SET_HEADING_REF, (uintptr_t)&method_set_heading_ref);
   failures += export_method(method::SET_ALT_REF, (uintptr_t)&method_set_alt_ref);
+  failures += export_method(method::SET_REF_PA, (uintptr_t)&method_set_ref_pa);
 
 
   g_out.init();
