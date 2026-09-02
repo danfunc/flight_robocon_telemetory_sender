@@ -336,9 +336,15 @@ void end_uart_bridge() {
   //   押し込んだ直後に入力を差し替えると、まだ汲まれていない末尾が宙に浮いて
   //   そのまま捨てられる (環は 4 枠 = 976 バイトしかない)。像の最後だけが
   //   欠ける形になり、CRC は弾いてくれるが原因は分かりにくい。
-  for (uint32_t spin = 0; spin < 2000 && g_uart_ota.hdl().available() > 0;
-       ++spin)
-    api(shizuku::object_api::YIELD);
+  // ★★★待ちは**反復回数ではなく実時間**で切ること。yield は「他に走るものが
+  //   無ければすぐ戻る」ので、2000 回が状況次第で数 ms にしかならない。
+  //   チャンク再送 (XNOR) は 1 チャンクごとに消去 39ms + 書き込み 21ms を
+  //   同期で回すため、環の末尾に数十チャンク残っていると 2000 回では
+  //   **まるで足りず**、残したまま下の SET_INPUT_STREAM で入力を差し替えて
+  //   捨ててしまう。2026-09-02 実機で踏んだ: 109 チャンク中 **ok=40 bad=0**、
+  //   欠けたのが連続した後半 = 化けではなく「届かなかった」形で現れる。
+  //   109 チャンク分の flash 作業 (約 6.5 秒) に余裕を持たせて 20 秒。
+  const uint64_t drain_deadline_us = BOARD::time_us() + 20000000ull;
   // ★★★available()==0 は「積んだ分は pop された」しか言っていない。pop の
   //   中で feed()/finish_upload() (最終セクタの flash 書き込み・CRC 読み返し・
   //   "done:" 行の送出) が走っている最中でも、pop 自体は先に rd を進めて
@@ -356,27 +362,36 @@ void end_uart_bridge() {
   //   消えて全再送になる)。GET_QUIESCENT は「メッセージの途中でもなく
   //   feed() の最中でもない」を ota 自身に判定させたもので、従来の XNOZ
   //   経路では実質 IDLE と同じ意味になる (後方互換)。
-  for (uint32_t spin = 0;
-       spin < 2000 &&
-       api(shizuku::object_api::CALL_METHOD, xno_object_id::ota,
-           (uintptr_t)method::GET_QUIESCENT, 0)
-               .value == 0;
-       ++spin)
+  // ★★待っている間、定期的に「まだ生きている」を送ること。XIAO の側は
+  //   **無通信 2 秒**で中継を畳んで baud を戻す作りで、1 バイト来るたびに
+  //   その 2 秒を数え直す (flight_robocon_safety/src/shell.rs)。チャンク
+  //   再送では末尾のチャンクを焼いている間 Pico が完全に黙るため (診断行を
+  //   止めたので余計に)、**ACK を送る前に相手が先に諦める**。2026-09-02 実機:
+  //   転送自体は成功しているのに毎回 "no ACK/NAK (2s idle timeout)" になった。
+  //   XIAO 側の閾値を上げるのが筋だが、あちらを焼き替えずに済ませたいので
+  //   こちらから息をする (相手の時計を進めさせない、が目的)。
+  uint64_t next_beat_us = BOARD::time_us();
+  while (BOARD::time_us() < drain_deadline_us) {
+    const bool ring_empty = g_uart_ota.hdl().available() == 0;
+    const bool quiet = api(shizuku::object_api::CALL_METHOD,
+                           xno_object_id::ota,
+                           (uintptr_t)method::GET_QUIESCENT, 0)
+                           .value != 0;
+    if (ring_empty && quiet)
+      break;
+    const uint64_t now = BOARD::time_us();
+    if (now >= next_beat_us) {
+      next_beat_us = now + 500000ull; // 相手の 2 秒に対して十分な余裕
+      uart_puts(SHELL_UART, "UBRIDGE_BUSY\n");
+    }
     api(shizuku::object_api::YIELD);
+  }
   // ★★ここで baud を戻す前に、XIAO へ「もう出すものは無い」を machine-readable
   //   な 1 バイトで伝える。commit が成功した場合はここへ戻ってこない
   //   (flash_safe_execute の中で直接再起動する、"no return") ので、その
   //   ケースは今まで通り XIAO 側の 2 秒アイドル待ちが拾う — ACK は
   //   「ステージングだけして commit しない」経路 (再送・実機試験) を主に
   //   縮めるためのもの。
-  {
-    const bool ok =
-        api(shizuku::object_api::CALL_METHOD, xno_object_id::ota,
-            (uintptr_t)method::GET_LAST_OK, 0)
-            .value != 0;
-    const uint8_t sync = ok ? UART_BRIDGE_ACK : UART_BRIDGE_NAK;
-    uart_putc_raw(SHELL_UART, sync);
-  }
   if (g_ble_ota_stream_id != xno::NO_STREAM) {
     api(shizuku::object_api::CALL_METHOD, xno_object_id::ota,
         (uintptr_t)method::SET_INPUT_STREAM, g_ble_ota_stream_id);
@@ -396,6 +411,23 @@ void end_uart_bridge() {
     uart_puts(SHELL_UART, line);
   }
   uart_puts(SHELL_UART, "UBRIDGE_DONE\n");
+  // ★★★ACK/NAK は**ブリッジ速度で送る最後の 1 バイト**であること。
+  //   以前はここより前 (UBRIDGE_LOST/DONE より先) に送っていたが、XIAO は
+  //   ACK を見た時点で自分の baud を 115200 へ戻すので、**後続の
+  //   UBRIDGE_LOST / UBRIDGE_DONE が速度の食い違った状態で送られて化けて
+  //   いた** (2026-09-02 実測: "UBsRI G0_0O0Tb0tUB IsGa_eO7E")。さらに
+  //   この行の後で RX を捨てるため、母艦が "[BRIDGE] done" を見て即座に
+  //   送った次のコマンドまで消えていた。「ubridge を 2 回連続で張れない」
+  //   として実用対処 (3 秒待ち) だけしていた現象の機序がこれ。
+  //   ACK を最後にすれば、XIAO が baud を戻すのと Pico が戻すのが揃う。
+  {
+    const bool ok =
+        api(shizuku::object_api::CALL_METHOD, xno_object_id::ota,
+            (uintptr_t)method::GET_LAST_OK, 0)
+            .value != 0;
+    const uint8_t sync = ok ? UART_BRIDGE_ACK : UART_BRIDGE_NAK;
+    uart_putc_raw(SHELL_UART, sync);
+  }
   // ★★速度を必ず常用へ戻す。**この経路を通らずに抜けると口が死ぬ**ので、
   //   中継から出る道は全部ここを通す (完了・中断・無通信タイムアウト)。
   //   戻す前に DONE を送り切る — 相手はまだ速い方で聞いているため。

@@ -180,18 +180,31 @@ def parse_need(text: str):
     complete = False
     for line in text.splitlines():
         line = line.strip()
-        if line.startswith("NEED n="):
+        # ★★XIAO は Pico から中継した行に "[UART-RX] " を前置して CDC へ出す。
+        #   素の startswith では一致せず、**NEED が全部届いているのに「届いて
+        #   いない」と誤判定する** (実機で踏んだ: ok=109 bad=0 と出ているのに
+        #   staging failed で止まった)。先頭の "[...] " を落としてから見る。
+        #   BLE 経路には前置が付かないので、これ一つで両方を扱える。
+        if line.startswith("[") and "] " in line:
+            line = line.split("] ", 1)[1]
+        # ★★行頭にゴミが付くことがある (中継の切り替わりで残ったバイトが
+        #   次の行に食い込む。実機で "dsNEED n=2 ..." を観測)。startswith で
+        #   見ていると**中身は全部届いているのに読めない**と誤判定するので、
+        #   目印は行のどこにあってもよいことにする。この 3 語は他の出力に
+        #   現れないので、探索にしても誤検出しない。
+        at = line.find("NEED n=")
+        if at >= 0:
             try:
-                n = int(line[7:].split()[0])
+                n = int(line[at + 7:].split()[0])
             except (ValueError, IndexError):
                 pass
-        elif line.startswith("NEEDSEQ"):
-            for tok in line[7:].replace(",", " ").split():
+        elif "NEEDSEQ" in line:
+            for tok in line[line.find("NEEDSEQ") + 7:].replace(",", " ").split():
                 try:
                     seqs.append(int(tok))
                 except ValueError:
                     pass  # 化けたトークンは捨てる (complete 判定で拾う)
-        elif line.startswith("NEEDEND"):
+        elif "NEEDEND" in line:
             complete = True
     return n, seqs, complete
 

@@ -141,8 +141,41 @@ def drain_until(ser: "serial.Serial", marker: bytes, idle_seconds: float,
     return bytes(buf)
 
 
+# ★2 回連続でブリッジを張ると「UBRIDGE_READY が来ません」で毎回失敗する
+#   (2026-09-02 実測: 5 秒待てば毎回通り、0.2 秒では毎回失敗。XIAO 側か
+#   Pico 側かは切り分けられていない)。実用対処として間隔を空ける。
+#   ★★この待ちは**次のブリッジを張る直前**に払う。以前は各ブリッジの
+#     終わりで払っていたが、チャンク再送では最後のブリッジのあとに来るのは
+#     行コマンド (OTANEED) であって次のブリッジではないので、そこで 3 秒
+#     待つのは丸損だった。必要なところでだけ払う。
+BRIDGE_GAP_S = 3.0
+_last_bridge_end = 0.0
+
+
+def wait_after_bridge(label: str) -> None:
+    """直前のブリッジの後始末が終わるまで空ける。
+
+    ★★次のブリッジだけでなく**行コマンドの前にも要る** (2026-09-02 実測:
+      待ちを外したら `[BRIDGE] done` の直後に送った OTANEED が消えた)。
+      つまりこれは「ubridge を 2 回連続で張れない」問題ではなく、
+      **ブリッジ直後の Pico は何も受け付けない**という問題だった。
+      機序: end_uart_bridge() は ACK を送ってから UBRIDGE_LOST/DONE を出し、
+      最後に baud を戻して RX を捨てる。XIAO は ACK を見た時点で自分の baud を
+      戻すので、以降の行は速度が食い違って化け、その後の RX 破棄でこちらの
+      コマンドまで消える。ACK をブリッジ速度で送る**最後の 1 バイト**に
+      すれば縮められるはず (firmware 側で対処中)。
+    """
+    global _last_bridge_end
+    gap = BRIDGE_GAP_S - (time.time() - _last_bridge_end)
+    if gap > 0:
+        print(f"[{label}] 前のブリッジの後始末を {gap:.1f}s 待つ")
+        time.sleep(gap)
+
+
 def send_bridge(ser: "serial.Serial", payload: bytes, label: str) -> None:
     """XIAO を ubridge モードへ入れ、payload を生で流し込む。"""
+    global _last_bridge_end
+    wait_after_bridge(label)
     n = len(payload)
     ser.reset_input_buffer()
     ser.write(f"ubridge {n} {BRIDGE_BAUD}\n".encode())
@@ -188,11 +221,18 @@ def send_bridge(ser: "serial.Serial", payload: bytes, label: str) -> None:
     #   ファームでこの文言が変わっていた場合に永久に待たないため)。
     drain_until(ser, b"[BRIDGE] done", idle_seconds=2.0, hard_limit=5.0)
     # ★"[BRIDGE] done" が見えた後も、次の 'ubridge ...' を受け付けられる
-    #   状態に戻るまでにもう少し時間がかかる (2026-09-02 実測: 0.2s では
-    #   毎回失敗、5s なら毎回通った)。正確な内訳は未特定 — XIAO 側か Pico
-    #   側か、あるいは両方の後始末が絡んでいるかは分かっていない。実用上は
-    #   ここで長めに待つのが最短の対策。
-    time.sleep(3.0)
+    #   状態に戻るまでにもう少し時間がかかる。正確な内訳は未特定 — XIAO 側か
+    #   Pico 側か、あるいは両方の後始末が絡んでいるかは分かっていない。
+    #   待ちは次の send_bridge() の頭で払う (BRIDGE_GAP_S)。
+    _last_bridge_end = time.time()
+
+
+def reset_ota(ser: "serial.Serial") -> None:
+    """走りかけの転送を捨てさせ、必ず待ち受けから始める。"""
+    ser.reset_input_buffer()
+    ser.write(b"SEND OTARESET\n")
+    ser.flush()
+    drain(ser, 0.5, hard_limit=3.0)
 
 
 def query_missing(ser: "serial.Serial"):
@@ -206,6 +246,7 @@ def query_missing(ser: "serial.Serial"):
       'e'=SW_INHIBIT トグル) が即時発火し、**安全フラグが検証コマンドの
       副作用で変わる**事故を実際に起こしている (2026-09-02)。
     """
+    wait_after_bridge("OTANEED")
     ser.reset_input_buffer()
     ser.write(b"SEND OTANEED\n")
     ser.flush()
@@ -227,15 +268,6 @@ def send_chunked(ser: "serial.Serial", header: bytes, chunks: list) -> bool:
       ビットマップを消すので、送り直すと全チャンクが「未受領」に戻る。
       device はラウンドの合間 CSEEK のまま待っている。
     """
-    # ★中継を張る前に、走りかけの転送を捨てさせる。前回の campaign を諦めた
-    #   直後は device が CSEEK に居座っており、そのまま送ると **XNOR の
-    #   ファイルヘッダがチャンクデータとして食われる**。待ち受けから始まって
-    #   いれば何も起きない (安いので毎回撃つ)。
-    ser.reset_input_buffer()
-    ser.write(b"SEND OTARESET\n")
-    ser.flush()
-    drain(ser, 0.5, hard_limit=3.0)
-
     send_bridge(ser, header + chunked_body(chunks), "upload")
 
     for rnd in range(1, MAX_ROUNDS + 1):
@@ -318,6 +350,15 @@ def main() -> int:
     time.sleep(0.3)
     # 開始前の掃除。相手が定期送信していると idle にならないので上限は短く。
     drain(ser, 0.3, hard_limit=1.0)
+
+    # ★★どの経路でも、送る前に走りかけの転送を捨てさせる。
+    #   **--legacy にも要る**。前の campaign を諦めた直後の ota は CSEEK に
+    #   居座っており、そこへ XNOZ を流すと**ストリーム全体がチャンク探索の
+    #   ゴミとして食われる** (2026-09-02 実機で踏んだ: done: も ACK も出ず、
+    #   次の commit 用ブリッジが UBRIDGE_READY を返せなくなった)。
+    #   最初これを chunked 経路にだけ入れていたのが誤り — **回復用の経路こそ
+    #   前提を仮定してはいけない**。待ち受けから始まっていれば何も起きない。
+    reset_ota(ser)
 
     if chunks is not None:
         if not send_chunked(ser, header, chunks):
