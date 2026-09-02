@@ -65,6 +65,28 @@ BAUD = 115200
 #   その値をどれだけ正確に作れるかの精度限界に見える。310000 でも通った
 #   実績はあるが、崖のすぐそばなので余裕を持って 300000 を既定にする。
 #   個体差・配線差があるので、崖の位置はボードごとに検証し直すこと。
+#
+# ★★2026-09-02 追試 (チャンク再送を入れた後、像 445608B / 109 チャンク、
+#   3 回ずつ交互に実行・1 回ごとに冷却)。実効速度 = 像 ÷ キャンペーン全体:
+#
+#     baud    1巡目の欠損   ラウンド   実効速度 (3 回)
+#     300000     0/109         1       31.9 / 32.0 / (中継開始失敗 1)
+#     310000     0/109         1       32.8 / 32.8 / 32.8
+#     345600     4/109         2       24.5 / 24.5 / 24.5
+#     375000     8/109         2       25.1 / (制御喪失) / 25.1
+#     460800    24/109         3       14.3
+#     921600      —            —       制御を保てず
+#
+#   ★**「多少化けても速い方が勝つ」帯は無かった。** 崖が急峻 (0 → 4 → 24 個)
+#     で、再送 1 ラウンドの固定費が約 4.3 秒あるため、崖を越えた瞬間に必ず
+#     負ける。チャンク再送は**速度を上げるためではなく、崖の向こうで失敗を
+#     全損にしないため**に効いている、と読むのが正しい。
+#   ★310000 が実測では最速 (+2.5%) だが、**既定は 300000 のままにする**。
+#     320000 で崖なので 310000 の余裕は 3%、300000 なら 6%。OTW は「戻って
+#     これる」ことが存在意義の経路で、2.5% の速度に余裕を半分渡すのは
+#     割に合わない。崖の位置は配線・個体・温度で動く。
+#     ★ただし再送が入った今、崖の向こうへ踏み込んでも全損ではなく再送に
+#       なるので、次に触る人が 310000 を選ぶ判断はあり得る。
 BRIDGE_BAUD = 300000
 WRITE_CHUNK = 256  # ホスト側の write() 粒度。UART の実速度で自然に律速される。
 
@@ -246,15 +268,32 @@ def query_missing(ser: "serial.Serial"):
       'e'=SW_INHIBIT トグル) が即時発火し、**安全フラグが検証コマンドの
       副作用で変わる**事故を実際に起こしている (2026-09-02)。
     """
-    wait_after_bridge("OTANEED")
-    ser.reset_input_buffer()
-    ser.write(b"SEND OTANEED\n")
-    ser.flush()
-    # NEEDEND は成否によらず必ず出る (device 側 report_missing)。それを
-    # 待てば「返事が全部届いた」が一つの合図で判定できる。
-    text = drain_until(ser, b"NEEDEND", idle_seconds=2.0,
-                       hard_limit=30.0).decode(errors="replace")
-    return parse_need(text)
+    # ★★何度か聞き直すこと。**Pico がまだ中継モードから抜けていない**ことが
+    #   ある — 化ける速度では受け取りバイト数が要求値に届かず、Pico は
+    #   無通信 5 秒のタイムアウトでしか中継を抜けない。その間に送った
+    #   OTANEED は像の一部として食われて消える。
+    #   2026-09-02 実機: 460800 で「制御が壊れた」と判定したが、後から手で
+    #   聞き直したら NEED n=24 (ok=85 bad=11) と正常に返ってきた。**制御が
+    #   壊れていたのではなく、こちらが早すぎた**。ここを一発勝負にすると
+    #   「速い baud は使えない」という誤った結論を出してしまう。
+    n = seqs = complete = None
+    for attempt in range(3):
+        wait_after_bridge("OTANEED")
+        ser.reset_input_buffer()
+        ser.write(b"SEND OTANEED\n")
+        ser.flush()
+        # NEEDEND は成否によらず必ず出る (device 側 report_missing)。それを
+        # 待てば「返事が全部届いた」が一つの合図で判定できる。
+        text = drain_until(ser, b"NEEDEND", idle_seconds=2.0,
+                           hard_limit=30.0).decode(errors="replace")
+        n, seqs, complete = parse_need(text)
+        if complete and n is not None:
+            return n, seqs, complete
+        if attempt < 2:
+            print(f"  (OTANEED に返事が無い — Pico がまだ中継から抜けて"
+                  f"いない可能性。{attempt + 2} 回目を試す)")
+            time.sleep(6.0)  # 中継の無通信タイムアウト (5s) より長く
+    return n, seqs, complete
 
 
 def send_chunked(ser: "serial.Serial", header: bytes, chunks: list) -> bool:
