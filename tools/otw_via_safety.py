@@ -232,9 +232,27 @@ def send_bridge(ser: "serial.Serial", payload: bytes, label: str,
 
     print(f"\n[{label}] sending {n} bytes over UART0 (115200 baud)...")
     t0 = time.perf_counter()
+    echoed = bytearray()
     for off in range(0, n, WRITE_CHUNK):
         ser.write(payload[off:off + WRITE_CHUNK])
+        # ★★**書きながら読むこと。** 以前はここで一度も読まずに 300KB を
+        #   流し込んでいた。その間 Pico は "ready (chunked)" などを返して
+        #   おり、XIAO の CDC 送信バッファが詰まる。XIAO の cdc_write は
+        #   書けないと最大 1000 回スピンして諦める作りで、しかもその間
+        #   `dev.poll()` を呼ばないので**バッファは絶対に空かない** —
+        #   つまり空回りしてバイトを捨て、その分だけ中継が遅れる。
+        #   遅れが Pico 側の無通信 5 秒タイムアウトに届くと中継が途中で
+        #   終わり、**チャンクがごっそり欠ける** (2026-09-02 実機:
+        #   ok=31 of=110)。読み続けていれば詰まらない。
+        # ★これは今日の観測を全部説明する: Pico の定期診断行を止めたら
+        #   安定し、0x16 のハートビート応答を足したら壊れ、PING/PONG でも
+        #   壊れた — どれも「Pico→母艦の通信量が増えた」変更だった。
+        if ser.in_waiting:
+            echoed += ser.read(ser.in_waiting)
     ser.flush()
+    if echoed:
+        sys.stdout.write(echoed.decode(errors="replace"))
+        sys.stdout.flush()
     elapsed = time.perf_counter() - t0
     rate = n / elapsed / 1024 if elapsed > 0 else 0
     print(f"[{label}] host-side write done in {elapsed:.1f}s ({rate:.1f} kB/s "
@@ -258,6 +276,26 @@ def send_bridge(ser: "serial.Serial", payload: bytes, label: str,
 def complete_flag(text: str) -> bool:
     """NEEDEND まで見えたか。"""
     return "NEEDEND" in text
+
+
+def set_quiet(ser: "serial.Serial", on: bool) -> None:
+    """安全装置に「これから転送する / 終わった」を明示的に告げる。
+
+    ★★推測でゲートしない。以前は XIAO 側で「UART が一定時間静かなら暇」と
+      判定してリンク確認の PING を撃っていたが、**中継の直前に重なって像を
+      壊した** (2026-09-02 に 2 通り試して 2 通りとも壊した)。転送の開始は
+      母艦しか知らないので、母艦が言うのが正しい。
+    ★これは PING だけの話ではない。QUIET は安全装置の 10Hz ハートビートも
+      止める。Pico がそれに答えると返事が UART と BLE を埋めて**どちらの
+      経路も通らなくなる**実績がある (flash.sh が最初からこれを撃っていたのは
+      そのため)。otw_via_safety.py を直接叩く経路にだけ抜けていた。
+    ★終わったら**必ず戻すこと**。ハートビートは安全装置が生きている証拠を
+      Pico へ届ける経路でもあるので、止めっぱなしにしてよいものではない。
+    """
+    ser.reset_input_buffer()
+    ser.write(b"QUIET ON\n" if on else b"QUIET OFF\n")
+    ser.flush()
+    drain(ser, 0.4, hard_limit=2.0)
 
 
 def reset_ota(ser: "serial.Serial") -> None:
@@ -419,12 +457,20 @@ def main() -> int:
     #   次の commit 用ブリッジが UBRIDGE_READY を返せなくなった)。
     #   最初これを chunked 経路にだけ入れていたのが誤り — **回復用の経路こそ
     #   前提を仮定してはいけない**。待ち受けから始まっていれば何も起きない。
-    reset_ota(ser)
+    # ★転送の間だけ安全装置を黙らせる。失敗しても必ず戻す (下の finally)。
+    set_quiet(ser, True)
+    try:
+        reset_ota(ser)
+        return _do_transfer(ser, chunks, header, body, do_commit, image, crc)
+    finally:
+        set_quiet(ser, False)
+        ser.close()
 
+
+def _do_transfer(ser, chunks, header, body, do_commit, image, crc) -> int:
     if chunks is not None:
         if not send_chunked(ser, header, chunks):
             print("RESULT: staging failed (本体は無傷)")
-            ser.close()
             return 1
     else:
         send_bridge(ser, header + body, "upload")
@@ -459,11 +505,9 @@ def main() -> int:
             #   flash.sh が「検証できていない commit」を「完了」と報告して
             #   いた。焼けたかどうかを言えないなら、言えないと返すこと —
             #   上位が次の手 (OTA) へ進めるかどうかの判断材料になる。
-            ser.close()
             return 1
         print(f"RESULT: commit verified (running new image, crc={crc:08x})")
 
-    ser.close()
     return 0
 
 
