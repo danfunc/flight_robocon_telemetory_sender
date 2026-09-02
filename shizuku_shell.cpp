@@ -108,6 +108,12 @@ uintptr_t g_uart_rx_stream_id = xno::NO_STREAM;
 shizuku::stream::handle<uint8_t> g_uart_rx;
 int g_uart_dma_ch = -1;
 uint32_t g_uart_rx_lost = 0; // pop() が報告した「落ちた数」の累計 (診断用)
+// ★★診断用。g_uart_rx_lost はこれまで積算されるだけで**どこにも出力されて
+//   いなかった**。OTW の inflate failed の原因候補 (シェルスレッドが長く
+//   スケジュールされず、非 LOSSLESS な DMA 環 (4096B ≈ 1Mbaud で 40ms 分) が
+//   uart_bridge_push_byte で 244B へ切り出す前に溢れて上書きされる) を
+//   実機で切り分けるための足跡。UBRIDGE 区間ごとの増分を UBRIDGE_DONE に載せる。
+uint32_t g_uart_rx_lost_at_bridge_start = 0;
 
 // ★★RP2350 の TRANS_COUNT は **[31:28] が MODE / [27:0] がカウント**
 //   (RP2040 には無いフィールド)。ここに 0xFFFFFFFF を書くと MODE=0xF =
@@ -300,6 +306,7 @@ void begin_uart_bridge(uint32_t total_bytes, uint32_t baud) {
   g_uart_bridge_last_us = BOARD::time_us();
   g_abort_filled = 0; // 前の中継の名残りで即座に誤爆させない
   uart_rx_discard_all(); // 前の会話の残りを像の先頭と間違えない
+  g_uart_rx_lost_at_bridge_start = g_uart_rx_lost; // この区間の増分を測る基点
   uart_puts(SHELL_UART, "UBRIDGE_READY\n");
   // ★★合図を**送り切ってから**速度を変える。TX FIFO に残ったまま切り替えると、
   //   相手は READY の途中から別の速度で受け取ることになり、合言葉が壊れる。
@@ -321,6 +328,24 @@ void end_uart_bridge() {
   for (uint32_t spin = 0; spin < 2000 && g_uart_ota.hdl().available() > 0;
        ++spin)
     api(shizuku::object_api::YIELD);
+  // ★★★available()==0 は「積んだ分は pop された」しか言っていない。pop の
+  //   中で feed()/finish_upload() (最終セクタの flash 書き込み・CRC 読み返し・
+  //   "done:" 行の送出) が走っている最中でも、pop 自体は先に rd を進めて
+  //   戻ってしまうので available() は 0 に見える。ここで baud を戻すと、
+  //   ota がまだ古い (速い) baud のつもりで送っている行の途中で速度が変わり、
+  //   XIAO 側は自分の 2 秒アイドルで別々に baud を戻す (協調していない) ため、
+  //   両者の切り戻しタイミングがずれて完了行が文字化けする
+  //   (2026-09-02 実測: 230400/1Mbaud で "done: ... crc=..." が化けて消えた。
+  //   115200 = 速度を一切変えない設定では発生しない = この経路でのみ起きる)。
+  //   ota が本当に IDLE (= reset_transfer() まで完走) に戻るのを見てから
+  //   baud を戻す。
+  for (uint32_t spin = 0;
+       spin < 2000 &&
+       api(shizuku::object_api::CALL_METHOD, xno_object_id::ota,
+           (uintptr_t)method::GET_STATE, 0)
+               .value != 0;
+       ++spin)
+    api(shizuku::object_api::YIELD);
   if (g_ble_ota_stream_id != xno::NO_STREAM) {
     api(shizuku::object_api::CALL_METHOD, xno_object_id::ota,
         (uintptr_t)method::SET_INPUT_STREAM, g_ble_ota_stream_id);
@@ -328,6 +353,16 @@ void end_uart_bridge() {
     // 配線されていないなら**戻さない**。適当な番号へ繋ぐより、BLE OTA が
     // 効かないまま次の再起動を待つほうが安全 (回復手段を壊さない)。
     uart_puts(SHELL_UART, "UBRIDGE_WARN no ble ota stream to restore\n");
+  }
+  // ★★DMA 環 (g_uart_rx_desc) は非 LOSSLESS = 上書き許容。ここが溢れると
+  //   uart_bridge_push_byte に渡る前にバイトが消え、ota 側の「input overrun」
+  //   (g_uart_ota 側の lost) には一切現れない。inflate failed の原因候補の
+  //   一つなので、区間ごとの増分を必ず報告する (0 ならこの経路は無罪)。
+  {
+    char line[48];
+    snprintf(line, sizeof(line), "UBRIDGE_LOST %lu\n",
+             (unsigned long)(g_uart_rx_lost - g_uart_rx_lost_at_bridge_start));
+    uart_puts(SHELL_UART, line);
   }
   uart_puts(SHELL_UART, "UBRIDGE_DONE\n");
   // ★★速度を必ず常用へ戻す。**この経路を通らずに抜けると口が死ぬ**ので、

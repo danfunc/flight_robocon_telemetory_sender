@@ -47,7 +47,16 @@ BAUD = 115200
 #   115200 のままだと 11.3 kB/s で、BLE OTA の 26 kB/s より遅い ——
 #   **有線が無線より遅いのはおかしい**というのが上げる動機。
 #   両側とも 115200〜3000000 の範囲しか受け付けない。
-BRIDGE_BAUD = 1000000
+
+# ★実測で決めた値 (2026-09-02)。1Mbaud/460800/375000/345600/320000 はいずれも
+#   Pico 自身が返すテキストまで文字化けする物理的なビット化けで失敗し、
+#   310000 と 300000 は繰り返し CRC 一致で成功した。300000/320000 の間に
+#   はっきりした崖があるのは SNR がなだらかに劣化しているというより、
+#   Pico (RP2350) と XIAO (RP2040) 双方のボーレート分周器が実クロックから
+#   その値をどれだけ正確に作れるかの精度限界に見える。310000 でも通った
+#   実績はあるが、崖のすぐそばなので余裕を持って 300000 を既定にする。
+#   個体差・配線差があるので、崖の位置はボードごとに検証し直すこと。
+BRIDGE_BAUD = 300000
 WRITE_CHUNK = 256  # ホスト側の write() 粒度。UART の実速度で自然に律速される。
 
 
@@ -189,7 +198,12 @@ def main() -> int:
         print("waiting for Pico to reboot...")
         time.sleep(3.0)
         ser.reset_input_buffer()
-        ser.write(b"send version\n")
+        # ★小文字は XIAO の 1 キーショートカット即時実行に化ける ('s'=status,
+        #   'e'=SW_INHIBIT トグル)。2026-09-01 の修正で複数文字コマンドは
+        #   大文字必須になったのに、ここだけ直し忘れていた。実際に踏んだ:
+        #   'send version' の 's' と 'e' が即時発火し、SW_INHIBIT が勝手に
+        #   ON になった (安全フラグが検証コマンドの副作用で変わった)。
+        ser.write(b"SEND version\n")
         text = drain(ser, 2.0).decode(errors="replace")
         if f"crc={crc:08x}" in text:
             print("RESULT: commit verified (running new image)")
