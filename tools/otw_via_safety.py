@@ -12,6 +12,13 @@ shizuku_shell.cpp が UART0 を
   python3 tools/otw_via_safety.py <image>              # 送るだけ (ステージング)
   python3 tools/otw_via_safety.py <image> --commit      # 送って、本体へ移す
   python3 tools/otw_via_safety.py --commit              # bazel の既定出力を使う
+  python3 tools/otw_via_safety.py --legacy --commit     # 旧 XNOZ 経路 (回復用)
+
+★既定は XNOR (チャンク単位の再送)。送り手は最後まで一括で送り切り、受け手が
+  全チャンクを受け終えた時点で「失敗した seq の一覧」を返し、送り手はその分
+  だけ再送する (HTTP の range 再取得と同じ発想)。一覧が空になるか上限回数まで
+  繰り返す。--legacy は再送の効かない従来経路で、**新形式が壊れたときの
+  回復用**に残してある。
 
 ★地上専用。飛行中に USB が母艦に繋がっていることはない前提で、BLE の
   OTA が使えなくなったとき (誤った像を焼いた直後など) の最後の書き込み口。
@@ -38,7 +45,9 @@ except ImportError:
     sys.exit("pyserial が要ります: pip install pyserial")
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from ota_send import DEFAULT_IMAGE, deflate_chunks, load_image  # noqa: E402
+from ota_send import (DEFAULT_IMAGE, MAX_ROUNDS, chunked_body,  # noqa: E402
+                      deflate_chunk_list, deflate_chunks, load_image,
+                      parse_need)
 
 DEFAULT_PORT = "/dev/cu.usbmodem1101"
 BAUD = 115200
@@ -186,6 +195,75 @@ def send_bridge(ser: "serial.Serial", payload: bytes, label: str) -> None:
     time.sleep(3.0)
 
 
+def query_missing(ser: "serial.Serial"):
+    """まだ届いていないチャンクを Pico に聞く。戻り値 (n, seqs, complete)。
+
+    ★★**中継の外**、常用の 115200 で聞く。同じ問い合わせは帯域内 (seq=0xFFFF
+      のチャンクヘッダ) でもできるが、攻めた baud では**返事そのものが化ける** —
+      そうなると「どれを再送すべきか」が分からず、再送機構ごと成立しない。
+      制御は必ず化けない速度で通す、というのがここを分けている理由。
+    ★小文字を送らないこと。XIAO の 1 キーショートカット ('s'=status,
+      'e'=SW_INHIBIT トグル) が即時発火し、**安全フラグが検証コマンドの
+      副作用で変わる**事故を実際に起こしている (2026-09-02)。
+    """
+    ser.reset_input_buffer()
+    ser.write(b"SEND OTANEED\n")
+    ser.flush()
+    # NEEDEND は成否によらず必ず出る (device 側 report_missing)。それを
+    # 待てば「返事が全部届いた」が一つの合図で判定できる。
+    text = drain_until(ser, b"NEEDEND", idle_seconds=2.0,
+                       hard_limit=30.0).decode(errors="replace")
+    return parse_need(text)
+
+
+def send_chunked(ser: "serial.Serial", header: bytes, chunks: list) -> bool:
+    """一括で送り切り、足りない seq だけを繰り返し再送する。
+
+    ★窓 (パイプライン) 方式ではなく **HTTP の range 再取得と同じ発想**。
+      送り手は途中で ACK を待たず最後まで流し切り、受け手が全部受け終えた
+      時点で「失敗した seq の一覧」を返す。窓幅・順序・タイムアウト再送の
+      状態機械が要らず、ota 側も「失敗した seq を覚えておくだけ」で済む。
+    ★2 ラウンド目以降は**ファイルヘッダを送らない**。XNOR ヘッダは受領
+      ビットマップを消すので、送り直すと全チャンクが「未受領」に戻る。
+      device はラウンドの合間 CSEEK のまま待っている。
+    """
+    # ★中継を張る前に、走りかけの転送を捨てさせる。前回の campaign を諦めた
+    #   直後は device が CSEEK に居座っており、そのまま送ると **XNOR の
+    #   ファイルヘッダがチャンクデータとして食われる**。待ち受けから始まって
+    #   いれば何も起きない (安いので毎回撃つ)。
+    ser.reset_input_buffer()
+    ser.write(b"SEND OTARESET\n")
+    ser.flush()
+    drain(ser, 0.5, hard_limit=3.0)
+
+    send_bridge(ser, header + chunked_body(chunks), "upload")
+
+    for rnd in range(1, MAX_ROUNDS + 1):
+        n, seqs, complete = query_missing(ser)
+        if not complete:
+            print(f"\n[round {rnd}] NEED の返事が最後まで届かない "
+                  f"(NEEDEND が見えない)。一覧が途中で切れている可能性が"
+                  f"あるので、ここで止める — 欠けたまま commit しないこと。")
+            return False
+        if n is None:
+            print(f"\n[round {rnd}] NEED 行が読めない。Pico のファームが "
+                  f"チャンク再送 (XNOR) に対応していない可能性がある "
+                  f"(--legacy で従来の XNOZ 経路に落とせる)")
+            return False
+        if n == 0:
+            print(f"[round {rnd}] 全チャンク受領。device が読み返し CRC まで"
+                  f"確認済み")
+            return True
+        if rnd == MAX_ROUNDS:
+            print(f"\n{n} チャンクが {MAX_ROUNDS} ラウンドでも埋まらない。"
+                  f"配線かこの baud が無理筋 — --baud= を下げて再試行すること")
+            return False
+        print(f"[round {rnd}] {n} チャンクが未達 → 再送する "
+              f"({len(seqs)} 個を詰め直し)")
+        send_bridge(ser, chunked_body(chunks, seqs), f"resend{rnd}")
+    return False
+
+
 def main() -> int:
     args = sys.argv[1:]
     global BRIDGE_BAUD
@@ -196,7 +274,7 @@ def main() -> int:
             args.remove(a)
     flags = {a for a in args if a.startswith("--")}
     positional = [a for a in args if not a.startswith("--")]
-    if len(positional) > 1 or not flags <= {"--commit", "--raw"}:
+    if len(positional) > 1 or not flags <= {"--commit", "--raw", "--legacy"}:
         print(__doc__)
         return 2
 
@@ -211,19 +289,28 @@ def main() -> int:
 
     do_commit = "--commit" in flags
     raw_upload = "--raw" in flags
+    legacy = "--legacy" in flags
 
     image = load_image(image_path)
     crc = zlib.crc32(image) & 0xFFFFFFFF
+    chunks = None
     if raw_upload:
         body = image
         header = b"XNOU" + struct.pack("<II", len(image), crc)
-    else:
+    elif legacy:
+        # ★従来の XNOZ 経路。**回復のために残してある** — 新形式 (XNOR) に
+        #   バグがあっても、この経路で板へ焼き直せる。チャンク再送は効かない。
         body = deflate_chunks(image)
         header = b"XNOZ" + struct.pack("<II", len(image), crc)
+    else:
+        chunks = deflate_chunk_list(image)
+        body = chunked_body(chunks)
+        header = b"XNOR" + struct.pack("<II", len(image), crc)
     print(f"image: {image_path}  {len(image)} bytes  crc32={crc:08x}")
     if not raw_upload:
+        mode = "XNOZ (legacy)" if legacy else f"XNOR ({len(chunks)} chunks)"
         print(f"  deflate: {len(body)} bytes on the wire "
-              f"({len(body) / len(image) * 100:.1f}%)")
+              f"({len(body) / len(image) * 100:.1f}%)  {mode}")
 
     port = find_port()
     print(f"opening {port} @ {BAUD} baud (中継中は {BRIDGE_BAUD} baud)")
@@ -232,7 +319,13 @@ def main() -> int:
     # 開始前の掃除。相手が定期送信していると idle にならないので上限は短く。
     drain(ser, 0.3, hard_limit=1.0)
 
-    send_bridge(ser, header + body, "upload")
+    if chunks is not None:
+        if not send_chunked(ser, header, chunks):
+            print("RESULT: staging failed (本体は無傷)")
+            ser.close()
+            return 1
+    else:
+        send_bridge(ser, header + body, "upload")
 
     if do_commit:
         commit_cmd = b"XNOC" + struct.pack("<II", len(image), crc)

@@ -66,22 +66,134 @@ ZWBITS = -12  # 窓 4KB = 1 チャンクぶん。これ以上大きくしても�
 ZCHUNK_MAX = ZCHUNK + 256  # デバイス側 ota.cpp の ZCHUNK_MAX と一致させること
 
 
+def _deflate_one(raw: bytes) -> bytes:
+    """4KB 以下の 1 ブロックを独立した raw deflate にする。"""
+    c = zlib.compressobj(9, zlib.DEFLATED, ZWBITS)
+    comp = c.compress(raw) + c.flush()
+    if len(comp) >= len(raw) + 5:
+        # ★縮まないチャンクは自分で「無圧縮ブロック」に組む。deflate の
+        #   枠が付いて 4KB を超え、デバイスの上限に当たるのを防ぐ。
+        #   0x01 = 最終ブロック・無圧縮、続けて LEN と ~LEN。
+        #   ★ここは元々**生の 0x01 バイトがソースへ直接埋まっていた**。値は
+        #     同じだが grep や差分で消えて見えるのでエスケープ表記へ直した。
+        comp = b"\x01" + struct.pack("<HH", len(raw), len(raw) ^ 0xFFFF) + raw
+    if len(comp) > ZCHUNK_MAX:
+        raise SystemExit(f"chunk is {len(comp)}B > {ZCHUNK_MAX}B")
+    return comp
+
+
+def deflate_chunk_list(image: bytes) -> list:
+    """像を 4KB ごとに独立圧縮したペイロードの一覧にする (seq = 添字)。"""
+    return [_deflate_one(image[at : at + ZCHUNK])
+            for at in range(0, len(image), ZCHUNK)]
+
+
 def deflate_chunks(image: bytes) -> bytes:
-    """4KB ごとに独立した raw deflate にして [u16 len][data] で並べる。"""
+    """4KB ごとに独立した raw deflate にして [u16 len][data] で並べる。
+
+    ★XNOZ (旧形式) 用。チャンク再送には使えない — 境界が len にしか無いので、
+      len の 1 ビットが化けると以降のフレーム境界が全部ずれ、「化けた seq
+      だけ再送」が「最初の 1 個が化けたら以降全部」へ退化する。新しい経路は
+      chunked_body() を使うこと。**この関数を消さないのは回復経路のため**:
+      新形式にバグがあっても、古い形式でこの板へ焼き直せる。
+    """
     out = bytearray()
-    for at in range(0, len(image), ZCHUNK):
-        raw = image[at : at + ZCHUNK]
-        c = zlib.compressobj(9, zlib.DEFLATED, ZWBITS)
-        comp = c.compress(raw) + c.flush()
-        if len(comp) >= len(raw) + 5:
-            # ★縮まないチャンクは自分で「無圧縮ブロック」に組む。deflate の
-            #   枠が付いて 4KB を超え、デバイスの上限に当たるのを防ぐ。
-            #   0x01 = 最終ブロック・無圧縮、続けて LEN と ~LEN。
-            comp = b"" + struct.pack("<HH", len(raw), len(raw) ^ 0xFFFF) + raw
-        if len(comp) > ZCHUNK_MAX:
-            raise SystemExit(f"chunk at {at} is {len(comp)}B > {ZCHUNK_MAX}B")
+    for comp in deflate_chunk_list(image):
         out += struct.pack("<H", len(comp)) + comp
     return bytes(out)
+
+
+# ---- XNOR: チャンク単位の再送 ---------------------------------------------
+# ★ワイヤ形式 (device 側 ota.cpp と一致させること):
+#     [u32 'XNCK'][u16 seq][u16 len][u32 crc32(payload)][u16 rsv][u16 crc16(先頭14B)]
+#   受け手は len を信用する前に crc16 でヘッダを検め、壊れていれば 1 バイト
+#   ずつずらして magic を探し直す。この「自己同期できるヘッダ」があって初めて
+#   「化けた seq だけ再送」が成立する。上乗せは 16B/4096B = 0.39%。
+# ★seq == QUERY_SEQ かつ len == 0 は「今どれが足りないか教えろ」の問い合わせ。
+#   チャンクと同じ枠に載せてあるので、探索も crc16 の保護もそのまま効く。
+CHUNK_MAGIC = b"XNCK"
+QUERY_SEQ = 0xFFFF
+RESET_SEQ = 0xFFFE
+MAX_ROUNDS = 5
+
+
+def _crc16_ccitt(data: bytes) -> int:
+    crc = 0xFFFF
+    for byte in data:
+        crc ^= byte << 8
+        for _ in range(8):
+            crc = (((crc << 1) ^ 0x1021) & 0xFFFF if crc & 0x8000
+                   else (crc << 1) & 0xFFFF)
+    return crc
+
+
+def chunk_frame(seq: int, payload: bytes) -> bytes:
+    head = CHUNK_MAGIC + struct.pack(
+        "<HHIH", seq, len(payload), zlib.crc32(payload) & 0xFFFFFFFF, 0)
+    return head + struct.pack("<H", _crc16_ccitt(head)) + payload
+
+
+def reset_frame() -> bytes:
+    """走りかけの転送を捨てさせる。
+
+    ★★諦めた転送のあと device は最大 2 分 CSEEK に居座る (ラウンドの合間を
+      守るための長いタイムアウト)。その間に次の転送を始めると **XNOR の
+      ファイルヘッダがチャンクデータとして食われて**先へ進まない。転送の頭で
+      必ず撃つこと。
+    ★device はこのフレームの**残りを捨てる**ので、**書き込み単位の最後に
+      置くこと** (BLE なら 16B を単独で write する)。UART の中継のように
+      バイト列が連続する経路では代わりにシェルの OTARESET を使う。
+    """
+    return chunk_frame(RESET_SEQ, b"")
+
+
+def query_frame() -> bytes:
+    """帯域内の「足りない seq を教えろ」。
+
+    ★OTW では使わない — 攻めた baud だと返事そのものが化けて再送機構ごと
+      成立しないので、あちらは中継の外から常用 115200 でシェルの OTANEED を
+      叩く。BLE は baud の問題が無いのでこれでよい。
+    """
+    return chunk_frame(QUERY_SEQ, b"")
+
+
+def chunked_body(chunks: list, seqs=None) -> bytes:
+    """指定した seq のチャンクだけを並べる (省略時は全部)。
+
+    ★チャンクが自分の seq を持っているので**順不同でよい**。送り手側に
+      窓幅・順序・タイムアウト再送の状態機械が要らないのがこの方式の要点。
+    """
+    if seqs is None:
+        seqs = range(len(chunks))
+    return b"".join(chunk_frame(s, chunks[s]) for s in seqs)
+
+
+def parse_need(text: str):
+    """device の NEED 応答を読む。戻り値 (n, seqs, complete)。
+
+    complete=False は「NEEDEND まで見えなかった」= 返事が化けたか届いて
+    いない。★このとき n も seqs も信用してはいけない — 一覧が途中で切れて
+    いるのに信じると、欠けたまま「もう要らない」と誤解して commit へ進む。
+    """
+    n = None
+    seqs = []
+    complete = False
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("NEED n="):
+            try:
+                n = int(line[7:].split()[0])
+            except (ValueError, IndexError):
+                pass
+        elif line.startswith("NEEDSEQ"):
+            for tok in line[7:].replace(",", " ").split():
+                try:
+                    seqs.append(int(tok))
+                except ValueError:
+                    pass  # 化けたトークンは捨てる (complete 判定で拾う)
+        elif line.startswith("NEEDEND"):
+            complete = True
+    return n, seqs, complete
 
 # ★write without response のバックプレッシャ。bleak は response=False を
 #   CoreBluetooth へ**投げっぱなし**にする (backends/corebluetooth の
@@ -206,22 +318,31 @@ async def _connect_or_explain(device):
 
 
 async def main(path: str, do_upload: bool, do_commit: bool,
-               with_response: bool, raw_upload: bool) -> int:
+               with_response: bool, raw_upload: bool,
+               legacy: bool = False) -> int:
     image = load_image(path)
     crc = zlib.crc32(image) & 0xFFFFFFFF
     commit_cmd = b"XNOC" + struct.pack("<II", len(image), crc)
     # ★total と crc32 は**常に展開後の像**のもの。圧縮するかどうかは転送の
     #   都合でしかなく、commit 側 (と検証) は一切変わらない。
+    chunks = None
     if raw_upload:
         body = image
         header = b"XNOU" + struct.pack("<II", len(image), crc)
-    else:
+    elif legacy:
+        # ★従来の XNOZ 経路。**回復のために残してある** — 新形式 (XNOR) に
+        #   バグがあっても、この経路で板へ焼き直せる。再送は効かない。
         body = deflate_chunks(image)
         header = b"XNOZ" + struct.pack("<II", len(image), crc)
+    else:
+        chunks = deflate_chunk_list(image)
+        body = chunked_body(chunks)
+        header = b"XNOR" + struct.pack("<II", len(image), crc)
     print(f"image: {path}  {len(image)} bytes  crc32={crc:08x}")
     if not raw_upload:
+        mode = "XNOZ (legacy)" if legacy else f"XNOR ({len(chunks)} chunks)"
         print(f"  deflate: {len(body)} bytes on the wire "
-              f"({len(body) / len(image) * 100:.1f}%)")
+              f"({len(body) / len(image) * 100:.1f}%)  {mode}")
 
     lines: list[str] = []
     buf = bytearray()
@@ -276,6 +397,12 @@ async def main(path: str, do_upload: bool, do_commit: bool,
         #   消去は両コアを止めて IRQ を切るので (1 ブロック ~105ms)、その間に
         #   流し込むと CYW43 の SPI が壊れる (実機で Bus error → チップごと
         #   ハング → 電源を抜くまで復帰せず)。**消し終わってから流す**。
+        if chunks is not None:
+            # ★16B を単独で write する (device はこのフレームの残りを捨てる)。
+            #   前回の転送を諦めた直後でも、必ず待ち受けから始められる。
+            await client.write_gatt_char(OTA_RX_UUID, reset_frame(),
+                                         response=True)
+            await asyncio.sleep(0.2)
         await client.write_gatt_char(OTA_RX_UUID, header, response=True)
         for _ in range(80):
             await asyncio.sleep(0.1)
@@ -311,32 +438,81 @@ async def main(path: str, do_upload: bool, do_commit: bool,
                 await asyncio.sleep(0.002)
             return True
 
-        t0 = time.perf_counter()
-        sent = 0
-        stalls = 0
-        for offset in range(0, len(payload), CHUNK):
-            if not with_response:
-                if not peripheral.canSendWriteWithoutResponse():
-                    stalls += 1
-                    if not await wait_ready():
-                        print(f"\nlink stalled at {sent}/{len(payload)} bytes "
-                              f"({sent / len(payload) * 100:.0f}%) — giving up",
-                              flush=True)
-                        print("RESULT: transfer stalled (本体は無傷)")
-                        return 1
-            await client.write_gatt_char(
-                OTA_RX_UUID, payload[offset : offset + CHUNK],
-                response=with_response,
-            )
-            await asyncio.sleep(0.005)
-            sent += min(CHUNK, len(payload) - offset)
-            if offset % (CHUNK * 200) == 0:
-                elapsed = time.perf_counter() - t0
-                rate = sent / elapsed / 1024 if elapsed > 0 else 0
-                print(f"  sent {sent}/{len(payload)}  {rate:.1f} kB/s", flush=True)
-        elapsed = time.perf_counter() - t0
-        print(f"transfer done: {sent} bytes in {elapsed:.1f}s "
-              f"({sent / elapsed / 1024:.1f} kB/s, {stalls} stalls)")
+        async def blast(data: bytes, label: str) -> bool:
+            """まとめて投げ切る。戻り値 False = リンクが詰まって戻らなかった。
+
+            ★チャンク再送でも「投げ切る」流し方は変えない。窓を作って ACK を
+              追いかけるのではなく、送り切ってから足りない分を聞く
+              (HTTP の range 再取得と同じ発想)。
+            """
+            t0 = time.perf_counter()
+            sent = 0
+            stalls = 0
+            for offset in range(0, len(data), CHUNK):
+                if not with_response:
+                    if not peripheral.canSendWriteWithoutResponse():
+                        stalls += 1
+                        if not await wait_ready():
+                            print(f"\n[{label}] link stalled at "
+                                  f"{sent}/{len(data)} bytes "
+                                  f"({sent / len(data) * 100:.0f}%) — giving up",
+                                  flush=True)
+                            return False
+                await client.write_gatt_char(
+                    OTA_RX_UUID, data[offset : offset + CHUNK],
+                    response=with_response,
+                )
+                await asyncio.sleep(0.005)
+                sent += min(CHUNK, len(data) - offset)
+                if offset % (CHUNK * 200) == 0:
+                    elapsed = time.perf_counter() - t0
+                    rate = sent / elapsed / 1024 if elapsed > 0 else 0
+                    print(f"  [{label}] sent {sent}/{len(data)}  "
+                          f"{rate:.1f} kB/s", flush=True)
+            elapsed = max(time.perf_counter() - t0, 1e-9)
+            print(f"[{label}] done: {sent} bytes in {elapsed:.1f}s "
+                  f"({sent / elapsed / 1024:.1f} kB/s, {stalls} stalls)")
+            return True
+
+        if not await blast(payload, "upload"):
+            print("RESULT: transfer stalled (本体は無傷)")
+            return 1
+
+        if chunks is not None:
+            # ★BLE は baud を切り替えないので、問い合わせも**帯域内**で済む
+            #   (OTW のように制御用の別経路を用意する必要が無い)。同じ 16B の
+            #   チャンクヘッダに seq=0xFFFF を載せるだけ。
+            # ★この枠組みが BLE でも効くのは、ACL 層の再送があってもアプリ層は
+            #   「投げた」ことしか分からず「届いて書き込めた」までは見えない
+            #   ため。stall や切断を**チャンク単位で切り分けられる**ようになる。
+            for rnd in range(1, MAX_ROUNDS + 1):
+                mark = len(lines)
+                await client.write_gatt_char(OTA_RX_UUID, query_frame(),
+                                             response=True)
+                for _ in range(300):
+                    await asyncio.sleep(0.1)
+                    if any(x.startswith("NEEDEND") for x in lines[mark:]):
+                        break
+                n, seqs, complete = parse_need("\n".join(lines[mark:]))
+                if not complete or n is None:
+                    print(f"[round {rnd}] NEED の返事が最後まで届かない "
+                          f"(NEEDEND が見えない)。一覧が途中で切れている可能性が"
+                          f"あるので止める — 欠けたまま commit しないこと。")
+                    dump_tail(lines)
+                    await quiet_stop(client)
+                    return 1
+                if n == 0:
+                    print(f"[round {rnd}] 全チャンク受領")
+                    break
+                if rnd == MAX_ROUNDS:
+                    print(f"{n} チャンクが {MAX_ROUNDS} ラウンドでも埋まらない")
+                    dump_tail(lines)
+                    await quiet_stop(client)
+                    return 1
+                print(f"[round {rnd}] {n} チャンク未達 → 再送 ({len(seqs)} 個)")
+                if not await blast(chunked_body(chunks, seqs), f"resend{rnd}"):
+                    print("RESULT: transfer stalled (本体は無傷)")
+                    return 1
 
         # デバイス側の判定 (done / CRC MISMATCH) が出るまで待つ。
         # ★固定待ちにしない — 判定は転送が終わればすぐ出る。
@@ -374,9 +550,15 @@ async def quiet_stop(client) -> None:
     「転送は途中まで進んでいたのに、後始末の disconnected で traceback だけが
     残り、どこで死んだのか分からない」が 2 回起きた。切断は起こる前提の経路
     なので、後始末は結果に影響させない。
+
+    ★2026-09-02 の 6c04010 で各所の `client.stop_notify(NUS_TX_UUID)` をこの
+      関数へまとめた際、**本体まで自分自身の呼び出しに置き換わっていた**
+      (無限再帰)。通知が止まらないだけでなく、RecursionError をすぐ下の
+      except が拾って「無視」と印字するので、**表向き無症状に見える**のが
+      たちが悪い。ラッパを作るときは中身が元の呼び出しのままか必ず見ること。
     """
     try:
-        await quiet_stop(client)
+        await client.stop_notify(NUS_TX_UUID)
     except Exception as e:  # noqa: BLE001
         print(f"  (stop_notify は無視: {type(e).__name__}: {e})")
 
@@ -504,7 +686,8 @@ if __name__ == "__main__":
     flags = {a for a in args if a.startswith("--")}
     positional = [a for a in args if not a.startswith("--")]
     if len(positional) > 1 or not flags <= {"--commit", "--commit-only",
-                                            "--with-response", "--raw"}:
+                                            "--with-response", "--raw",
+                                            "--legacy"}:
         print(__doc__)
         raise SystemExit(2)
     image_path = positional[0] if positional else DEFAULT_IMAGE
@@ -523,4 +706,5 @@ if __name__ == "__main__":
         do_commit=commit_only or "--commit" in flags,
         with_response="--with-response" in flags,
         raw_upload="--raw" in flags,
+        legacy="--legacy" in flags,
     )))

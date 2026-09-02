@@ -348,13 +348,19 @@ void end_uart_bridge() {
   //   両者の切り戻しタイミングがずれて完了行が文字化けする
   //   (2026-09-02 実測: 230400/1Mbaud で "done: ... crc=..." が化けて消えた。
   //   115200 = 速度を一切変えない設定では発生しない = この経路でのみ起きる)。
-  //   ota が本当に IDLE (= reset_transfer() まで完走) に戻るのを見てから
-  //   baud を戻す。
+  //   ota が本当に手ぶらになるのを見てから baud を戻す。
+  // ★★条件は GET_STATE==IDLE ではなく **GET_QUIESCENT** を使う。チャンク
+  //   単位再送 (XNOR) のラウンドの合間、ota は IDLE ではなく CSEEK (次の
+  //   チャンクを待っている) で待機しており、IDLE を待つと永久に来ない。
+  //   かといって転送を捨てさせるわけにはいかない (受領ビットマップごと
+  //   消えて全再送になる)。GET_QUIESCENT は「メッセージの途中でもなく
+  //   feed() の最中でもない」を ota 自身に判定させたもので、従来の XNOZ
+  //   経路では実質 IDLE と同じ意味になる (後方互換)。
   for (uint32_t spin = 0;
        spin < 2000 &&
        api(shizuku::object_api::CALL_METHOD, xno_object_id::ota,
-           (uintptr_t)method::GET_STATE, 0)
-               .value != 0;
+           (uintptr_t)method::GET_QUIESCENT, 0)
+               .value == 0;
        ++spin)
     api(shizuku::object_api::YIELD);
   // ★★ここで baud を戻す前に、XIAO へ「もう出すものは無い」を machine-readable
@@ -740,6 +746,29 @@ void handle_command_line(char *line) {
     if (total > 0) {
       begin_uart_bridge(total, baud);
     }
+  } else if (strcmp(line, "OTANEED") == 0) {
+    // チャンク単位再送 (XNOR) のラウンド区切り。まだ受け取れていない seq の
+    // 一覧を ota に吐かせる ("NEED n=.." / "NEEDSEQ .." / "NEEDEND")。
+    // ★★これは**中継の外**、常用の 115200 で叩くための口。同じ問い合わせは
+    //   帯域内 (seq=0xFFFF のチャンクヘッダ) でもできるが、OTW で攻めた baud を
+    //   使うときは**返事そのものが化けたら再送機構ごと成立しない**。制御は
+    //   必ず化けない速度で通す、というのがこの口を別に持つ理由。
+    //   BLE 側は baud の問題が無いので帯域内で済ませてよい。
+    using shizuku::objects::ota::method;
+    api(shizuku::object_api::CALL_METHOD, xno_object_id::ota,
+        (uintptr_t)method::GET_MISSING, 0);
+  } else if (strcmp(line, "OTARESET") == 0) {
+    // 走りかけの転送を捨てて待ち受けへ戻す。
+    // ★★諦めた転送のあと ota は最大 2 分 CSEEK に居座る (チャンク再送の
+    //   ラウンドの合間を守るための長いタイムアウト)。その間に次の転送を
+    //   始めると、**XNOR のファイルヘッダをチャンクデータとして食う**ので
+    //   先へ進まない。転送の頭でこれを撃てば必ず待ち受けから始まる。
+    // ★中継の外 (常用 115200) から叩く口。同じことは帯域内の制御フレーム
+    //   (seq=0xFFFE) でもできるが、UART の中継はバイト列が連続していて
+    //   「フレームの最後に置く」を送り手が保証しにくい。有線ではこちらを使う。
+    using shizuku::objects::ota::method;
+    api(shizuku::object_api::CALL_METHOD, xno_object_id::ota,
+        (uintptr_t)method::RESET, 0);
   } else if (strcmp(line, "help") == 0 || strcmp(line, "?") == 0) {
     shell_printf(
         "Commands: status, arm, disarm, pitch <deg>, head <deg>, alt <m>\n");
@@ -747,6 +776,7 @@ void handle_command_line(char *line) {
     shell_printf("          fs [ls|stat|cat <name>|rm <name>|format!]\n");
     shell_printf("          nc [status|y|n|lock|allow|forget!]\n");
     shell_printf("          kill! <thread_id>\n");
+    shell_printf("          UBRIDGE <bytes> [baud], OTANEED, OTARESET\n");
   } else {
     shell_printf("unknown command: %s (try 'help')\n", line);
   }
