@@ -419,22 +419,34 @@ def main() -> int:
         print("\ncommitting — ここで USB / 電源を抜かないこと")
         send_bridge(ser, commit_cmd, "commit", tag="commit")
 
-        print("waiting for Pico to reboot...")
-        time.sleep(3.0)
-        ser.reset_input_buffer()
+        # ★★何度か聞き直すこと。commit は消去 + 書き込み + 再起動なので、
+        #   固定の 3 秒では**間に合わないほうが普通**だった (実測: 1 回きりだと
+        #   ほぼ毎回「確認できず」になる)。
         # ★小文字は XIAO の 1 キーショートカット即時実行に化ける ('s'=status,
-        #   'e'=SW_INHIBIT トグル)。2026-09-01 の修正で複数文字コマンドは
-        #   大文字必須になったのに、ここだけ直し忘れていた。実際に踏んだ:
-        #   'send version' の 's' と 'e' が即時発火し、SW_INHIBIT が勝手に
-        #   ON になった (安全フラグが検証コマンドの副作用で変わった)。
-        ser.write(b"SEND version\n")
-        text = drain(ser, 2.0).decode(errors="replace")
-        if f"crc={crc:08x}" in text:
-            print("RESULT: commit verified (running new image)")
-        else:
-            print("RESULT: could not verify from here — XIAO 経由の 'send "
-                  "version' 応答に一致する crc が見えなかった。Pico の USB "
-                  "CDC (もし繋げれば) か次回 BLE 接続で確認すること。")
+        #   'e'=SW_INHIBIT トグル)。行頭が大文字なら以降は行バッファに入るので
+        #   'SEND ...' は安全だが、**行頭を必ず大文字にする**規律は崩さない。
+        print("waiting for Pico to reboot...")
+        verified = False
+        deadline = time.time() + 25.0
+        while time.time() < deadline:
+            time.sleep(2.0)
+            ser.reset_input_buffer()
+            ser.write(b"SEND VER\n")
+            text = drain(ser, 2.0).decode(errors="replace")
+            if f"crc={crc:08x}" in text:
+                verified = True
+                break
+        if not verified:
+            print("RESULT: could not verify from here — XIAO 経由の 'SEND VER' "
+                  "応答に一致する crc が見えなかった。Pico の USB CDC "
+                  "(もし繋げれば) か次回 BLE 接続で確認すること。")
+            # ★★**成功として返さない**。ここで 0 を返していたため、
+            #   flash.sh が「検証できていない commit」を「完了」と報告して
+            #   いた。焼けたかどうかを言えないなら、言えないと返すこと —
+            #   上位が次の手 (OTA) へ進めるかどうかの判断材料になる。
+            ser.close()
+            return 1
+        print(f"RESULT: commit verified (running new image, crc={crc:08x})")
 
     ser.close()
     return 0

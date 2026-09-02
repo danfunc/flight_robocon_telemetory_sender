@@ -47,7 +47,12 @@ xiao_send() {
 #   (2026-09-01 に実際に両方塞がった)。相手のファームが古いときほど効く。
 quiet_on()  { xiao_send "QUIET ON"; }
 quiet_off() { xiao_send "QUIET OFF"; }
-reset_pico() { say "Pico を再起動して状態を作り直す"; xiao_send "reboot"; sleep 6; }
+# ★★**大文字で送ること**。XIAO の 1 キーショートカットは小文字専用で、
+#   行バッファが空のときに即時発火する。"reboot" と送ると 'r' がその場で
+#   発火して残り "eboot" が行バッファにゴミとして残り、**次のコマンドの
+#   先頭に食い込む**。行コマンド側は大小を問わない (eqi) ので、大文字なら
+#   必ず 1 行として届く。
+reset_pico() { say "Pico を再起動して状態を作り直す"; xiao_send "REBOOT"; sleep 6; }
 
 # ---- 1) BOOTSEL -----------------------------------------------------------
 if [ -n "$PICOTOOL" ] && "$PICOTOOL" info >/dev/null 2>&1; then

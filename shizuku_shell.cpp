@@ -382,7 +382,11 @@ void end_uart_bridge() {
   //     出たあと commit が実行されず、像が古いままだった)。
   //     commit の 12 バイトは即座に汲まれるので第 1 段はすぐ抜け、第 2 段の
   //     2 秒で諦めれば、ota は邪魔されずに焼ける。
-  uint64_t next_beat_us = BOARD::time_us();
+  // ★最初の 1 拍は**すぐ打たない**。commit の 12 バイトのように即座に汲まれる
+  //   場合、環の検査と ota の pop が競って 1 拍だけ余計に出てしまい、
+  //   begin_commit() の出力と UART 上で衝突する (2026-09-02 実機:
+  //   "UBRIvGr_fUiY" と混ざり "verifying ..." の頭が消えた)。
+  uint64_t next_beat_us = BOARD::time_us() + 500000ull;
   while (BOARD::time_us() < drain_deadline_us &&
          g_uart_ota.hdl().available() > 0) {
     const uint64_t now = BOARD::time_us();
