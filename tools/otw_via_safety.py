@@ -255,6 +255,11 @@ def send_bridge(ser: "serial.Serial", payload: bytes, label: str,
     _last_bridge_end = time.time()
 
 
+def complete_flag(text: str) -> bool:
+    """NEEDEND まで見えたか。"""
+    return "NEEDEND" in text
+
+
 def reset_ota(ser: "serial.Serial") -> None:
     """走りかけの転送を捨てさせ、必ず待ち受けから始める。"""
     ser.reset_input_buffer()
@@ -292,6 +297,16 @@ def query_missing(ser: "serial.Serial"):
         # 待てば「返事が全部届いた」が一つの合図で判定できる。
         text = drain_until(ser, b"NEEDEND", idle_seconds=2.0,
                            hard_limit=30.0).decode(errors="replace")
+        # ★★"NEEDIDLE" = device 側に転送が走っていない。**成功ではない**。
+        #   以前 device はこれを "NEED n=0 (チャンク転送が走っていない)" と
+        #   返しており、n=0 = 全チャンク受領として読まれて**失敗が成功として
+        #   報告されていた** (2026-09-02 実機)。しかも括弧の中は日本語なので
+        #   XIAO の行組み立て (ASCII のみ) を通ると消え、"NEED n=0 ()" という
+        #   完全に成功に見える文字列になっていた。
+        if "NEEDIDLE" in text:
+            print("  ★device に転送が走っていない (NEEDIDLE)。転送が途中で"
+                  "畳まれた可能性が高い — 最初からやり直すこと")
+            return None, [], complete_flag(text)
         n, seqs, complete = parse_need(text)
         if complete and n is not None:
             return n, seqs, complete
