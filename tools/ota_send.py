@@ -199,9 +199,19 @@ def parse_need(text: str):
             except (ValueError, IndexError):
                 pass
         elif "NEEDSEQ" in line:
+            # ★範囲表記 ("40-59") を受ける。ビット化けは連続したチャンクを
+            #   まとめて落とすので、範囲にすると行が劇的に短くなる —
+            #   これは見た目の話ではなく、**XIAO の UART RX が FIFO 32B の
+            #   ポーリングで 115200 では 2.8ms で溢れる**ため。長い行を続けて
+            #   流すと途中が落ちて一覧が欠け、送り手は足りない seq を知らない
+            #   まま再送して永久に収束しない (2026-09-02 実機で踏んだ)。
             for tok in line[line.find("NEEDSEQ") + 7:].replace(",", " ").split():
                 try:
-                    seqs.append(int(tok))
+                    if "-" in tok:
+                        a, b = tok.split("-", 1)
+                        seqs.extend(range(int(a), int(b) + 1))
+                    else:
+                        seqs.append(int(tok))
                 except ValueError:
                     pass  # 化けたトークンは捨てる (complete 判定で拾う)
         elif "NEEDEND" in line:

@@ -370,22 +370,36 @@ void end_uart_bridge() {
   //   転送自体は成功しているのに毎回 "no ACK/NAK (2s idle timeout)" になった。
   //   XIAO 側の閾値を上げるのが筋だが、あちらを焼き替えずに済ませたいので
   //   こちらから息をする (相手の時計を進めさせない、が目的)。
+  // ★★待ちを 2 段に分ける。
+  //   第 1 段は「環が空くまで」= **これが正しさの本体**。ここで打ち切ると、
+  //   まだ汲まれていないフレームを抱えたまま下の SET_INPUT_STREAM で入力を
+  //   差し替えて捨ててしまう。長く待ってよい。
+  //   第 2 段は「ota が処理を終えたか」= あれば嬉しい程度なので**短く打ち切る**。
+  //   ★★★ここを長く待つと commit を壊す。commit (XNOC) は feed() の中から
+  //     flash を焼いて**そのまま再起動する**ので、GET_QUIESCENT は永久に 0 の
+  //     まま。20 秒粘ると、その間シェルが UART へ喋り続けて commit 自身の
+  //     出力を潰し、焼けなくなる (2026-09-02 実機: UBRIDGE_BUSY が 21 行
+  //     出たあと commit が実行されず、像が古いままだった)。
+  //     commit の 12 バイトは即座に汲まれるので第 1 段はすぐ抜け、第 2 段の
+  //     2 秒で諦めれば、ota は邪魔されずに焼ける。
   uint64_t next_beat_us = BOARD::time_us();
-  while (BOARD::time_us() < drain_deadline_us) {
-    const bool ring_empty = g_uart_ota.hdl().available() == 0;
-    const bool quiet = api(shizuku::object_api::CALL_METHOD,
-                           xno_object_id::ota,
-                           (uintptr_t)method::GET_QUIESCENT, 0)
-                           .value != 0;
-    if (ring_empty && quiet)
-      break;
+  while (BOARD::time_us() < drain_deadline_us &&
+         g_uart_ota.hdl().available() > 0) {
     const uint64_t now = BOARD::time_us();
-    if (now >= next_beat_us) {
-      next_beat_us = now + 500000ull; // 相手の 2 秒に対して十分な余裕
+    // ★焼いている間は**喋らない**。IRQ を止めている最中に口を開くのは
+    //   この系で何度も痛い目を見ている作法違反 (ota::flash_busy())。
+    if (now >= next_beat_us && !shizuku::objects::ota::flash_busy()) {
+      next_beat_us = now + 500000ull; // 相手の 2 秒アイドルに対する余裕
       uart_puts(SHELL_UART, "UBRIDGE_BUSY\n");
     }
     api(shizuku::object_api::YIELD);
   }
+  const uint64_t quiet_deadline_us = BOARD::time_us() + 2000000ull;
+  while (BOARD::time_us() < quiet_deadline_us &&
+         api(shizuku::object_api::CALL_METHOD, xno_object_id::ota,
+             (uintptr_t)method::GET_QUIESCENT, 0)
+                 .value == 0)
+    api(shizuku::object_api::YIELD);
   // ★★ここで baud を戻す前に、XIAO へ「もう出すものは無い」を machine-readable
   //   な 1 バイトで伝える。commit が成功した場合はここへ戻ってこない
   //   (flash_safe_execute の中で直接再起動する、"no return") ので、その

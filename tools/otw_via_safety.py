@@ -194,13 +194,19 @@ def wait_after_bridge(label: str) -> None:
         time.sleep(gap)
 
 
-def send_bridge(ser: "serial.Serial", payload: bytes, label: str) -> None:
-    """XIAO を ubridge モードへ入れ、payload を生で流し込む。"""
+def send_bridge(ser: "serial.Serial", payload: bytes, label: str,
+                tag: str = "upload") -> None:
+    """XIAO を ubridge モードへ入れ、payload を生で流し込む。
+
+    tag は XIAO の**状態 LED の色だけ**を決める第 3 引数 (upload/resend/commit)。
+    ★古い XIAO は第 3 引数を読まないので黙って無視される (後方互換)。
+      Pico へ中継される UBRIDGE には載らないので、Pico 側は無関係。
+    """
     global _last_bridge_end
     wait_after_bridge(label)
     n = len(payload)
     ser.reset_input_buffer()
-    ser.write(f"ubridge {n} {BRIDGE_BAUD}\n".encode())
+    ser.write(f"ubridge {n} {BRIDGE_BAUD} {tag}\n".encode())
     ser.flush()
 
     buf = bytearray()
@@ -331,7 +337,8 @@ def send_chunked(ser: "serial.Serial", header: bytes, chunks: list) -> bool:
             return False
         print(f"[round {rnd}] {n} チャンクが未達 → 再送する "
               f"({len(seqs)} 個を詰め直し)")
-        send_bridge(ser, chunked_body(chunks, seqs), f"resend{rnd}")
+        send_bridge(ser, chunked_body(chunks, seqs), f"resend{rnd}",
+                    tag="resend")
     return False
 
 
@@ -410,7 +417,7 @@ def main() -> int:
     if do_commit:
         commit_cmd = b"XNOC" + struct.pack("<II", len(image), crc)
         print("\ncommitting — ここで USB / 電源を抜かないこと")
-        send_bridge(ser, commit_cmd, "commit")
+        send_bridge(ser, commit_cmd, "commit", tag="commit")
 
         print("waiting for Pico to reboot...")
         time.sleep(3.0)
