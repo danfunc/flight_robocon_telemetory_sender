@@ -765,20 +765,6 @@ void handle_command_line(char *line) {
   } else if (strcmp(line, "PING") == 0 || strcmp(line, "ping") == 0) {
     shell_printf("PONG\n");
   } else if (strncmp(line, "SAFE", 4) == 0) {
-    // ★★安全装置のハートビートに **1 バイトだけ**答える (2026-09-02)。
-    //   これが無いと XIAO は「Pico が生きている」を知る手段が一切無く、
-    //   実測でも UART0 は TX=93898 / RX=11 と一方通行だった。XIAO の
-    //   User LED の B (UART) は「無通信」と「リンク断」を区別できず、
-    //   表示として意味を持てない (HANDOFF の宿題 4)。
-    // ★値は 0x16 (SYN = synchronous idle)。中継の同期に使う ACK(0x06) /
-    //   NAK(0x15) とは**別の値**にする — 中継の出口で 1 バイトを待って
-    //   いる相手が、遅れて届いたハートビート応答を取り違えないため。
-    // ★非印字なので XIAO 側は行として組み立てず黙って食う (CDC の
-    //   コンソールを 10Hz で埋めない)。
-    // ★焼いている最中は喋らない。IRQ を止めている間に口を開くのは
-    //   この系で何度も痛い目を見ている作法違反。
-    if (!shizuku::objects::ota::flash_busy())
-      uart_putc_raw(SHELL_UART, 0x16);
     // 外部安全装置 (Seeed XIAO) からの安全ハートビート / アラート。
     // 必要に応じて安全インターロックの反映が可能。
     // ★接頭辞を "SAFE" 4 文字だけで見る。以前は "SAFE," と "SAFE_" を
