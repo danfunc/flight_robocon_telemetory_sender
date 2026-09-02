@@ -142,9 +142,14 @@ uintptr_t poll_loop(uintptr_t, uintptr_t, uintptr_t, uintptr_t) {
   g_enabled = true;
   uint32_t step_index = 0;
 
-  constexpr int32_t MIN_MS = 1000;
-  constexpr int32_t MAX_MS = 2000;
-  constexpr int32_t STEP_MS = 10;
+  // ★掃引幅を広く・遅くしてある (2026-09-01)。**OTA が効いたことを目で確かめる
+  //   ための印**。書き込み前は 100〜200ms の速い狭い掃引だったので、
+  //   300〜1200ms のゆっくりした広い掃引に変われば、新しい像が走っていると
+  //   一目で分かる。デバッガもシリアルも要らない確認手段は、遠隔で焼く系では
+  //   それ自体が価値がある。
+  constexpr int32_t MIN_MS = 300;
+  constexpr int32_t MAX_MS = 1200;
+  constexpr int32_t STEP_MS = 100;
   int32_t sweep_interval_ms = MIN_MS;
   int32_t sweep_step_ms = STEP_MS;
 
