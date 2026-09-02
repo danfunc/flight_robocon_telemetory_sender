@@ -256,6 +256,17 @@ uint64_t g_uart_bridge_last_us = 0;
 //     誤検出するほうが安全側**なのでこの交換を選んでいる。
 constexpr uint8_t BRIDGE_ABORT_MAGIC[8] = {0x55, 0xA5, 'U', 'B', 'R', 'K',
                                            0x5A, 0xAA};
+
+// ★モード切替 (raw ⇄ 行コマンド) の同期用。ASCII の ACK/NAK をそのまま使う
+//   (印字可能な範囲の外なので、ログ行やコマンド行と混ざる余地が無い —
+//   BRIDGE_ABORT_MAGIC と同じ発想)。end_uart_bridge() が baud を戻す**前**、
+//   まだ相手 (XIAO) が聞いている速度のうちに 1 バイトだけ送る。
+//   XIAO 側はこれを見た時点で「Pico はもう何も出さない」と確信して即座に
+//   baud を戻せるので、2 秒のアイドル待ちに頼らずに済む (待ちは相手が古い
+//   ファームのときの後方互換フォールバックとして残す)。XIAO 側の定数と
+//   値を一致させること (flight_robocon_safety/src/shell.rs)。
+constexpr uint8_t UART_BRIDGE_ACK = 0x06; // 転送・commit とも成功
+constexpr uint8_t UART_BRIDGE_NAK = 0x15; // 失敗 (CRC 不一致・inflate 失敗等)
 uint8_t g_abort_window[sizeof(BRIDGE_ABORT_MAGIC)] = {};
 uint32_t g_abort_filled = 0;
 
@@ -346,6 +357,20 @@ void end_uart_bridge() {
                .value != 0;
        ++spin)
     api(shizuku::object_api::YIELD);
+  // ★★ここで baud を戻す前に、XIAO へ「もう出すものは無い」を machine-readable
+  //   な 1 バイトで伝える。commit が成功した場合はここへ戻ってこない
+  //   (flash_safe_execute の中で直接再起動する、"no return") ので、その
+  //   ケースは今まで通り XIAO 側の 2 秒アイドル待ちが拾う — ACK は
+  //   「ステージングだけして commit しない」経路 (再送・実機試験) を主に
+  //   縮めるためのもの。
+  {
+    const bool ok =
+        api(shizuku::object_api::CALL_METHOD, xno_object_id::ota,
+            (uintptr_t)method::GET_LAST_OK, 0)
+            .value != 0;
+    const uint8_t sync = ok ? UART_BRIDGE_ACK : UART_BRIDGE_NAK;
+    uart_putc_raw(SHELL_UART, sync);
+  }
   if (g_ble_ota_stream_id != xno::NO_STREAM) {
     api(shizuku::object_api::CALL_METHOD, xno_object_id::ota,
         (uintptr_t)method::SET_INPUT_STREAM, g_ble_ota_stream_id);

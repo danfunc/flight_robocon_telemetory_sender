@@ -102,6 +102,36 @@ def drain(ser: "serial.Serial", idle_seconds: float,
     return bytes(buf)
 
 
+def drain_until(ser: "serial.Serial", marker: bytes, idle_seconds: float,
+                 hard_limit: float) -> bytes:
+    """marker が出るか、無通信が idle_seconds 続くか、hard_limit を過ぎるまで読む。
+
+    drain() と違い「相手がもう次を受け付けられる状態に戻った」ことを示す
+    具体的な文言を待てる場合に使う — 固定の idle_seconds だけに頼ると、
+    こちらの秒読みと相手の秒読みが別クロックでずれたときに、相手がまだ
+    片付いていないうちに次のコマンドを送ってしまう (2026-09-02 実測)。
+    """
+    buf = bytearray()
+    start = time.time()
+    deadline = start + idle_seconds
+    while time.time() < deadline:
+        if marker in buf:
+            break
+        if time.time() - start > hard_limit:
+            sys.stdout.write(
+                f"\n[drain] '{marker.decode()}' が {hard_limit:.0f}s 待っても"
+                f" 出ない。見切って進む\n")
+            sys.stdout.flush()
+            break
+        chunk = ser.read(max(1, ser.in_waiting))
+        if chunk:
+            buf += chunk
+            sys.stdout.write(chunk.decode(errors="replace"))
+            sys.stdout.flush()
+            deadline = time.time() + idle_seconds
+    return bytes(buf)
+
+
 def send_bridge(ser: "serial.Serial", payload: bytes, label: str) -> None:
     """XIAO を ubridge モードへ入れ、payload を生で流し込む。"""
     n = len(payload)
@@ -139,7 +169,21 @@ def send_bridge(ser: "serial.Serial", payload: bytes, label: str) -> None:
     rate = n / elapsed / 1024 if elapsed > 0 else 0
     print(f"[{label}] host-side write done in {elapsed:.1f}s ({rate:.1f} kB/s "
           f"— UART のハードウェア律速はこの後も続く)")
-    drain(ser, 2.0)
+    # ★2026-09-02 実測: 固定 2 秒の drain() だけで次の send_bridge() へ進む
+    #   と、こちらの 2 秒と XIAO 自身のアイドル待ち (これも 2 秒だが、別々の
+    #   クロックで別々の起点から数えている) がわずかにずれて、XIAO がまだ
+    #   run_uart_bridge() から戻り切る前に次の 'ubridge ...' を送ってしまう
+    #   ことがあった。次のコマンドを受け付けられる状態に戻ったことは、
+    #   XIAO 自身が最後に必ず出す "[BRIDGE] done" で分かるので、それを見て
+    #   から進む (見えなければ hard_limit で打ち切って進む — 古い XIAO
+    #   ファームでこの文言が変わっていた場合に永久に待たないため)。
+    drain_until(ser, b"[BRIDGE] done", idle_seconds=2.0, hard_limit=5.0)
+    # ★"[BRIDGE] done" が見えた後も、次の 'ubridge ...' を受け付けられる
+    #   状態に戻るまでにもう少し時間がかかる (2026-09-02 実測: 0.2s では
+    #   毎回失敗、5s なら毎回通った)。正確な内訳は未特定 — XIAO 側か Pico
+    #   側か、あるいは両方の後始末が絡んでいるかは分かっていない。実用上は
+    #   ここで長めに待つのが最短の対策。
+    time.sleep(3.0)
 
 
 def main() -> int:
