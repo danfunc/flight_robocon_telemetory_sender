@@ -11,6 +11,18 @@ module(
 bazel_dep(name = "platforms", version = "0.0.9")
 bazel_dep(name = "bazel_skylib", version = "1.6.1")
 bazel_dep(name = "rules_cc", version = "0.0.10")
+# ★ホスト側 (母艦) の Python を Bazel から扱うため。Bazel 8 で native の
+#   py_binary/py_test が消えたので、これが無いと試験を `bazel test` に載せられない。
+bazel_dep(name = "rules_python", version = "1.0.0")
+
+# ★★interpreter を**固定する**。ホストの python3 に乗ると、マシンを変えた
+#   ときや homebrew が上がったときに黙って挙動が変わる。ここは
+#   「新しいチェックアウトで `bazel test //...` が通る」ことを狙っている部分。
+python = use_extension("@rules_python//python/extensions:python.bzl", "python")
+python.toolchain(
+    python_version = "3.11",
+    is_default = True,
+)
 bazel_dep(name = "pico-sdk", version = "2.2.0")
 
 local_path_override(

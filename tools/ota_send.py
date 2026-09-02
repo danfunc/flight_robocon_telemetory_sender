@@ -44,8 +44,28 @@ import time
 import zlib
 
 sys.path.insert(0, __file__.rsplit("/", 1)[0])
-from bleak import BleakClient, BleakScanner  # noqa: E402
-from shizuku_link import DEVICE_NAME, NUS_TX_UUID, find_device  # noqa: E402
+# ★★BLE の依存を import だけで要求しない。この module にはワイヤ形式の
+#   組み立てや NEED のパースといった**純粋な処理**も入っていて、試験はそこ
+#   だけを見る。import で bleak を要求すると、ハードウェアも外部パッケージも
+#   無い環境 (Bazel の hermetic な interpreter が典型) で**試験が回らなく
+#   なる**。実際に BLE を使う関数へ入った時点で落ちれば十分。
+try:
+    from bleak import BleakClient, BleakScanner  # noqa: E402,F401
+    from shizuku_link import DEVICE_NAME, NUS_TX_UUID, find_device  # noqa: E402,F401
+    _BLE_IMPORT_ERROR = None
+except ImportError as _err:  # pragma: no cover - 環境依存
+    BleakClient = BleakScanner = None
+    DEVICE_NAME = NUS_TX_UUID = None
+    find_device = None
+    _BLE_IMPORT_ERROR = _err
+
+
+def _require_ble() -> None:
+    """BLE 経路へ入る直前に呼ぶ。落ちるなら**理由が分かる形で**落とす。"""
+    if _BLE_IMPORT_ERROR is not None:
+        raise SystemExit(
+            f"BLE の依存が入っていません ({_BLE_IMPORT_ERROR})。"
+            "  pip install bleak pyserial")
 
 OTA_RX_UUID = "6e402002-b5a3-f393-e0a9-e50e24dcca9e"
 NUS_RX_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
@@ -343,6 +363,7 @@ async def _connect_or_explain(device):
 async def main(path: str, do_upload: bool, do_commit: bool,
                with_response: bool, raw_upload: bool,
                legacy: bool = False) -> int:
+    _require_ble()
     image = load_image(path)
     crc = zlib.crc32(image) & 0xFFFFFFFF
     commit_cmd = b"XNOC" + struct.pack("<II", len(image), crc)

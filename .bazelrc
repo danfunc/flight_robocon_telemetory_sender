@@ -1,0 +1,44 @@
+# 既定ターゲット: RP2350 / pico2_w (Shizuku 側と揃える)。
+build --platforms=@pico-sdk//bazel/platform:rp2350
+build --@pico-sdk//bazel/config:PICO_BOARD=pico2_w
+
+# Shizuku 側の USB 方針をそのまま踏襲 (D42: pico_stdio_usb は使わず自前の
+# CDC 2 本、tusb_config は Shizuku 側のラベルを @shizuku// 経由で参照)。
+# .bazelrc は依存モジュールからは継承されないので、ここで明示的に揃える。
+build --@pico-sdk//bazel/config:PICO_STDIO_USB=False
+build --@pico-sdk//bazel/config:PICO_TINYUSB_CONFIG=@shizuku//modules/pico_sdk_support:tusb_config
+build --@pico-sdk//bazel/config:PICO_CONFIG_EXTRA_HEADER=@shizuku//configs:pico_extra_config
+
+# BLE UART (ble_uart.cpp) 用。btstack_config.h は旧 CMake ビルドのものを
+# そのまま再利用する (include/btstack_config.h, HCI_ACL_PAYLOAD_SIZE の
+# CYW43 ワイヤ罠回避値を含む)。
+build --@pico-sdk//bazel/config:PICO_BT_ENABLE_BLE=True
+build --@pico-sdk//bazel/config:PICO_BTSTACK_CONFIG=//:btstack_config
+
+# Shizuku 側のヘッダは C++23 前提。既存 CMake ビルド (C++20) とは独立に、
+# Bazel 側だけ 23 にする。
+build --cxxopt=-std=c++23
+
+# デバッグ・自己テストのしやすさは Shizuku 側の作法に合わせる。
+build --copt=-g3
+build --strip=never
+build --copt=-Og
+
+# macOS 上での sandbox 初期化および PATH 継承の安定化
+build --action_env=PATH=/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin
+build --strategy=Genrule=local
+
+# ---- ホスト側 (母艦) のツール・試験を回すとき ------------------------------
+# ★★上の `--platforms=...:rp2350` は**全ターゲットに効く**ので、母艦で動く
+#   Python まで MCU 向けにビルドされ、Python のツールチェーンが見つからない。
+#   ホスト側のものはこの config で明示的にホストプラットフォームへ戻す。
+#
+#     bazel test --config=host //tools:test_ota_framing
+#
+# ★本当の直し方は「既定のプラットフォームを MCU にしない」ことだが、それは
+#   このリポジトリの全ターゲットに影響するので、今は config を分けるに留める。
+#   ホスト側のターゲットには tags=["manual"] を付けてあり、`bazel test //...`
+#   が MCU プラットフォームのまま拾って落ちないようにしてある (裏を返すと
+#   **既定では走らない**ので、CI に載せるならこの config を明示すること)。
+build:host --platforms=@platforms//host
+test:host --platforms=@platforms//host
