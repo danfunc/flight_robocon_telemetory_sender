@@ -5,6 +5,8 @@
 #include "shizuku_shell.hpp"
 #include "blink.hpp"
 #include "flight_controller.hpp"
+#include "hardware/dma.h"
+#include "hardware/regs/dma.h"
 #include "hardware/gpio.h"
 #include "hardware/uart.h"
 #include "hardware/watchdog.h"
@@ -68,6 +70,120 @@ uintptr_t export_method(method m, uintptr_t entry) {
 constexpr uint32_t SHELL_UART_BAUD = 115200;
 constexpr uint SHELL_UART_TX_PIN = 0;
 constexpr uint SHELL_UART_RX_PIN = 1;
+
+// ---- UART0 RX を DMA で「ストリーム」へ流し込む -----------------------------
+//  ★なぜ要るか (2026-09-01 実測): 従来はポーリングで FIFO (32B) を読んでいた。
+//    安全装置は 100ms ごとに 2 行 (約 100B) をまとめて送るので、115200 では
+//    32B の FIFO は **2.8ms で溢れる**。シェルスレッドが BLE 等に取られて
+//    その間走らないと、行の**途中が欠ける**。実際にそうなり、
+//    `SAFE2,0,LINK_LOST` が `SA,LINK_LOST` になって未知コマンド扱いされ、
+//    その返事が UART と BLE を埋めて **OTA も OTW も通らなくなった**。
+//    DMA なら**スレッドが走っていなくても受け続ける**ので、取りこぼしが
+//    「スケジューリングが間に合うか」に依存しなくなる。
+//  ★★baud を上げるのはこれを入れてから。1Mbaud だと FIFO は 0.32ms で
+//    溢れるので、ポーリングのまま速くすると悪化するだけ。
+//
+//  ★★★行き先を**私物の環ではなくストリームにする**。理由は 2 つ:
+//    (1) `descriptor.wr` は「公開済みレコード数」の**単調カウンタ**で、
+//        rec_size=1 のバイトストリームなら **DMA が書いた総バイト数がそのまま
+//        wr**。つまり公開は 1 ストアで済み、DMA とストリームの意味論が
+//        そのまま一致する。
+//    (2) 追い越しの検出と「落ちた数」の計上は `pop()` が既に持っている
+//        (stream.hpp)。自前の環だと同じ処理を書き直すことになり、
+//        **数え方が 2 つある**状態になる。
+//    こうしておけば、UART をペリフェラルオブジェクトが持つ形へ移すときも、
+//    この初期化の置き場所が変わるだけで、読む側は何も変えなくてよい。
+//    `connect()` でストリーム間 DMA へ繋ぐ道も開く。
+constexpr uint32_t UART_RX_RING_BITS = 10; // 2^10 = 1024B
+constexpr uint32_t UART_RX_RING = 1u << UART_RX_RING_BITS;
+// ★DMA の環アドレッシングは**バッファがその大きさに整列していること**を要求する。
+//   storage<> は先頭に descriptor を置くので整列を保証できない。だから
+//   バッファと記述子を別々に持ち、記述子から指す。
+alignas(UART_RX_RING) uint8_t g_uart_rx_buf[UART_RX_RING];
+shizuku::stream::descriptor g_uart_rx_desc{};
+uintptr_t g_uart_rx_stream_id = xno::NO_STREAM;
+shizuku::stream::handle<uint8_t> g_uart_rx;
+int g_uart_dma_ch = -1;
+uint32_t g_uart_rx_lost = 0; // pop() が報告した「落ちた数」の累計 (診断用)
+
+// ★★RP2350 の TRANS_COUNT は **[31:28] が MODE / [27:0] がカウント**
+//   (RP2040 には無いフィールド)。ここに 0xFFFFFFFF を書くと MODE=0xF =
+//   **ENDLESS** が選ばれ、その名のとおり**カウントが減らなくなる**。
+//   すると下の引き算が常に 0 を返し、wr が一度も進まない = ストリームが
+//   永久に空に見える。DMA は正常にバッファへ書いているのに、**受信が
+//   まるごと止まったように見える**。2026-09-01 に実機で踏んだ。
+//   MODE=NORMAL のまま最大まで使うので、要求数は 28bit に収める。
+constexpr uint32_t UART_RX_DMA_COUNT = DMA_CH0_TRANS_COUNT_COUNT_BITS; // 0x0FFFFFFF
+
+// DMA が今までに書いた総バイト数。transfer_count は残数なので引き算で出す。
+// ★読み出しでも MODE のビットを落としてから使う。
+uint32_t uart_rx_total() {
+  const uint32_t remaining = dma_channel_hw_addr(g_uart_dma_ch)->transfer_count &
+                             DMA_CH0_TRANS_COUNT_COUNT_BITS;
+  return UART_RX_DMA_COUNT - remaining;
+}
+
+// DMA が進めた分をストリームへ公開する。★DMA は wr を書けないので、
+//   ここだけが producer の仕事。1 ストアで済むのがバイトストリームの利点。
+void uart_rx_publish() {
+  if (g_uart_dma_ch < 0)
+    return;
+  __atomic_store_n(&g_uart_rx_desc.wr, uart_rx_total(), __ATOMIC_RELEASE);
+}
+
+void uart_rx_dma_start() {
+  g_uart_rx_desc.base = g_uart_rx_buf;
+  g_uart_rx_desc.rec_size = 1;
+  g_uart_rx_desc.capacity = UART_RX_RING;
+  g_uart_rx_desc.flags = 0; // 上書き許容 (producer は待てない = DMA だから)
+  g_uart_rx_desc.wr = 0;
+  g_uart_rx_desc.rd = 0;
+  g_uart_rx_desc.producer = shizuku::stream::NO_OWNER;
+  g_uart_rx_desc.consumer = shizuku::stream::NO_OWNER;
+  g_uart_rx = shizuku::stream::handle<uint8_t>(&g_uart_rx_desc);
+
+  g_uart_dma_ch = dma_claim_unused_channel(false);
+  if (g_uart_dma_ch < 0) {
+    BOARD::diag_printf("[SHELL] no DMA channel — UART は従来のポーリング\n");
+    return; // 空きが無ければ従来のポーリングのまま (遅いが動く)
+  }
+  // ★FIFO は切る。DREQ は FIFO のしきい値で上がるので、有効なままだと
+  //   しきい値に満たない末尾が次のバイトが来るまで届かず、行末が遅れる。
+  uart_set_fifo_enabled(SHELL_UART, false);
+  dma_channel_config c = dma_channel_get_default_config(g_uart_dma_ch);
+  channel_config_set_transfer_data_size(&c, DMA_SIZE_8);
+  channel_config_set_read_increment(&c, false);
+  channel_config_set_write_increment(&c, true);
+  channel_config_set_ring(&c, true, UART_RX_RING_BITS); // 書き側を環に
+  channel_config_set_dreq(&c, uart_get_dreq(SHELL_UART, false));
+  dma_channel_configure(g_uart_dma_ch, &c, g_uart_rx_buf,
+                        &uart_get_hw(SHELL_UART)->dr, UART_RX_DMA_COUNT, true);
+  BOARD::diag_printf("[SHELL] UART RX -> stream %lu via DMA ch%d\n",
+                     (unsigned long)g_uart_rx_stream_id, g_uart_dma_ch);
+}
+
+// 以降、UART の読み口はこの 2 つだけ。DMA が取れなかった場合は素の UART へ
+// 落ちるので、呼ぶ側は経路を意識しなくてよい。
+uint32_t uart_rx_available() {
+  if (g_uart_dma_ch < 0)
+    return uart_is_readable(SHELL_UART) ? 1u : 0u;
+  uart_rx_publish();
+  return g_uart_rx.available();
+}
+
+int uart_rx_getc() {
+  if (g_uart_dma_ch < 0)
+    return uart_is_readable(SHELL_UART) ? (int)uart_getc(SHELL_UART) : -1;
+  uart_rx_publish();
+  uint8_t v = 0;
+  uint32_t lost = 0;
+  if (!g_uart_rx.pop(&v, &lost)) {
+    g_uart_rx_lost += lost;
+    return -1;
+  }
+  g_uart_rx_lost += lost;
+  return (int)v;
+}
 
 // ---- 出力ストリーム (logger 経由 BLE TX notify)
 // ------------------------------
@@ -446,6 +562,36 @@ void handle_command_line(char *line) {
   } else if (strncmp(line, "nc", 2) == 0 &&
              (line[2] == '\0' || line[2] == ' ')) {
     handle_nc_command(line[2] == '\0' ? "" : line + 3);
+  } else if (strncmp(line, "kill! ", 6) == 0) {
+    // ★'!' を要求する。fs format! / nc forget! と同じ作法 —— KILL_THREAD は
+    //   BLE/UART/CDC のどの経路からも任意のスレッド ID を撃ててしまい
+    //   (飛行制御スレッドも例外ではない)、打ち間違いで走ってよい操作ではない。
+    //   対象の可否そのもの (自分自身/各コア最初の1本/デバッガ本体か) は
+    //   カーネル側 (handler.cpp kill_thread) がその場で判定するので、
+    //   シェル側で二重に絞り込みはしない (基準が変わったときのズレを避ける)。
+    char *endptr = nullptr;
+    unsigned long id = strtoul(line + 6, &endptr, 10);
+    if (endptr == line + 6) {
+      shell_printf("kill: usage: kill! <thread_id>\n");
+    } else {
+      const auto r = api(shizuku::object_api::KILL_THREAD, (uintptr_t)id);
+      if (r.error == 0) {
+        shell_printf("kill: thread %lu stopped\n", id);
+      } else {
+        // ★対応表は handler.cpp kill_thread が実際に設定する error だけを書く
+        //   (推測で埋めない)。それ以外の番号は名前を出さず番号だけ見せる。
+        const char *why = "";
+        if (r.error == (uintptr_t)shizuku::object_error::NOT_PRIVILEGED)
+          why = " (NOT_PRIVILEGED: 呼び手が特権でない/対象がデバッガ本体)";
+        else if (r.error == (uintptr_t)shizuku::object_error::BAD_OBJECT)
+          why = " (BAD_OBJECT: 範囲外 / 0 / 各コア最初の1本)";
+        shell_printf("kill: error %lu%s\n", (unsigned long)r.error, why);
+      }
+    }
+  } else if (strncmp(line, "kill ", 5) == 0) {
+    // ★'!' 抜きは実行しない。打ち間違いで飛行制御スレッドを落とす事故を防ぐ。
+    shell_printf("kill: '!' が要る (任意スレッドを強制停止できるため): "
+                 "kill! <thread_id>\n");
   } else if (strcmp(line, "PING") == 0 || strcmp(line, "ping") == 0) {
     shell_printf("PONG\n");
   } else if (strncmp(line, "SAFE", 4) == 0) {
@@ -475,6 +621,7 @@ void handle_command_line(char *line) {
     shell_printf("          r<ms>, version, reboot, bootsel, ping\n");
     shell_printf("          fs [ls|stat|cat <name>|rm <name>|format!]\n");
     shell_printf("          nc [status|y|n|lock|allow|forget!]\n");
+    shell_printf("          kill! <thread_id>\n");
   } else {
     shell_printf("unknown command: %s (try 'help')\n", line);
   }
@@ -524,6 +671,14 @@ uintptr_t poll_loop(uintptr_t, uintptr_t, uintptr_t, uintptr_t) {
   uart_set_hw_flow(SHELL_UART, false, false);
   uart_set_format(SHELL_UART, 8, 1, UART_PARITY_NONE);
   uart_set_fifo_enabled(SHELL_UART, true);
+  // ★DMA を張るのはここ (UART を叩けるようになった直後)。中で FIFO を切る。
+  uart_rx_dma_start();
+  {
+    const auto created =
+        api(shizuku::object_api::STREAM_CREATE, (uintptr_t)&g_uart_rx_desc);
+    if (created.error == 0)
+      g_uart_rx_stream_id = created.value;
+  }
 
   // 出力ストリーム (logger への応答) を PRODUCER としてバインド
   if (g_out_id != 0) {
@@ -650,9 +805,12 @@ uintptr_t poll_loop(uintptr_t, uintptr_t, uintptr_t, uintptr_t) {
     //      ota の入力ストリームへ積む (二人読みを避けるため、UART0 の
     //      リーダーはここ一つのまま、バイトの行き先だけを切り替える)。
     if (g_uart_bridge_active) {
-      while (g_uart_bridge_remaining > 0 && uart_is_readable(SHELL_UART)) {
+      while (g_uart_bridge_remaining > 0 && uart_rx_available() != 0) {
+        const int got = uart_rx_getc();
+        if (got < 0)
+          break;
         did_work = true;
-        uint8_t b = (uint8_t)uart_getc(SHELL_UART);
+        uint8_t b = (uint8_t)got;
         if (abort_magic_seen(b)) {
           // 相手が降りた。数え終わるのを待たずに畳む (待つと居座る)。
           uart_puts(SHELL_UART, "UBRIDGE_ABORTED\n");
@@ -685,13 +843,16 @@ uintptr_t poll_loop(uintptr_t, uintptr_t, uintptr_t, uintptr_t) {
       //   最中の BLE トラフィックが CYW43 を壊す (2026-08-30 に 3 回踏んだ:
       //   安全装置 XIAO の定期送信がきっかけで OTA が毎回死んだ)。
       //   捨てるのではなく**読み飛ばす**だけにして、FIFO の溢れも防ぐ。
-      while (uart_is_readable(SHELL_UART))
-        (void)uart_getc(SHELL_UART);
+      while (uart_rx_available() != 0)
+        (void)uart_rx_getc();
       uart_pos = 0;
     } else {
-      while (uart_is_readable(SHELL_UART)) {
+      while (uart_rx_available() != 0) {
+        const int got = uart_rx_getc();
+        if (got < 0)
+          break;
         did_work = true;
-        char ch = (char)uart_getc(SHELL_UART);
+        char ch = (char)got;
         if (ch == '\r' || ch == '\n') {
           if (uart_pos > 0) {
             uart_line[uart_pos] = '\0';
