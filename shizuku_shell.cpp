@@ -729,13 +729,32 @@ void handle_command_line(char *line) {
       shell_printf("QNH: 現在値の読み出しは未実装 (QNH <hPa> / QNH auto)\n");
     } else {
       if (strncmp(arg, "auto", 4) != 0 && strncmp(arg, "AUTO", 4) != 0) {
-        const uint32_t hpa = (uint32_t)strtoul(arg, nullptr, 10);
+        // ★★小数を受ける (例: 1013.25)。**整数 hPa 刻みでは高度に直して
+        //   約 8.3m の粒度**しかなく、外部カメラの位置推定から逆算した QNH を
+        //   降ろす用途では逆算した意味が消える。1 Pa ≒ 8cm まで刻めるように
+        //   hPa の小数 2 桁まで読む。
+        // ★strtof を使わず手で読むのは、値がおかしいときに黙って 0 になる
+        //   のを避けるため (打ち間違いがそのまま高度数千 m のずれになる)。
+        char *endp = nullptr;
+        const uint32_t hpa_int = (uint32_t)strtoul(arg, &endp, 10);
+        uint32_t frac_pa = 0;
+        if (endp != nullptr && *endp == '.') {
+          const char *f = endp + 1;
+          // 小数第 1 位 = 10 Pa、第 2 位 = 1 Pa。
+          if (*f >= '0' && *f <= '9') {
+            frac_pa += (uint32_t)(*f - '0') * 10u;
+            ++f;
+            if (*f >= '0' && *f <= '9')
+              frac_pa += (uint32_t)(*f - '0');
+          }
+        }
         // 妥当な範囲だけ受ける。打ち間違いで高度が数千 m ずれるため。
-        if (hpa < 800 || hpa > 1100) {
-          shell_printf("QNH: 800-1100 hPa の範囲で指定すること\n");
+        if (hpa_int < 800 || hpa_int > 1100) {
+          shell_printf("QNH: 800-1100 hPa の範囲で指定すること "
+                       "(小数 2 桁まで可、例 1013.25)\n");
           return;
         }
-        pa = hpa * 100u;
+        pa = hpa_int * 100u + frac_pa;
       }
       api(shizuku::object_api::CALL_METHOD, xno_object_id::flight_controller,
           (uintptr_t)::flight_controller::method::SET_REF_PA, (uintptr_t)pa);
@@ -744,8 +763,9 @@ void handle_command_line(char *line) {
       if (pa == 0)
         shell_printf("QNH: auto (現在地を 0m として捕捉し直す)\n");
       else
-        shell_printf("QNH: %lu hPa (高度は海抜になる)\n",
-                     (unsigned long)(pa / 100u));
+        shell_printf("QNH: %lu.%02lu hPa = %lu Pa (高度は海抜になる)\n",
+                     (unsigned long)(pa / 100u), (unsigned long)(pa % 100u),
+                     (unsigned long)pa);
     }
   } else if (strncmp(line, "ALT ", 4) == 0 || strncmp(line, "alt ", 4) == 0) {
     float alt_m = strtof(line + 4, nullptr);
