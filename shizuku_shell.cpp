@@ -94,7 +94,10 @@ constexpr uint SHELL_UART_RX_PIN = 1;
 //    こうしておけば、UART をペリフェラルオブジェクトが持つ形へ移すときも、
 //    この初期化の置き場所が変わるだけで、読む側は何も変えなくてよい。
 //    `connect()` でストリーム間 DMA へ繋ぐ道も開く。
-constexpr uint32_t UART_RX_RING_BITS = 10; // 2^10 = 1024B
+// ★環の大きさも線速で決める。1024B は 1 Mbaud だと **10ms 分**しかなく、
+//   シェルスレッドがそれ以上走らなければ DMA に追い越される (上の
+//   g_uart_ota と同じ話が 1 段手前でも起きる)。4096B なら約 40ms 分。
+constexpr uint32_t UART_RX_RING_BITS = 12; // 2^12 = 4096B
 constexpr uint32_t UART_RX_RING = 1u << UART_RX_RING_BITS;
 // ★DMA の環アドレッシングは**バッファがその大きさに整列していること**を要求する。
 //   storage<> は先頭に descriptor を置くので整列を保証できない。だから
@@ -171,6 +174,24 @@ uint32_t uart_rx_available() {
   return g_uart_rx.available();
 }
 
+// 受信ストリームに溜まっている分を全部捨てる。
+// ★★中継の出入りで必ず通すこと (2026-09-02 実測)。中断した転送の**続き**が
+//   環に残ったまま行モードへ戻ると、シェルは像の続きをコマンドとして解釈し
+//   始める。実際に `PING` が `FPING` になって届き (残骸の 1 バイトが頭に
+//   食い込んだ)、以後の会話が壊れた。捨てるのは「読み飛ばし」ではなく
+//   **rd を wr に合わせる** = ストリームの意味論そのままで済む。
+void uart_rx_discard_all() {
+  if (g_uart_dma_ch < 0) {
+    while (uart_is_readable(SHELL_UART))
+      (void)uart_getc(SHELL_UART);
+    return;
+  }
+  uart_rx_publish();
+  __atomic_store_n(&g_uart_rx_desc.rd,
+                   __atomic_load_n(&g_uart_rx_desc.wr, __ATOMIC_ACQUIRE),
+                   __ATOMIC_RELEASE);
+}
+
 int uart_rx_getc() {
   if (g_uart_dma_ch < 0)
     return uart_is_readable(SHELL_UART) ? (int)uart_getc(SHELL_UART) : -1;
@@ -200,7 +221,15 @@ shizuku::stream::handle<frame_t> g_rx;
 //    「行として読んでコマンド解釈する」代わりに「そのまま ota の入力ストリームへ
 //    積む」へモードを切り替える。持ち主(UART0 のリーダー)は変えず、
 //    バイトの行き先だけを変える設計。
-shizuku::stream::storage<frame_t, 4> g_uart_ota;
+// ★★枠数は **flash の停止時間 × 線速** で決める (2026-09-02 実測で 4 → 64)。
+//   ota は 1 セクタ消去 + 書き込みで数十 ms 止まる。その間に線から来る分を
+//   ここで飲めなければ取りこぼす。4 枠 (976B) では 24 kB/s ですら
+//   66KB 地点で `input overrun` になった。
+//   BLE 側 (ble_uart.cpp の g_ota_rx) は同じ理由で最初から 32 枠あり、
+//   **UART 側だけ 4 枠のまま取り残されていた** —— 経路が増えたときに
+//   片方だけ直し忘れる、の典型。
+//   64 枠 = 15.6KB は、1 Mbaud (約 100 kB/s) で 150ms 分の余裕にあたる。
+shizuku::stream::storage<frame_t, 64> g_uart_ota;
 uintptr_t g_uart_ota_id = 0;
 // ブリッジ終了後に ota の入力を戻す先。★0 で初期化しないこと —
 //   **ストリーム番号 0 は正当な番号**なので、0 を「未配線」の印に使うと、
@@ -255,7 +284,13 @@ void uart_bridge_flush() {
   }
 }
 
-void begin_uart_bridge(uint32_t total_bytes) {
+// 中継中だけ使う速度。★常用の速度は上げない — 上げると、**片方だけ焼き替えた
+//   瞬間に会話できなくなる**。PING も `nc forget!` も通らなくなり、
+//   締め出しからの逃げ道ごと失う。速いのが要るのは転送中だけなので、
+//   そこだけ切り替えて必ず戻す。
+uint32_t g_uart_bridge_baud = SHELL_UART_BAUD;
+
+void begin_uart_bridge(uint32_t total_bytes, uint32_t baud) {
   using shizuku::objects::ota::method;
   api(shizuku::object_api::CALL_METHOD, xno_object_id::ota,
       (uintptr_t)method::SET_INPUT_STREAM, g_uart_ota_id);
@@ -264,7 +299,15 @@ void begin_uart_bridge(uint32_t total_bytes) {
   g_uart_bridge_active = true;
   g_uart_bridge_last_us = BOARD::time_us();
   g_abort_filled = 0; // 前の中継の名残りで即座に誤爆させない
+  uart_rx_discard_all(); // 前の会話の残りを像の先頭と間違えない
   uart_puts(SHELL_UART, "UBRIDGE_READY\n");
+  // ★★合図を**送り切ってから**速度を変える。TX FIFO に残ったまま切り替えると、
+  //   相手は READY の途中から別の速度で受け取ることになり、合言葉が壊れる。
+  if (baud != SHELL_UART_BAUD) {
+    uart_tx_wait_blocking(SHELL_UART);
+    uart_set_baudrate(SHELL_UART, baud);
+    g_uart_bridge_baud = baud;
+  }
 }
 
 void end_uart_bridge() {
@@ -287,6 +330,17 @@ void end_uart_bridge() {
     uart_puts(SHELL_UART, "UBRIDGE_WARN no ble ota stream to restore\n");
   }
   uart_puts(SHELL_UART, "UBRIDGE_DONE\n");
+  // ★★速度を必ず常用へ戻す。**この経路を通らずに抜けると口が死ぬ**ので、
+  //   中継から出る道は全部ここを通す (完了・中断・無通信タイムアウト)。
+  //   戻す前に DONE を送り切る — 相手はまだ速い方で聞いているため。
+  if (g_uart_bridge_baud != SHELL_UART_BAUD) {
+    uart_tx_wait_blocking(SHELL_UART);
+    uart_set_baudrate(SHELL_UART, SHELL_UART_BAUD);
+    g_uart_bridge_baud = SHELL_UART_BAUD;
+  }
+  // ★速度を戻した**後**に捨てる。残っているのは古い速度で受けたバイトなので、
+  //   行として解釈しても意味が無いどころか害になる。
+  uart_rx_discard_all();
 }
 
 // ---- シェル応答送信用ヘルパー (BLE TX notify & UART0) -----------------------
@@ -611,9 +665,20 @@ void handle_command_line(char *line) {
   } else if (strncmp(line, "UBRIDGE ", 8) == 0) {
     // XIAO からの UART バイナリブリッジ開始要求 (BLE の代替 OTA 経路)。
     // a1 = これから生バイトで流れてくる総バイト数 (ota.hpp のヘッダ+本体)。
-    const uint32_t total = (uint32_t)strtoul(line + 8, nullptr, 10);
+    // 書式: UBRIDGE <bytes> [baud]。baud 省略時は常用の速度のまま
+    //   (古い母艦・古い XIAO とそのまま繋がる = 後方互換)。
+    char *rest = nullptr;
+    const uint32_t total = (uint32_t)strtoul(line + 8, &rest, 10);
+    uint32_t baud = SHELL_UART_BAUD;
+    if (rest != nullptr && *rest != '\0') {
+      const uint32_t req = (uint32_t)strtoul(rest, nullptr, 10);
+      // ★上下限を持つ。相手の打ち間違いで到達不能な速度にされると、
+      //   こちらは戻す機会すら得られない (受け取れないので DONE も出せない)。
+      if (req >= 115200u && req <= 3000000u)
+        baud = req;
+    }
     if (total > 0) {
-      begin_uart_bridge(total);
+      begin_uart_bridge(total, baud);
     }
   } else if (strcmp(line, "help") == 0 || strcmp(line, "?") == 0) {
     shell_printf(

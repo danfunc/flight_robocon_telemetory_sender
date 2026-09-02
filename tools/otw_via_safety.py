@@ -42,6 +42,12 @@ from ota_send import DEFAULT_IMAGE, deflate_chunks, load_image  # noqa: E402
 
 DEFAULT_PORT = "/dev/cu.usbmodem1101"
 BAUD = 115200
+# ★中継中だけ上げる速度。常用は 115200 のまま (両側の実装参照: 片方だけ焼き
+#   替えた瞬間に会話できなくなるのを避けるため、速いのは転送中だけ)。
+#   115200 のままだと 11.3 kB/s で、BLE OTA の 26 kB/s より遅い ——
+#   **有線が無線より遅いのはおかしい**というのが上げる動機。
+#   両側とも 115200〜3000000 の範囲しか受け付けない。
+BRIDGE_BAUD = 1000000
 WRITE_CHUNK = 256  # ホスト側の write() 粒度。UART の実速度で自然に律速される。
 
 
@@ -91,7 +97,7 @@ def send_bridge(ser: "serial.Serial", payload: bytes, label: str) -> None:
     """XIAO を ubridge モードへ入れ、payload を生で流し込む。"""
     n = len(payload)
     ser.reset_input_buffer()
-    ser.write(f"ubridge {n}\n".encode())
+    ser.write(f"ubridge {n} {BRIDGE_BAUD}\n".encode())
     ser.flush()
 
     buf = bytearray()
@@ -129,6 +135,12 @@ def send_bridge(ser: "serial.Serial", payload: bytes, label: str) -> None:
 
 def main() -> int:
     args = sys.argv[1:]
+    global BRIDGE_BAUD
+    # --baud=<n> は中継速度の実験用。配線が長い/ノイズが乗る環境で落とせるように。
+    for a in list(args):
+        if a.startswith("--baud="):
+            BRIDGE_BAUD = int(a.split("=", 1)[1])
+            args.remove(a)
     flags = {a for a in args if a.startswith("--")}
     positional = [a for a in args if not a.startswith("--")]
     if len(positional) > 1 or not flags <= {"--commit", "--raw"}:
@@ -161,7 +173,7 @@ def main() -> int:
               f"({len(body) / len(image) * 100:.1f}%)")
 
     port = find_port()
-    print(f"opening {port} @ {BAUD} baud")
+    print(f"opening {port} @ {BAUD} baud (中継中は {BRIDGE_BAUD} baud)")
     ser = serial.Serial(port, BAUD, timeout=0.1)
     time.sleep(0.3)
     # 開始前の掃除。相手が定期送信していると idle にならないので上限は短く。
