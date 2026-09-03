@@ -88,15 +88,34 @@ BAUD = 115200
 #     ★ただし再送が入った今、崖の向こうへ踏み込んでも全損ではなく再送に
 #       なるので、次に触る人が 310000 を選ぶ判断はあり得る。
 BRIDGE_BAUD = 300000
-WRITE_CHUNK = 256  # ホスト側の write() 粒度。UART の実速度で自然に律速される。
+WRITE_CHUNK = 512  # ホスト側の write() 粒度。UART の実速度で自然に律速される。
 
 
 def find_port() -> str:
+    """安全装置 (XIAO) の USB CDC を選ぶ。
+
+    ★★**名前で選ぶこと。** 以前は /dev/cu.usbmodem* の先頭を取っていたが、
+      Pico 2 W の USB を母艦へ繋いだ瞬間に `usbmodem101` が
+      `usbmodemXIAO_SAFE_11` より先に並び、**XIAO 向けのコマンドを Pico 自身の
+      CDC シェルへ送り始めた** (2026-09-02 実機)。`QUIET ON` が先頭を食われて
+      `IET ON` として Pico に届き、"unknown command" が並ぶという分かりにくい
+      壊れ方をする。デバッグのために Pico の USB を繋ぐと壊れる、という
+      いちばん困る形なので、名前で当てる。
+    """
+    candidates = sorted(glob.glob("/dev/cu.usbmodem*"))
+    named = [c for c in candidates if "XIAO" in c.upper()]
+    if named:
+        return named[0]
     if os.path.exists(DEFAULT_PORT):
         return DEFAULT_PORT
-    candidates = sorted(glob.glob("/dev/cu.usbmodem*"))
     if not candidates:
         sys.exit("XIAO の USB CDC が見つかりません (/dev/cu.usbmodem*)")
+    if len(candidates) > 1:
+        # ★どれか分からないなら**黙って選ばない**。Pico を掴むと上の事故になる。
+        sys.exit("XIAO を特定できません。候補が複数あります:\n  "
+                 + "\n  ".join(candidates)
+                 + "\n名前に XIAO を含むポートが無いので、DEFAULT_PORT を"
+                   "設定するか、Pico の USB を抜いてください。")
     return candidates[0]
 
 
@@ -351,7 +370,7 @@ def query_missing(ser: "serial.Serial"):
         if attempt < 2:
             print(f"  (OTANEED に返事が無い — Pico がまだ中継から抜けて"
                   f"いない可能性。{attempt + 2} 回目を試す)")
-            time.sleep(6.0)  # 中継の無通信タイムアウト (5s) より長く
+            time.sleep(3.0)  # 中継の無通信タイムアウト (5s) より長く
     return n, seqs, complete
 
 
@@ -490,7 +509,7 @@ def _do_transfer(ser, chunks, header, body, do_commit, image, crc) -> int:
         verified = False
         deadline = time.time() + 25.0
         while time.time() < deadline:
-            time.sleep(2.0)
+            time.sleep(0.5)
             ser.reset_input_buffer()
             ser.write(b"SEND VER\n")
             text = drain(ser, 2.0).decode(errors="replace")

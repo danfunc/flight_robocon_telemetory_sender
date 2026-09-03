@@ -308,9 +308,31 @@ void uart_bridge_flush() {
 uint32_t g_uart_bridge_baud = SHELL_UART_BAUD;
 
 void begin_uart_bridge(uint32_t total_bytes, uint32_t baud) {
-  using shizuku::objects::ota::method;
-  api(shizuku::object_api::CALL_METHOD, xno_object_id::ota,
-      (uintptr_t)method::SET_INPUT_STREAM, g_uart_ota_id);
+  // ★★配線は**最初の 1 回だけ**。以前は中継のたびに差し替え、終わるたびに
+  //   BLE へ戻していたが、それが 2026-09-02 の主症状の元だった (汲んでいる
+  //   最中に席を引き抜き、109 チャンク中 40 個しか受理されない転送になった)。
+  //   一度繋いだら二度と触らない = 引き抜く瞬間が存在しない。
+  // ★★★起動時に繋がないのは**順序**のため。shell の init が走る時点では
+  //   ota がまだメソッドを公開しておらず、CALL_METHOD が空振りする
+  //   (実際に踏んだ: 配線されないまま中継だけ始まり、ota に 1 バイトも
+  //   届かず NEEDIDLE が返る)。ここなら相手は必ず起動済み。
+  static bool wired = false;
+  if (!wired) {
+    const auto r =
+        api(shizuku::object_api::CALL_METHOD, xno_object_id::ota,
+            (uintptr_t)shizuku::objects::ota::method::SET_INPUT_STREAM_UART,
+            g_uart_ota_id);
+    // ★成否を黙って捨てない。ここが失敗すると「中継はできているのに ota に
+    //   届かない」という、いちばん切り分けにくい壊れ方になる。
+    if (r.error != 0 || r.value != 0) {
+      char line[64];
+      snprintf(line, sizeof(line), "UBRIDGE_WARN wire failed e=%lu v=%lu\n",
+               (unsigned long)r.error, (unsigned long)r.value);
+      uart_puts(SHELL_UART, line);
+    } else {
+      wired = true;
+    }
+  }
   g_uart_bridge_remaining = total_bytes;
   g_uart_bridge_frame = frame_t{};
   g_uart_bridge_active = true;
@@ -410,14 +432,8 @@ void end_uart_bridge() {
   //   ケースは今まで通り XIAO 側の 2 秒アイドル待ちが拾う — ACK は
   //   「ステージングだけして commit しない」経路 (再送・実機試験) を主に
   //   縮めるためのもの。
-  if (g_ble_ota_stream_id != xno::NO_STREAM) {
-    api(shizuku::object_api::CALL_METHOD, xno_object_id::ota,
-        (uintptr_t)method::SET_INPUT_STREAM, g_ble_ota_stream_id);
-  } else {
-    // 配線されていないなら**戻さない**。適当な番号へ繋ぐより、BLE OTA が
-    // 効かないまま次の再起動を待つほうが安全 (回復手段を壊さない)。
-    uart_puts(SHELL_UART, "UBRIDGE_WARN no ble ota stream to restore\n");
-  }
+  // ★★入力を「戻す」処理はもう無い。BLE も UART も起動時から常設で繋がって
+  //   いるので、中継の出入りでストリームを触らない。**触らないから壊れない。**
   // ★★DMA 環 (g_uart_rx_desc) は非 LOSSLESS = 上書き許容。ここが溢れると
   //   uart_bridge_push_byte に渡る前にバイトが消え、ota 側の「input overrun」
   //   (g_uart_ota 側の lost) には一切現れない。inflate failed の原因候補の
@@ -911,6 +927,13 @@ uintptr_t method_process_cmd(uintptr_t cmd_ptr, uintptr_t, uintptr_t,
 uintptr_t method_set_ble_ota_stream(uintptr_t stream_id, uintptr_t, uintptr_t,
                                     uintptr_t) {
   g_ble_ota_stream_id = stream_id;
+  // ★★受け取った時点で ota の入力枠 0 (BLE) へ**常設で**繋ぐ。以前は番号を
+  //   覚えておいて、中継が終わるたびに shell が「戻して」いた。つまり
+  //   **BLE OTA が生きていたのは shell がちゃんと戻してくれたからで**、
+  //   独立しているつもりで shell に隠れて依存していた。shell が固まると
+  //   BLE も道連れになる、が今日の実際の壊れ方だった。
+  api(shizuku::object_api::CALL_METHOD, xno_object_id::ota,
+      (uintptr_t)shizuku::objects::ota::method::SET_INPUT_STREAM, stream_id);
   return 0;
 }
 
