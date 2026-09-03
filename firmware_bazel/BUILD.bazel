@@ -1,0 +1,108 @@
+# XNO 側 (このリポジトリ) の bring-up ファームウェア
+load("@rules_pico_flash//:defs.bzl", "pico_binary", "pico_flash", "pico_uf2")
+load("@rules_cc//cc:defs.bzl", "cc_binary")
+
+# XNO bring-up ファームウェア
+# 自動生成: :xno_bringup.elf, :xno_bringup_uf2 (xno_bringup.uf2), :uf2, :flash, :flash_all
+# ★:flash は自前で定義する (下)。picotool 決め打ちの既定の別名は張らせない。
+pico_binary(
+    name = "xno_bringup",
+    default_aliases = False,
+    srcs = ["main.cpp"],
+    deps = [
+        "//:xno_objects",
+        "@shizuku//:internal_headers",
+        "@shizuku//:kernel_object",
+        "@shizuku//configs:config",
+        "@shizuku//modules/pico_sdk_support",
+    ],
+)
+
+# 書き込み — 使える手を自動で選ぶ (BOOTSEL → OTW → OTA)。
+#  ★経路を人が毎回選ばなくてよくする。どれが使えるかは「いま板がどう繋がって
+#    いるか」で決まり、それは実行時にしか分からない。
+sh_binary(
+    name = "flash",
+    srcs = ["flash.sh"],
+    args = ["$(location :xno_bringup.elf)"],
+    data = [
+        ":xno_bringup.elf",
+        "//tools:ota_send.py",
+        "//tools:otw_via_safety.py",
+        "//tools:shizuku_link.py",
+    ],
+)
+
+alias(
+    name = "uf2",
+    actual = ":xno_bringup_uf2",
+)
+
+# BLE 経由でのファームウェア書き換え (OTA Deploy)
+# bazel run //firmware_bazel:ota
+sh_binary(
+    name = "flash_usb",
+    srcs = ["flash_usb.sh"],
+    args = ["$(location :xno_bringup.elf)"],
+    data = [":xno_bringup.elf"],
+)
+
+sh_binary(
+    name = "otw",
+    srcs = ["otw.sh"],
+    args = ["$(location :xno_bringup.elf)"],
+    data = [
+        ":xno_bringup.elf",
+        "//tools:ota_send.py",
+        "//tools:otw_via_safety.py",
+        "//tools:shizuku_link.py",
+    ],
+)
+
+sh_binary(
+    name = "ota",
+    srcs = ["ota.sh"],
+    args = ["$(location :xno_bringup.elf)"],
+    data = [
+        ":xno_bringup.elf",
+        "//tools:ota_send.py",
+        "//tools:shizuku_link.py",
+    ],
+)
+
+alias(
+    name = "ota_deploy",
+    actual = ":ota",
+)
+
+# BLE 経由での GDB ブリッジ起動
+# bazel run //firmware_bazel:gdb_bridge
+sh_binary(
+    name = "gdb_bridge",
+    srcs = ["gdb_bridge.sh"],
+    data = [
+        "//tools:gdb_ble_bridge.py",
+        "//tools:shizuku_link.py",
+    ],
+)
+
+# ★測定専用ターゲット (BLE 受信経路だけの像が SRAM 520KB に収まるかを測る)
+cc_binary(
+    name = "flasher_probe.elf",
+    srcs = ["flasher_probe.cpp"],
+    deps = [
+        "//:ble_uart",
+        "//:object_ids",
+        "@pico-sdk//src/rp2_common/pico_stdlib",
+        "@shizuku//:internal_headers",
+        "@shizuku//:kernel_object",
+        "@shizuku//configs:config",
+        "@shizuku//modules/pico_sdk_support",
+    ],
+)
+
+pico_uf2(
+    name = "flasher_probe_uf2",
+    elf_target = ":flasher_probe.elf",
+    out = "flasher_probe.uf2",
+)

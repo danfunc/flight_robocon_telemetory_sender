@@ -1,0 +1,213 @@
+# flight_robocon_xno オブジェクト群
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
+# btstack_config.h — BLE UART 専用の最小構成 (config/btstack_config.h)。
+cc_library(
+    name = "btstack_config",
+    hdrs = ["config/btstack_config.h"],
+    includes = ["config"],
+    visibility = ["//visibility:public"],
+)
+
+# ble_uart is upstreamed into Shizuku pico_sdk_support
+alias(
+    name = "ble_uart",
+    actual = "@shizuku//modules/pico_sdk_support:ble_uart",
+    visibility = ["//visibility:public"],
+)
+
+# オブジェクト番号定義
+# ★番号は Shizuku 側の生成ヘッダ (shizuku/object_ids.hpp) の続きから始める。
+#   数字を手で書かないための依存なので、これは外せない (D28)。
+cc_library(
+    name = "object_ids",
+    hdrs = ["object_ids.hpp"],
+    deps = [
+        "@shizuku//:internal_headers",
+        "@shizuku//configs:config",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+# fw_version: 走っている像の大きさと CRC32 (焼けたかを板に訊くため)
+cc_library(
+    name = "fw_version",
+    srcs = ["fw_version.cpp"],
+    hdrs = ["fw_version.hpp"],
+    visibility = ["//visibility:public"],
+)
+
+# props: オブジェクトのプロパティを flash FS の上に置く薄い層
+cc_library(
+    name = "props",
+    srcs = ["props.cpp"],
+    hdrs = ["props.hpp"],
+    deps = [
+        "@shizuku//:internal_headers",
+        "@shizuku//configs:config",
+        "@shizuku//modules/pico_sdk_support:headers",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+# blink: LED 点滅オブジェクト
+cc_library(
+    name = "blink",
+    srcs = ["blink.cpp"],
+    hdrs = ["blink.hpp"],
+    deps = [
+        ":object_ids",
+        ":props",
+        "@shizuku//:internal_headers",
+        "@shizuku//configs:config",
+        "@shizuku//modules/pico_sdk_support:headers",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+# BNO055 (IMU)
+cc_library(
+    name = "bno055",
+    srcs = ["bno055.cpp"],
+    hdrs = ["bno055.hpp", "sensor_sample.hpp"],
+    deps = [
+        ":object_ids",
+        "@shizuku//:internal_headers",
+        "@shizuku//configs:config",
+        "@shizuku//modules/pico_sdk_support:headers",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+# BME280 (気圧/温度)
+cc_library(
+    name = "bme280",
+    srcs = ["bme280.cpp"],
+    hdrs = ["bme280.hpp", "sensor_sample.hpp"],
+    deps = [
+        ":object_ids",
+        "@shizuku//:internal_headers",
+        "@shizuku//configs:config",
+        "@shizuku//modules/pico_sdk_support:headers",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+# センサ群の集約
+cc_library(
+    name = "sensors",
+    deps = [
+        ":bme280",
+        ":bno055",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+# flight_controller: 自律飛行制御 (PID / センサフュージョン)
+cc_library(
+    name = "flight_controller",
+    srcs = ["flight_controller.cpp"],
+    hdrs = [
+        "flight_controller.hpp",
+        "sensor_sample.hpp",
+        "tx_frame.hpp",
+    ],
+    deps = [
+        ":blink",
+        ":object_ids",
+        "@shizuku//:internal_headers",
+        "@shizuku//configs:config",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+# telemetry: サンプル → テレメトリ行
+cc_library(
+    name = "telemetry",
+    srcs = ["telemetry.cpp"],
+    hdrs = [
+        "sensor_sample.hpp",
+        "telemetry.hpp",
+        "tx_frame.hpp",
+    ],
+    deps = [
+        ":ota",
+        ":fw_version",
+        ":flight_controller",
+        ":object_ids",
+        "@shizuku//:internal_headers",
+        "@shizuku//configs:config",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+# logger: ログ行の合流点
+cc_library(
+    name = "logger",
+    srcs = ["logger.cpp"],
+    hdrs = [
+        "logger.hpp",
+        "tx_frame.hpp",
+    ],
+    deps = [
+        ":object_ids",
+        "@shizuku//:internal_headers",
+        "@shizuku//configs:config",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+# ota is upstreamed into Shizuku pico_sdk_support
+alias(
+    name = "ota",
+    actual = "@shizuku//modules/pico_sdk_support:ota",
+    visibility = ["//visibility:public"],
+)
+
+# shizuku_shell: 対話型管理シェル (CDC 0 / BLE NUS)
+cc_library(
+    name = "shizuku_shell",
+    srcs = ["shizuku_shell.cpp"],
+    hdrs = [
+        "shizuku_shell.hpp",
+        "tx_frame.hpp",
+    ],
+    deps = [
+        ":fw_version",
+        ":blink",
+        ":flight_controller",
+        ":object_ids",
+        ":props",
+        ":telemetry",
+        "@pico-sdk//src/rp2_common/hardware_dma",
+        "@pico-sdk//src/rp2_common/hardware_uart",
+        "@pico-sdk//src/rp2_common/hardware_watchdog",
+        "@pico-sdk//src/rp2_common/pico_bootrom",
+        "@shizuku//:internal_headers",
+        "@shizuku//configs:config",
+        "@shizuku//modules/pico_sdk_support:headers",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+# 全アプリケーションオブジェクトの集約ライブラリ
+cc_library(
+    name = "xno_objects",
+    deps = [
+        ":blink",
+        ":bme280",
+        ":bno055",
+        ":flight_controller",
+        ":logger",
+        ":ota",
+        ":shizuku_shell",
+        ":telemetry",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+exports_files([
+    "blink.cpp",
+    "blink.hpp",
+    "object_ids.hpp",
+])

@@ -1,0 +1,41 @@
+# ★`@rules_python//python:defs.bzl` は native ルールへのエイリアスを返すため、
+#   Bazel 8 では toolchain が解決できない。**個別の .bzl から読むこと**。
+load("@rules_python//python:py_library.bzl", "py_library")
+load("@rules_python//python:py_test.bzl", "py_test")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files([
+    "ota_send.py",
+    "otw_via_safety.py",
+    "shizuku_link.py",
+    "gdb_ble_bridge.py",
+    "xno_shell.py",
+    "qnh_from_altitude.py",
+])
+
+# 書き込みの中身 (ワイヤ形式・NEED のパース) だけを切り出したもの。
+# ★pyserial / bleak には依存しない部分なので、試験はハードウェアも
+#   外部パッケージも無しで走る。**依存を足すと `bazel test //...` が
+#   環境で落ちるようになり、試験が回らなくなる**ので足さないこと。
+py_library(
+    name = "ota_send_lib",
+    srcs = ["ota_send.py"],
+    imports = ["."],
+)
+
+# ★★実機に持ち込む前にバグを 1 つ捕まえた試験。消さないこと (詳細は
+#   test_ota_framing.py の冒頭)。device 側 (Shizuku の ota.cpp) の受信部を
+#   写してあるので、あちらの CSEEK/CHDR/CDATA を触ったらここも直すこと。
+# ★`bazel test --config=host //tools:test_ota_framing` で走らせること。
+#   このリポジトリの .bazelrc は全体を MCU プラットフォームでビルドするので、
+#   ホスト用の config を明示しないと Python のツールチェーンが解決できない。
+#   manual を付けてあるのは、`bazel test //...` が MCU のまま拾って落ちるのを
+#   防ぐため (**裏を返すと既定では走らない**)。
+py_test(
+    name = "test_ota_framing",
+    size = "small",
+    srcs = ["test_ota_framing.py"],
+    tags = ["manual"],
+    deps = [":ota_send_lib"],
+)

@@ -1,4 +1,10 @@
-build*
+# ★CMake の出力ディレクトリだけを狙う。**先頭の / とと末尾の / が要る。**
+#   以前は `build*` と書いていたが、macOS の大小を区別しないファイルシステムでは
+#   これが **BUILD.bazel に一致**してしまい、BUILD.bazel / tools/BUILD.bazel /
+#   firmware_bazel/BUILD.bazel が 3 つとも追跡されていなかった (2026-09-02 に発覚)。
+#   .bazelrc がグローバルの `.*` に巻き込まれていたのと合わせて、**clone しても
+#   Bazel でビルドできない状態**になっていた。
+/build/
 # ★場所を限定しない。.pyc には __file__ の絶対パス (= $HOME = 実名) が
 #   埋まるので、公開リポジトリに入れてよいものではない。
 __pycache__/
