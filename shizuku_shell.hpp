@@ -16,6 +16,7 @@ enum struct method : uintptr_t {
   PROCESS_CMD = 3,   // a1 = コマンド文字列ポインタ
   POLL = 4,
   SET_BLE_OTA_STREAM = 5, // a1 = ota の入力を BLE 側へ戻すためのストリームID
+  GET_SAFETY_STREAM = 6, // xno::safety::update stream (UART0 only)
 };
 
 // シェルの登録 (オブジェクト生成 ＆ export)

@@ -4,6 +4,7 @@
 #include "bno055.hpp"
 #include "flight_controller.hpp"
 #include "logger.hpp"
+#include "neopixel.hpp"
 #include "object_ids.hpp"
 #include "pico/stdlib.h"
 #include "shizuku/app_entry.hpp"
@@ -18,6 +19,7 @@
 #include "shizuku/objects/usb_cdc.hpp"
 #include "shizuku_shell.hpp"
 #include "telemetry.hpp"
+#include "tx_frame.hpp"
 #include <cstdio>
 
 // センサ有効化フラグ
@@ -46,6 +48,9 @@ void shizuku::app_entry() {
         "[XNO BOOT] flash fs unavailable (プロパティは既定値で動く)\n");
 
   // ---- 管理シェルの初期化 ----
+  const bool neopixel_registered = xno::neopixel::register_neopixel() == 0;
+  if (!neopixel_registered)
+    shizuku::KERNEL::BOARD::diag_printf("[XNO BOOT] neopixel registration failed\n");
   xno::shell::register_shell();
 
   // ---- 1) 登録 (生成 + export + 自分のストリーム作成) ----------------------
@@ -72,6 +77,21 @@ void shizuku::app_entry() {
     auto sid = [](const auto &res) -> uintptr_t {
       return res.value != 0 ? res.value : res.error;
     };
+
+    // shell UART0 -> NeoPixel. Use error/value separately, never an error as ID.
+    if (neopixel_registered) {
+      const auto safety_stream = call(xno::shell::OBJECT,
+          (uintptr_t)xno::shell::method::GET_SAFETY_STREAM, 0);
+      if (safety_stream.error == 0 && safety_stream.value != xno::NO_STREAM) {
+        const auto wired = call(xno::neopixel::OBJECT,
+            (uintptr_t)xno::neopixel::method::SET_INPUT_STREAM,
+            safety_stream.value);
+        if (wired.error != 0 || wired.value != 0)
+          shizuku::KERNEL::BOARD::diag_printf("[XNO BOOT] neopixel wiring failed\n");
+      } else {
+        shizuku::KERNEL::BOARD::diag_printf("[XNO BOOT] safety stream unavailable\n");
+      }
+    }
 
     // センサ → telemetry
     shizuku::KERNEL::ARCH::syscall_result bno_stream{}, bme_stream{};
@@ -161,6 +181,9 @@ void shizuku::app_entry() {
   }
 
   // ---- 3) 起動 (poll スレッド群 ＆ シェルの開始) ---------------------------
+  // Consumer first: its initial dispatch precedes the shell producer.
+  if (neopixel_registered && xno::neopixel::start_neopixel() != 0)
+    shizuku::KERNEL::BOARD::diag_printf("[XNO BOOT] neopixel spawn failed\n");
   shizuku::objects::ble_uart::start_ble_uart(xno_object_id::ble_uart);
   logger::start_logger();
   shizuku::objects::ota::start_ota(xno_object_id::ota);

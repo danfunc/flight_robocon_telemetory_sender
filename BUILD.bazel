@@ -1,5 +1,45 @@
 # flight_robocon_xno オブジェクト群
-load("@rules_cc//cc:defs.bzl", "cc_library")
+load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
+load("@pico-sdk//bazel:defs.bzl", "pico_generate_pio_header")
+
+cc_library(
+    name = "safety_status",
+    hdrs = ["safety_status.hpp"],
+    visibility = ["//visibility:public"],
+)
+
+pico_generate_pio_header(
+    name = "ws2812_pio",
+    srcs = ["ws2812.pio"],
+)
+
+cc_library(
+    name = "neopixel",
+    srcs = ["neopixel.cpp"],
+    hdrs = [
+        "neopixel.hpp",
+        "tx_frame.hpp",
+    ],
+    deps = [
+        ":object_ids",
+        ":safety_status",
+        ":ws2812_pio",
+        "@pico-sdk//src/rp2_common/hardware_clocks",
+        "@pico-sdk//src/rp2_common/hardware_pio",
+        "@shizuku//:internal_headers",
+        "@shizuku//configs:config",
+        "@shizuku//modules/pico_sdk_support:headers",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+cc_test(
+    name = "safety_status_test",
+    srcs = ["tests/safety_status_test.cpp"],
+    deps = [":safety_status"],
+    tags = ["manual"], # bazel test --config=host //:safety_status_test
+    size = "small",
+)
 
 # btstack_config.h — BLE UART 専用の最小構成 (config/btstack_config.h)。
 cc_library(
@@ -178,6 +218,7 @@ cc_library(
         ":flight_controller",
         ":object_ids",
         ":props",
+        ":safety_status",
         ":telemetry",
         "@pico-sdk//src/rp2_common/hardware_dma",
         "@pico-sdk//src/rp2_common/hardware_uart",
@@ -199,6 +240,7 @@ cc_library(
         ":bno055",
         ":flight_controller",
         ":logger",
+        ":neopixel",
         ":ota",
         ":shizuku_shell",
         ":telemetry",

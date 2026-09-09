@@ -22,12 +22,13 @@ constexpr uintptr_t telemetry = base + 5;
 constexpr uintptr_t logger = base + 6;
 constexpr uintptr_t ota = base + 7;
 constexpr uintptr_t shell = base + 8;
+constexpr uintptr_t neopixel = base + 9;
 
 // 動的にロードするモジュールへ配る番号。★上限はカーネルの表の大きさで決まる
 //   (SHIZUKU_OBJECT_COUNT)。ここを手で書くと表からはみ出した番号を配って
 //   CREATE_OBJECT が BAD_OBJECT で黙って失敗する (dyn_obj_end = 63 と
 //   書いてあった版が実際にそれ)。
-constexpr uintptr_t dyn_obj_start = base + 9;
+constexpr uintptr_t dyn_obj_start = base + 10;
 constexpr uintptr_t dyn_obj_end = shizuku::KERNEL_OBJECT::OBJECT_COUNT - 1;
 
 static_assert(dyn_obj_start <= dyn_obj_end,

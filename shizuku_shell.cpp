@@ -5,6 +5,7 @@
 #include "shizuku_shell.hpp"
 #include "blink.hpp"
 #include "flight_controller.hpp"
+#include "safety_status.hpp"
 #include "hardware/dma.h"
 #include "hardware/regs/dma.h"
 #include "hardware/gpio.h"
@@ -216,6 +217,9 @@ int uart_rx_getc() {
 // ------------------------------
 shizuku::stream::storage<frame_t, 16> g_out;
 uintptr_t g_out_id = 0;
+shizuku::stream::storage<xno::safety::update, 16> g_safety_out;
+uintptr_t g_safety_out_id = xno::NO_STREAM;
+bool g_safety_producer_bound = false;
 
 // ---- 入力ストリーム (ble_uart の RX)
 // -----------------------------------------
@@ -658,7 +662,7 @@ void handle_nc_command(const char *argument) {
 
 // ---- コマンド解釈ディスパッチャ
 // ----------------------------------------------
-void handle_command_line(char *line) {
+void handle_command_line(char *line, bool from_safety_uart = false) {
   while (*line && ((uint8_t)*line <= ' ' || (uint8_t)*line > 126))
     ++line;
   size_t len = strlen(line);
@@ -835,8 +839,13 @@ void handle_command_line(char *line) {
   } else if (strcmp(line, "PING") == 0 || strcmp(line, "ping") == 0) {
     shell_printf("PONG\n");
   } else if (strncmp(line, "SAFE", 4) == 0) {
+    xno::safety::update update{};
+    if (from_safety_uart && g_safety_producer_bound &&
+        xno::safety::parse(line, BOARD::time_us(), update))
+      g_safety_out.hdl().push(update);
     // 外部安全装置 (Seeed XIAO) からの安全ハートビート / アラート。
-    // 必要に応じて安全インターロックの反映が可能。
+    // UART0 の有効な SAFE/SAFE2 のみ表示用ストリームへ送る。
+    // 未知の SAFE 系・不正な行にも応答せず、受信時刻も更新しない。
     // ★接頭辞を "SAFE" 4 文字だけで見る。以前は "SAFE," と "SAFE_" を
     //   個別に並べていたが、XIAO の Rust 化で 2 行目 `SAFE2,...` が増えた
     //   瞬間にどちらにも一致しなくなり、**10Hz で "unknown command" を
@@ -923,6 +932,10 @@ uintptr_t method_process_cmd(uintptr_t cmd_ptr, uintptr_t, uintptr_t,
   return 0;
 }
 
+uintptr_t method_get_safety_stream(uintptr_t, uintptr_t, uintptr_t, uintptr_t) {
+  return g_safety_out_id;
+}
+
 // Method 5: SET_BLE_OTA_STREAM
 uintptr_t method_set_ble_ota_stream(uintptr_t stream_id, uintptr_t, uintptr_t,
                                     uintptr_t) {
@@ -939,6 +952,14 @@ uintptr_t method_set_ble_ota_stream(uintptr_t stream_id, uintptr_t, uintptr_t,
 
 // メインポーリングループ (Core 0: BLE ストリーム ＆ CDC ＆ UART0 を監視)
 uintptr_t poll_loop(uintptr_t, uintptr_t, uintptr_t, uintptr_t) {
+  if (g_safety_out_id != xno::NO_STREAM) {
+    const auto safety_bound = api(shizuku::object_api::STREAM_BIND, g_safety_out_id,
+                                 (uintptr_t)shizuku::stream::role::PRODUCER);
+    g_safety_producer_bound = safety_bound.error == 0;
+    if (!g_safety_producer_bound)
+      BOARD::diag_printf("[SHELL] safety stream bind failed: %lu\n",
+                         (unsigned long)safety_bound.error);
+  }
   char cdc_line[128] = "";
   size_t cdc_pos = 0;
   char uart_line[128] = "";
@@ -1057,8 +1078,19 @@ uintptr_t poll_loop(uintptr_t, uintptr_t, uintptr_t, uintptr_t) {
     }
 
     // 2. CDC (USB stdio) からの入力
+    // ★★**来ている分はその場で全部汲む。** 1 周につき 1 文字しか読まないと、
+    //   母艦が 1 行を一気に書いたときに CDC の受信バッファが溢れて**先頭が
+    //   落ちる**。このループは BLE・UART・テレメトリ・LED を全部回すので
+    //   1 周が長く、7 文字のコマンドには 7 周かかっていた。実際 "status" が
+    //   "tatus" / "atus" / "s" と頭を食われ、**診断が何度も止まった**
+    //   (2026-09-05)。人が 1 文字ずつ打つ分には露見せず、機械が投げると壊れる。
+    // ★上限を付けるのは、大量に流し込まれたときに他の経路 (BLE/UART) が
+    //   飢えないため。ここで全部飲み切る義務は無い — 次の周回で続きを取る。
+    for (uint32_t cdc_budget = 0; cdc_budget < 128; ++cdc_budget) {
     int c = getchar_timeout_us(0);
-    if (c != PICO_ERROR_TIMEOUT && c != PICO_ERROR_NO_DATA && c >= 0) {
+    if (c == PICO_ERROR_TIMEOUT || c == PICO_ERROR_NO_DATA || c < 0)
+      break;
+    {
       did_work = true;
       if (c == '\r' || c == '\n') {
         if (cdc_pos > 0) {
@@ -1080,6 +1112,7 @@ uintptr_t poll_loop(uintptr_t, uintptr_t, uintptr_t, uintptr_t) {
         putchar(c);
         fflush(stdout);
       }
+    }
     }
 
     // 3. UART0 (Seeed XIAO 等の安全装置) からのコマンド受信
@@ -1138,7 +1171,7 @@ uintptr_t poll_loop(uintptr_t, uintptr_t, uintptr_t, uintptr_t) {
         if (ch == '\r' || ch == '\n') {
           if (uart_pos > 0) {
             uart_line[uart_pos] = '\0';
-            handle_command_line(uart_line);
+            handle_command_line(uart_line, true);
             uart_pos = 0;
           }
         } else if (ch == 0x08 || ch == 0x7F) {
@@ -1172,6 +1205,17 @@ uintptr_t shell_main(uintptr_t, uintptr_t, uintptr_t, uintptr_t) {
   failures += export_method(method::POLL, (uintptr_t)&poll_loop);
   failures += export_method(method::SET_BLE_OTA_STREAM,
                             (uintptr_t)&method_set_ble_ota_stream);
+  failures += export_method(method::GET_SAFETY_STREAM,
+                            (uintptr_t)&method_get_safety_stream);
+
+  g_safety_out.init(); // Overwrite old samples; producer must never wait on LED.
+  const auto safety_created = api(shizuku::object_api::STREAM_CREATE,
+                                   (uintptr_t)&g_safety_out.desc);
+  failures += safety_created.error;
+  g_safety_out_id = safety_created.error == 0 ? safety_created.value : xno::NO_STREAM;
+  if (safety_created.error != 0)
+    BOARD::diag_printf("[SHELL] safety stream create failed: %lu\n",
+                       (unsigned long)safety_created.error);
 
   g_out.init();
   const auto created =
