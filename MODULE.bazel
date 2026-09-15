@@ -25,12 +25,6 @@ python.toolchain(
 )
 bazel_dep(name = "pico-sdk", version = "2.2.0")
 
-local_path_override(
-    module_name = "pico-sdk",
-    # Shizuku 側と同じ SDK を指す。マシンが変わったらここを更新する。
-    path = "../../.pico-sdk/sdk/2.2.0",
-)
-
 bazel_dep(name = "shizuku", version = "0.1.0")
 
 git_override(
@@ -43,9 +37,12 @@ git_override(
 
 bazel_dep(name = "rules_pico_flash", version = "0.1.0")
 
-local_path_override(
+git_override(
     module_name = "rules_pico_flash",
-    path = "../rules_pico_flash",
+    # ローカルのワークツリーで開発するときは .bazelrc.user に
+    # common --override_module=rules_pico_flash=/path/to/rules_pico_flash を書く。
+    remote = "https://github.com/danfunc/rules_pico_flash.git",
+    commit = "d2616363f667947ef50359fd00a94433a0f1a87a",
 )
 
 # pico-sdk のツールチェーンは dev_dependency 登録なので、利用側が明示的に登録する。
