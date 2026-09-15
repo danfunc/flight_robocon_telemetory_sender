@@ -13,3 +13,10 @@ __pycache__/
 
 # 実行時のテレメトリ記録。走らせるたびに増える実行成果物であってソースではない。
 telemetry_*.csv
+
+# ローカル開発用設定ファイル
+.bazelrc.user
+
+# Bazel のバージョン固定。グローバル gitignore の `.*` に吸われるので明示的に戻す
+# (無いと新しいクローンで Bazel 9 が選ばれ sh_binary is not defined で止まる)。
+!.bazelversion

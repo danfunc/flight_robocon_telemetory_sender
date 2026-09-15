@@ -33,11 +33,12 @@ local_path_override(
 
 bazel_dep(name = "shizuku", version = "0.1.0")
 
-local_path_override(
+git_override(
     module_name = "shizuku",
-    # ★開発中は隣のワークツリーを直接指す。将来 git リモートに切り替える場合は
-    #   ここを git_override(module_name="shizuku", remote=..., commit=...) にする。
-    path = "../Shizuku",
+    # ローカルのワークツリーで開発するときは .bazelrc.user に
+    # common --override_module=shizuku=/path/to/Shizuku を書く。
+    remote = "https://github.com/danfunc/Shizuku.git",
+    commit = "38f0df5c539a3f0c23ec6559af7708043654f122",
 )
 
 bazel_dep(name = "rules_pico_flash", version = "0.1.0")

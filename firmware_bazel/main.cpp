@@ -193,7 +193,8 @@ int main() {
   shizuku::kernel_instance.init();
   shizuku::kernel_object_instance.init();
   shizuku::kernel_instance.set_object_handler(
-      shizuku::KERNEL_OBJECT::handler_entry());
+      shizuku::KERNEL_OBJECT::handler_entry(),
+      (uint32_t)shizuku::KERNEL_OBJECT::KERNEL_OBJECT_ID);
   const auto boot = shizuku::kernel_object_instance.lend_boot_stack();
   shizuku::kernel_instance.bootstrap(shizuku::app_entry, boot.base, boot.bytes);
 }

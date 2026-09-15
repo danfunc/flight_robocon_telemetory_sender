@@ -42,3 +42,6 @@ build --strategy=Genrule=local
 #   **既定では走らない**ので、CI に載せるならこの config を明示すること)。
 build:host --platforms=@platforms//host
 test:host --platforms=@platforms//host
+
+# 開発環境ごとのローカル設定 (リポジトリにはコミットしない)
+try-import %workspace%/.bazelrc.user
