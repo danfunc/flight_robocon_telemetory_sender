@@ -3,8 +3,8 @@
 #include "bme280.hpp"
 #include "bno055.hpp"
 #include "flight_controller.hpp"
-#include "logger.hpp"
 #include "object_ids.hpp"
+#include "objects/logger/logger.hpp"
 #include "pico/stdlib.h"
 #include "shizuku/app_entry.hpp"
 #include "shizuku/kernel.hpp"
@@ -56,7 +56,7 @@ void shizuku::app_entry() {
   }
   telemetry::register_telemetry();
   flight_controller::register_flight_controller();
-  logger::register_logger();
+  xno::logger::register_logger(xno_object_id::logger);
   shizuku::objects::ota::register_ota(xno_object_id::ota, xno_object_id::blink,
                                       xno_object_id::ble_uart);
   blink::register_blink(xno_object_id::blink);
@@ -102,16 +102,16 @@ void shizuku::app_entry() {
     const auto shell_stream =
         call(xno::shell::OBJECT, (uintptr_t)xno::shell::method::GET_STREAM, 0);
 
-    call(logger::OBJECT, (uintptr_t)logger::method::ADD_INPUT,
-         logger::pack_input(sid(tele_stream), logger::PRIO_BULK));
-    call(logger::OBJECT, (uintptr_t)logger::method::ADD_INPUT,
-         logger::pack_input(sid(fc_stream), logger::PRIO_CONTROL));
-    call(logger::OBJECT, (uintptr_t)logger::method::ADD_INPUT,
-         logger::pack_input(sid(shell_stream), logger::PRIO_CONTROL));
+    call(xno_object_id::logger, (uintptr_t)xno::logger::method::ADD_INPUT,
+         xno::logger::pack_input(sid(tele_stream), xno::logger::PRIO_BULK));
+    call(xno_object_id::logger, (uintptr_t)xno::logger::method::ADD_INPUT,
+         xno::logger::pack_input(sid(fc_stream), xno::logger::PRIO_CONTROL));
+    call(xno_object_id::logger, (uintptr_t)xno::logger::method::ADD_INPUT,
+         xno::logger::pack_input(sid(shell_stream), xno::logger::PRIO_CONTROL));
 
     // logger → ble_uart (NUS TX notify)
     const auto log_stream =
-        call(logger::OBJECT, (uintptr_t)logger::method::GET_STREAM, 0);
+        call(xno_object_id::logger, (uintptr_t)xno::logger::method::GET_STREAM, 0);
     call(xno_object_id::ble_uart,
          (uintptr_t)shizuku::objects::ble_uart::method::SET_TX_STREAM,
          sid(log_stream));
@@ -127,8 +127,8 @@ void shizuku::app_entry() {
     const auto ota_stream =
         call(xno_object_id::ota,
              (uintptr_t)shizuku::objects::ota::method::GET_STREAM, 0);
-    call(logger::OBJECT, (uintptr_t)logger::method::ADD_INPUT,
-         logger::pack_input(sid(ota_stream), logger::PRIO_CONTROL));
+    call(xno_object_id::logger, (uintptr_t)xno::logger::method::ADD_INPUT,
+         xno::logger::pack_input(sid(ota_stream), xno::logger::PRIO_CONTROL));
 
     // ble_uart OTA write → ota
     const auto ota_rx_stream =
@@ -162,7 +162,7 @@ void shizuku::app_entry() {
 
   // ---- 3) 起動 (poll スレッド群 ＆ シェルの開始) ---------------------------
   shizuku::objects::ble_uart::start_ble_uart(xno_object_id::ble_uart);
-  logger::start_logger();
+  xno::logger::start_logger(xno_object_id::logger);
   shizuku::objects::ota::start_ota(xno_object_id::ota);
   telemetry::start_telemetry();
   flight_controller::start_flight_controller();

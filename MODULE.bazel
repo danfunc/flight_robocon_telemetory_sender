@@ -35,6 +35,19 @@ git_override(
     commit = "38f0df5c539a3f0c23ec6559af7708043654f122",
 )
 
+bazel_dep(name = "xno", version = "0.1.0")
+
+# XNO (danfunc/XNO, private)。git_override はルートモジュールでしか効かないので、
+# Shizuku と XNO の両方をここで検証済みの SHA に固定する。
+# ローカルで XNO を触るときは .bazelrc.user に
+#   common --override_module=xno=/path/to/XNO
+# を書く (Shizuku と同じ作法)。
+git_override(
+    module_name = "xno",
+    remote = "https://github.com/danfunc/XNO.git",
+    commit = "6b5673ee3401698528d0f1a94fea9d2f2f3bb7fd",
+)
+
 bazel_dep(name = "rules_pico_flash", version = "0.1.0")
 
 git_override(

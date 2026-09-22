@@ -141,19 +141,12 @@ cc_library(
     visibility = ["//visibility:public"],
 )
 
-# logger: ログ行の合流点
-cc_library(
+# logger: XNO へ移設済み (objects/logger の logger.hpp/logger.cpp を参照)。
+# 旧ターゲットは alias として残す — 呼び出し側 (main.cpp) の include/依存の
+# 形を変えないため。
+alias(
     name = "logger",
-    srcs = ["logger.cpp"],
-    hdrs = [
-        "logger.hpp",
-        "tx_frame.hpp",
-    ],
-    deps = [
-        ":object_ids",
-        "@shizuku//:internal_headers",
-        "@shizuku//configs:config",
-    ],
+    actual = "@xno//objects/logger:logger",
     visibility = ["//visibility:public"],
 )
 
