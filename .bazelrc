@@ -1,6 +1,8 @@
 # 既定ターゲット: RP2350 / pico2_w (Shizuku 側と揃える)。
 build --platforms=@pico-sdk//bazel/platform:rp2350
 build --@pico-sdk//bazel/config:PICO_BOARD=pico2_w
+# Shizuku 内の select() は Shizuku 自身の board build setting を参照する。
+build --@shizuku//configs:board=rp2350_pico2_w
 
 # Shizuku 側の USB 方針をそのまま踏襲 (D42: pico_stdio_usb は使わず自前の
 # CDC 2 本、tusb_config は Shizuku 側のラベルを @shizuku// 経由で参照)。
@@ -9,11 +11,9 @@ build --@pico-sdk//bazel/config:PICO_STDIO_USB=False
 build --@pico-sdk//bazel/config:PICO_TINYUSB_CONFIG=@shizuku//modules/pico_sdk_support:tusb_config
 build --@pico-sdk//bazel/config:PICO_CONFIG_EXTRA_HEADER=@shizuku//configs:pico_extra_config
 
-# BLE UART (ble_uart.cpp) 用。btstack_config.h は旧 CMake ビルドのものを
-# そのまま再利用する (include/btstack_config.h, HCI_ACL_PAYLOAD_SIZE の
-# CYW43 ワイヤ罠回避値を含む)。
+# BLE UART と SDK が同じ Shizuku の btstack_config.h を使う。
 build --@pico-sdk//bazel/config:PICO_BT_ENABLE_BLE=True
-build --@pico-sdk//bazel/config:PICO_BTSTACK_CONFIG=//:btstack_config
+build --@pico-sdk//bazel/config:PICO_BTSTACK_CONFIG=@shizuku//modules/pico_sdk_support:btstack_config
 
 # Shizuku 側のヘッダは C++23 前提。既存 CMake ビルド (C++20) とは独立に、
 # Bazel 側だけ 23 にする。

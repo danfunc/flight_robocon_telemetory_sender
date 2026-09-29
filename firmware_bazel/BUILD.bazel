@@ -9,6 +9,8 @@ pico_binary(
     name = "xno_bringup",
     default_aliases = False,
     srcs = ["main.cpp"],
+    additional_linker_inputs = ["rp2350_flash_limit.ld"],
+    linkopts = ["-Wl,-T,$(location :rp2350_flash_limit.ld)"],
     deps = [
         "//:xno_objects",
         "@shizuku//:internal_headers",
@@ -90,6 +92,8 @@ sh_binary(
 cc_binary(
     name = "flasher_probe.elf",
     srcs = ["flasher_probe.cpp"],
+    additional_linker_inputs = ["rp2350_flash_limit.ld"],
+    linkopts = ["-Wl,-T,$(location :rp2350_flash_limit.ld)"],
     deps = [
         "//:ble_uart",
         "//:object_ids",
